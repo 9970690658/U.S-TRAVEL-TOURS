@@ -1,0 +1,18 @@
+{
+  "name": "us-travel-tours",
+  "version": "1.0.0",
+  "description": "U.S TRAVEL & TOURS website backend",
+  "main": "server/server.js",
+  "scripts": {
+    "start": "node server/server.js",
+    "dev": "node server/server.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "better-sqlite3": "^13.0.3",
+    "dotenv": "^17.4.2",
+    "express": "^5.1.0",
+    "multer": "^2.3.0",
+    "nodemailer": "^10.0.9"
+  }
+}
