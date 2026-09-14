@@ -22,12 +22,164 @@ require("dotenv").config({
 
 const express = require("express");
 const cors = require("cors");
+const bcrypt = require("bcryptjs");
 
 // ---------------------------------------------------------
 // DATABASE
 // ---------------------------------------------------------
 
 const { db } = require("./database");
+// =========================================================
+// ADMIN BOOTSTRAP
+// CREATE / RESET PRODUCTION ADMIN
+// =========================================================
+
+function bootstrapAdmin() {
+
+    const adminName =
+        process.env.BOOTSTRAP_ADMIN_NAME;
+
+    const adminEmail =
+        process.env.BOOTSTRAP_ADMIN_EMAIL;
+
+    const adminPassword =
+        process.env.BOOTSTRAP_ADMIN_PASSWORD;
+
+    if (
+        !adminName ||
+        !adminEmail ||
+        !adminPassword
+    ) {
+
+        console.log(
+            "Admin bootstrap skipped: environment variables not configured."
+        );
+
+        return;
+
+    }
+
+    try {
+
+        const normalizedEmail =
+            adminEmail.trim().toLowerCase();
+
+        const existingAdmin =
+            db.prepare(`
+                SELECT id, role
+                FROM users
+                WHERE email = ?
+            `).get(normalizedEmail);
+
+        const passwordHash =
+            bcrypt.hashSync(
+                adminPassword,
+                12
+            );
+
+        if (!existingAdmin) {
+
+            db.prepare(`
+                INSERT INTO users
+                (
+                    name,
+                    email,
+                    password,
+                    role
+                )
+                VALUES
+                (?, ?, ?, 'admin')
+            `).run(
+                adminName.trim(),
+                normalizedEmail,
+                passwordHash
+            );
+
+            console.log("");
+            console.log(
+                "=============================================="
+            );
+            console.log(
+                "ADMIN BOOTSTRAP"
+            );
+            console.log(
+                "=============================================="
+            );
+            console.log(
+                "Admin account created successfully."
+            );
+            console.log(
+                "Admin Email:",
+                normalizedEmail
+            );
+            console.log(
+                "Admin Role: admin"
+            );
+            console.log(
+                "=============================================="
+            );
+            console.log("");
+
+        } else if (
+            existingAdmin.role === "admin"
+        ) {
+
+            db.prepare(`
+                UPDATE users
+                SET
+                    name = ?,
+                    password = ?,
+                    role = 'admin'
+                WHERE id = ?
+            `).run(
+                adminName.trim(),
+                passwordHash,
+                existingAdmin.id
+            );
+
+            console.log("");
+            console.log(
+                "=============================================="
+            );
+            console.log(
+                "ADMIN BOOTSTRAP"
+            );
+            console.log(
+                "=============================================="
+            );
+            console.log(
+                "Existing admin password reset successfully."
+            );
+            console.log(
+                "Admin Email:",
+                normalizedEmail
+            );
+            console.log(
+                "Admin Role: admin"
+            );
+            console.log(
+                "=============================================="
+            );
+            console.log("");
+
+        } else {
+
+            console.error(
+                "ADMIN BOOTSTRAP ERROR: Email already belongs to a non-admin user."
+            );
+
+        }
+
+    } catch (error) {
+
+        console.error(
+            "ADMIN BOOTSTRAP ERROR:",
+            error
+        );
+
+    }
+
+}
 
 // ---------------------------------------------------------
 // EXPRESS
@@ -446,7 +598,7 @@ app.use(
 
     }
 );
-
+bootstrapAdmin();
 // =========================================================
 // START SERVER
 // RENDER
