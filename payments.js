@@ -1,3 +1,5 @@
+const PAYMENT_ENDPOINT =
+    "https://u-s-travel-tours-1.onrender.com/api/application-payment";
 const express = require("express");
 const router = express.Router();
 const multer = require("multer");
@@ -5,6 +7,10 @@ const path = require("path");
 const fs = require("fs");
 
 const { db } = require("./database");
+const {
+    requireAuth,
+    requireAdmin
+} = require("./auth");
 
 // =========================================================
 // U.S TRAVEL & TOURS
@@ -84,6 +90,7 @@ const upload = multer({
 
 router.post(
     "/",
+    requireAuth,
     upload.single("paymentProof"),
     (req, res) => {
 
@@ -274,11 +281,40 @@ router.post(
             }
 
             const existingApplication = db.prepare(`
-                SELECT
-                    id
-                FROM applications
-                WHERE id = ?
-            `).get(applicationId);
+    SELECT
+        id,
+        user_id
+    FROM applications
+    WHERE id = ?
+`).get(applicationId);
+
+if (!existingApplication) {
+
+    if (req.file) {
+        fs.unlinkSync(req.file.path);
+    }
+
+    return res.status(404).json({
+        success: false,
+        message: "Application not found."
+    });
+}
+
+if (
+    req.user.role !== "admin" &&
+    Number(existingApplication.user_id) !== Number(req.user.id)
+) {
+
+    if (req.file) {
+        fs.unlinkSync(req.file.path);
+    }
+
+    return res.status(403).json({
+        success: false,
+        message:
+            "You are not authorized to submit payment for this application."
+    });
+}
 
             if (!existingApplication) {
 
@@ -460,7 +496,7 @@ router.post(
 // GET /api/payments/:id
 // =========================================================
 
-router.get("/:id", (req, res) => {
+router.get("/:id", requireAuth, (req, res) => {
 
     try {
 
@@ -530,6 +566,7 @@ router.get("/:id", (req, res) => {
 
 router.get(
     "/application/:applicationId",
+    requireAuth,
     (req, res) => {
 
         try {
@@ -594,6 +631,7 @@ router.get(
 
 router.patch(
     "/:id/status",
+    requireAdmin,
     (req, res) => {
 
         try {
@@ -718,7 +756,7 @@ router.patch(
 // GET /api/payments
 // =========================================================
 
-router.get("/", (req, res) => {
+router.get("/", requireAdmin, (req, res) => {
 
     try {
 
