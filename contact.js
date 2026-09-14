@@ -28,7 +28,7 @@ const nodemailer = require("nodemailer");
 
 const router = express.Router();
 
-const db = require("./db");
+const { db } = require("./database");
 
 const {
     requireAuth,
