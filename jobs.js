@@ -1117,7 +1117,7 @@ U.S TRAVEL & TOURS
         }
 
     }
-);
+);  
 
 // =========================================================
 // MY JOB APPLICATIONS
@@ -1126,7 +1126,7 @@ U.S TRAVEL & TOURS
 // GET /api/jobs/my
 // =========================================================
 
-router.get(
+router.get( 
     "/my",
     requireAuth,
     function (
