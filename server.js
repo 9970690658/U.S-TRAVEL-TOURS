@@ -84,7 +84,7 @@ function bootstrapAdmin() {
                 (
                     name,
                     email,
-                    password,
+                    password_hash,
                     role
                 )
                 VALUES
