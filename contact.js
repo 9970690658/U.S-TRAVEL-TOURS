@@ -179,31 +179,127 @@ try {
 
     db.prepare(`
         CREATE TABLE IF NOT EXISTS contact_messages (
-
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-
             name TEXT NOT NULL,
-
             email TEXT NOT NULL,
-
             phone TEXT NOT NULL,
-
             service TEXT NOT NULL,
-
             subject TEXT,
-
             message TEXT NOT NULL,
-
             consent INTEGER DEFAULT 0,
-
             status TEXT DEFAULT 'new',
-
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-
         )
     `).run();
+
+
+    // -----------------------------------------------------
+    // DATABASE MIGRATIONS
+    // -----------------------------------------------------
+
+    const contactColumns = db
+        .prepare(`
+            PRAGMA table_info(contact_messages)
+        `)
+        .all();
+
+    const existingColumns =
+        new Set(
+            contactColumns.map(
+                column => column.name
+            )
+        );
+
+
+    // -----------------------------------------------------
+    // SERVICE COLUMN
+    // -----------------------------------------------------
+
+    if (!existingColumns.has("service")) {
+
+        db.prepare(`
+            ALTER TABLE contact_messages
+            ADD COLUMN service TEXT DEFAULT ''
+        `).run();
+
+        console.log(
+            "Contact database migration: service column added."
+        );
+
+    }
+
+
+    // -----------------------------------------------------
+    // CONSENT COLUMN
+    // -----------------------------------------------------
+
+    if (!existingColumns.has("consent")) {
+
+        db.prepare(`
+            ALTER TABLE contact_messages
+            ADD COLUMN consent INTEGER DEFAULT 0
+        `).run();
+
+        console.log(
+            "Contact database migration: consent column added."
+        );
+
+    }
+
+
+    // -----------------------------------------------------
+    // STATUS COLUMN
+    // -----------------------------------------------------
+
+    if (!existingColumns.has("status")) {
+
+        db.prepare(`
+            ALTER TABLE contact_messages
+            ADD COLUMN status TEXT DEFAULT 'new'
+        `).run();
+
+        console.log(
+            "Contact database migration: status column added."
+        );
+
+    }
+
+
+    // -----------------------------------------------------
+    // CREATED AT COLUMN
+    // -----------------------------------------------------
+
+    if (!existingColumns.has("created_at")) {
+
+        db.prepare(`
+            ALTER TABLE contact_messages
+            ADD COLUMN created_at DATETIME
+        `).run();
+
+        console.log(
+            "Contact database migration: created_at column added."
+        );
+
+    }
+
+
+    // -----------------------------------------------------
+    // UPDATED AT COLUMN
+    // -----------------------------------------------------
+
+    if (!existingColumns.has("updated_at")) {
+
+        db.prepare(`
+            ALTER TABLE contact_messages
+            ADD COLUMN updated_at DATETIME
+        `).run();
+
+        console.log(
+            "Contact database migration: updated_at column added."
+        );
+
+    }
 
 
     // -----------------------------------------------------
@@ -215,7 +311,6 @@ try {
         idx_contact_messages_status
         ON contact_messages(status)
     `).run();
-
 
     db.prepare(`
         CREATE INDEX IF NOT EXISTS
@@ -234,8 +329,8 @@ try {
         "Contact table initialization error:",
         error
     );
-}
 
+}
 
 // =========================================================
 // SMTP TRANSPORTER
