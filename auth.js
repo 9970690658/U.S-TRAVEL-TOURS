@@ -56,8 +56,8 @@ function normalizeEmail(email) {
         .toLowerCase();
 }
 
-function isValidEmail(email) {
-    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+function cleanText(value) {
+    return String(value || "").trim();
 }
 
 function isValidEmail(email) {
