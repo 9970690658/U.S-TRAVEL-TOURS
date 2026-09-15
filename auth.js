@@ -1,167 +1,257 @@
 // =========================================================
 // U.S TRAVEL & TOURS
-// LIVE SUPPORT CHAT BACKEND
+// CUSTOMER + ADMIN AUTHENTICATION SYSTEM
 // =========================================================
 
 const express = require("express");
+const bcrypt = require("bcryptjs");
+const crypto = require("crypto");
 const nodemailer = require("nodemailer");
 
 const { db } = require("./database");
-const { requireAuth, requireAdmin } = require("./auth");
 
 const router = express.Router();
 
-console.log("CHAT: Initializing live chat backend...");
-
 // =========================================================
-// DATABASE SETUP
+// CONFIGURATION
 // =========================================================
 
-const CHAT_TABLE = "support_chat_messages";
+const SESSION_DURATION_MS =
+    1000 * 60 * 60 * 24 * 7;
 
-try {
+const RESET_TOKEN_DURATION_MS =
+    1000 * 60 * 30; // 30 minutes
 
-    db.exec(`
-        CREATE TABLE IF NOT EXISTS support_chat_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            sender_type TEXT NOT NULL
-                CHECK(sender_type IN ('customer', 'admin')),
-            message TEXT NOT NULL,
-            is_read INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
+const sessions = new Map();
 
-        CREATE INDEX IF NOT EXISTS idx_support_chat_user_id
-        ON support_chat_messages(user_id);
+// =========================================================
+// PASSWORD RESET TABLE
+// =========================================================
 
-        CREATE INDEX IF NOT EXISTS idx_support_chat_created_at
-        ON support_chat_messages(created_at);
-
-        CREATE INDEX IF NOT EXISTS idx_support_chat_unread
-        ON support_chat_messages(
-            user_id,
-            sender_type,
-            is_read
-        );
-    `);
-
-    console.log(
-        "CHAT DATABASE: support chat table ready."
+db.exec(`
+    CREATE TABLE IF NOT EXISTS password_resets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        expires_at INTEGER NOT NULL,
+        used_at INTEGER,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id)
     );
 
-} catch (error) {
+    CREATE INDEX IF NOT EXISTS idx_password_resets_token
+    ON password_resets(token_hash);
 
-    console.error(
-        "CHAT DATABASE ERROR:",
-        error
-    );
-
-    throw error;
-}
-
-// =========================================================
-// EMAIL CONFIGURATION
-// =========================================================
-
-let transporter = null;
-
-function createTransporter() {
-
-    if (
-        !process.env.SMTP_HOST ||
-        !process.env.SMTP_PORT ||
-        !process.env.SMTP_USER ||
-        !process.env.SMTP_PASS
-    ) {
-
-        console.warn(
-            "CHAT SMTP: SMTP configuration missing."
-        );
-
-        return null;
-    }
-
-    return nodemailer.createTransport({
-
-        host: process.env.SMTP_HOST,
-
-        port: Number(
-            process.env.SMTP_PORT
-        ),
-
-        secure:
-            String(
-                process.env.SMTP_SECURE || ""
-            ).toLowerCase() === "true",
-
-        auth: {
-            user: process.env.SMTP_USER,
-            pass: process.env.SMTP_PASS
-        }
-
-    });
-}
-
-transporter = createTransporter();
+    CREATE INDEX IF NOT EXISTS idx_password_resets_user
+    ON password_resets(user_id);
+`);
 
 // =========================================================
 // HELPERS
 // =========================================================
 
-function cleanMessage(value) {
-
-    if (
-        typeof value !== "string"
-    ) {
-        return "";
-    }
-
-    return value
-        .replace(/\u0000/g, "")
-        .trim();
+function normalizeEmail(email) {
+    return String(email || "")
+        .trim()
+        .toLowerCase();
 }
 
-function getUserId(req) {
+function isValidEmail(email) {
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
 
-    if (
-        !req.user ||
-        req.user.id === undefined ||
-        req.user.id === null
-    ) {
+function isValidEmail(email) {
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function isStrongPassword(password) {
+    return (
+        password.length >= 8 &&
+        /[A-Za-z]/.test(password) &&
+        /\d/.test(password)
+    );
+}
+
+// =========================================================
+// EMAIL CONFIGURATION - BREVO SMTP
+// =========================================================
+
+let mailTransporter = null;
+
+function getMailTransporter() {
+
+    if (mailTransporter) {
+        return mailTransporter;
+    }
+
+    const smtpHost = process.env.SMTP_HOST;
+    const smtpPort = Number(process.env.SMTP_PORT || 587);
+    const smtpUser = process.env.SMTP_USER;
+    const smtpPass = process.env.SMTP_PASS;
+
+    if (!smtpHost || !smtpUser || !smtpPass) {
+
+        console.error(
+            "SMTP CONFIG ERROR: SMTP_HOST / SMTP_USER / SMTP_PASS missing."
+        );
+
         return null;
     }
 
-    const userId =
-        Number(req.user.id);
+    console.log("Creating SMTP transporter...");
+    console.log("SMTP Host:", smtpHost);
+    console.log("SMTP Port:", smtpPort);
+    console.log("SMTP User:", smtpUser);
 
-    if (
-        !Number.isInteger(userId) ||
-        userId <= 0
-    ) {
-        return null;
+    mailTransporter = nodemailer.createTransport({
+        host: smtpHost,
+        port: smtpPort,
+        secure:
+            String(
+                process.env.SMTP_SECURE || "false"
+            ).toLowerCase() === "true",
+
+        auth: {
+            user: smtpUser,
+            pass: smtpPass
+        }
+    });
+
+    return mailTransporter;
+}
+
+// =========================================================
+// SEND PASSWORD RESET EMAIL
+// =========================================================
+
+async function sendPasswordResetEmail(
+    user,
+    rawToken
+) {
+
+    const transporter =
+        getMailTransporter();
+
+    if (!transporter) {
+        throw new Error(
+            "Email service is not configured."
+        );
     }
 
-    return userId;
+    await transporter.verify();
+
+console.log("SMTP connection verified successfully.");
+
+    const baseUrl =
+        String(
+            process.env.APP_BASE_URL ||
+            "http://localhost:3000"
+        ).replace(/\/+$/, "");
+
+    const resetUrl =
+        `${baseUrl}/reset-password.html?token=${encodeURIComponent(rawToken)}`;
+
+    const mailFrom =
+        process.env.MAIL_FROM ||
+        process.env.SMTP_USER;
+
+    const mailResult = await transporter.sendMail({
+
+        from: mailFrom,
+
+        to: user.email,
+
+        subject:
+            "Reset your U.S TRAVEL & TOURS password",
+
+        text:
+`Hello ${user.name || "Customer"},
+
+We received a request to reset your U.S TRAVEL & TOURS account password.
+
+Use the link below to create a new password:
+
+${resetUrl}
+
+This link will expire in 30 minutes and can only be used once.
+
+If you did not request a password reset, you can safely ignore this email.
+
+U.S TRAVEL & TOURS`,
+
+        html:
+`
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Password Reset</title>
+</head>
+
+<body style="margin:0;padding:0;background:#f5f5f5;font-family:Arial,sans-serif;">
+
+<div style="max-width:600px;margin:40px auto;background:#ffffff;padding:40px;border-radius:10px;">
+
+    <h2 style="margin-top:0;">
+        U.S TRAVEL & TOURS
+    </h2>
+
+    <p>
+        Hello ${escapeHtml(user.name || "Customer")},
+    </p>
+
+    <p>
+        We received a request to reset your account password.
+    </p>
+
+    <p>
+        Click the button below to create a new password.
+    </p>
+
+    <p style="margin:30px 0;">
+        <a
+            href="${resetUrl}"
+            style="
+                display:inline-block;
+                padding:14px 24px;
+                background:#111111;
+                color:#ffffff;
+                text-decoration:none;
+                border-radius:6px;
+                font-weight:bold;
+            "
+        >
+            Reset Password
+        </a>
+    </p>
+
+    <p style="font-size:14px;color:#666;">
+        This link expires in 30 minutes and can only be used once.
+    </p>
+
+    <p style="font-size:14px;color:#666;">
+        If you did not request this password reset, you can safely ignore this email.
+    </p>
+
+</div>
+
+</body>
+</html>
+`
+    });
+     console.log("PASSWORD RESET EMAIL SENT");
+    console.log("Message ID:", mailResult.messageId);
+    console.log("Accepted:", mailResult.accepted);
+    console.log("Rejected:", mailResult.rejected);
 }
 
-function getCustomerById(userId) {
-
-    return db.prepare(`
-        SELECT
-            id,
-            name,
-            email,
-            role
-        FROM users
-        WHERE id = ?
-        LIMIT 1
-    `).get(userId);
-}
+// =========================================================
+// HTML ESCAPE
+// =========================================================
 
 function escapeHtml(value) {
 
-    return String(value ?? "")
+    return String(value || "")
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;")
@@ -170,655 +260,1462 @@ function escapeHtml(value) {
 }
 
 // =========================================================
-// CUSTOMER - GET OWN MESSAGES
+// SESSION
 // =========================================================
 
-router.get(
-    "/messages",
-    requireAuth,
-    (req, res) => {
+function createSession(user) {
 
-        try {
+    const token =
+        crypto.randomBytes(32).toString("hex");
 
-            if (
-                !req.user ||
-                req.user.role !== "customer"
-            ) {
+    const expiresAt =
+        Date.now() + SESSION_DURATION_MS;
 
-                return res.status(403).json({
-                    success: false,
-                    message:
-                        "Customer access required."
-                });
-            }
+    sessions.set(token, {
+        userId: user.id,
+        role: user.role,
+        expiresAt
+    });
 
-            const userId =
-                getUserId(req);
+    return {
+        token,
+        expiresAt
+    };
+}
 
-            if (!userId) {
+// =========================================================
+// GET SESSION
+// =========================================================
 
-                return res.status(401).json({
-                    success: false,
-                    message:
-                        "Authentication required."
-                });
-            }
+function getSession(token) {
 
-            const messages =
-                db.prepare(`
-                    SELECT
-                        id,
-                        user_id,
-                        sender_type,
-                        message,
-                        is_read,
-                        created_at
-                    FROM support_chat_messages
-                    WHERE user_id = ?
-                    ORDER BY id ASC
-                `).all(userId);
-
-            // Admin replies become read when
-            // customer opens the chat.
-            db.prepare(`
-                UPDATE support_chat_messages
-                SET is_read = 1
-                WHERE
-                    user_id = ?
-                    AND sender_type = 'admin'
-            `).run(userId);
-
-            return res.json({
-                success: true,
-                messages
-            });
-
-        } catch (error) {
-
-            console.error(
-                "CHAT GET CUSTOMER ERROR:",
-                error
-            );
-
-            return res.status(500).json({
-                success: false,
-                message:
-                    "Unable to load chat messages."
-            });
-        }
+    if (!token) {
+        return null;
     }
-);
+
+    const session =
+        sessions.get(token);
+
+    if (!session) {
+        return null;
+    }
+
+    if (
+        Date.now() >
+        session.expiresAt
+    ) {
+        sessions.delete(token);
+        return null;
+    }
+
+    return session;
+}
 
 // =========================================================
-// CUSTOMER - SEND MESSAGE
+// GET TOKEN
+// =========================================================
+
+function getTokenFromRequest(req) {
+
+    const authHeader =
+        req.headers.authorization || "";
+
+    if (
+        !authHeader.startsWith("Bearer ")
+    ) {
+        return null;
+    }
+
+    return authHeader
+        .substring(7)
+        .trim();
+}
+
+// =========================================================
+// GET AUTHENTICATED USER
+// =========================================================
+
+function getAuthenticatedUser(req) {
+
+    const token =
+        getTokenFromRequest(req);
+
+    if (!token) {
+        return null;
+    }
+
+    const session =
+        getSession(token);
+
+    if (!session) {
+        return null;
+    }
+
+    const user =
+        db.prepare(`
+            SELECT
+                id,
+                name,
+                email,
+                phone,
+                role,
+                created_at,
+                updated_at
+            FROM users
+            WHERE id = ?
+            LIMIT 1
+        `).get(session.userId);
+
+    if (!user) {
+
+        sessions.delete(token);
+
+        return null;
+    }
+
+    return {
+        token,
+        session,
+        user
+    };
+}
+
+// =========================================================
+// REQUIRE LOGIN
+// =========================================================
+
+function requireAuth(
+    req,
+    res,
+    next
+) {
+
+    const authenticated =
+        getAuthenticatedUser(req);
+
+    if (!authenticated) {
+
+        return res.status(401).json({
+
+            success: false,
+
+            message:
+                "Authentication required."
+
+        });
+    }
+
+    req.user =
+        authenticated.user;
+
+    req.authToken =
+        authenticated.token;
+
+    req.session =
+        authenticated.session;
+
+    next();
+}
+
+// =========================================================
+// REQUIRE ADMIN
+// =========================================================
+
+function requireAdmin(
+    req,
+    res,
+    next
+) {
+
+    const authenticated =
+        getAuthenticatedUser(req);
+
+    if (!authenticated) {
+
+        return res.status(401).json({
+
+            success: false,
+
+            message:
+                "Authentication required."
+
+        });
+    }
+
+    if (
+        authenticated.user.role !==
+        "admin"
+    ) {
+
+        return res.status(403).json({
+
+            success: false,
+
+            message:
+                "Admin access required."
+
+        });
+    }
+
+    req.user =
+        authenticated.user;
+
+    req.authToken =
+        authenticated.token;
+
+    req.session =
+        authenticated.session;
+
+    next();
+}
+
+// =========================================================
+// CUSTOMER REGISTER
+// POST /api/auth/register
 // =========================================================
 
 router.post(
-    "/messages",
-    requireAuth,
-    (req, res) => {
+    "/register",
+    async (req, res) => {
 
         try {
 
-            if (
-                !req.user ||
-                req.user.role !== "customer"
-            ) {
-
-                return res.status(403).json({
-                    success: false,
-                    message:
-                        "Customer access required."
-                });
-            }
-
-            const userId =
-                getUserId(req);
-
-            if (!userId) {
-
-                return res.status(401).json({
-                    success: false,
-                    message:
-                        "Authentication required."
-                });
-            }
-
-            const message =
-                cleanMessage(
-                    req.body?.message
+            const name =
+                cleanText(
+                    req.body.name
                 );
 
-            if (!message) {
+            const email =
+                normalizeEmail(
+                    req.body.email
+                );
+
+            const phone =
+                cleanText(
+                    req.body.phone
+                );
+
+            const country =
+                cleanText(
+                    req.body.country
+                );
+
+            const city =
+                cleanText(
+                    req.body.city
+                );
+
+            const password =
+                cleanText(
+                    req.body.password
+                );
+
+            const consent =
+                Boolean(
+                    req.body.consent
+                );
+
+            // -------------------------------------------------
+            // VALIDATION
+            // -------------------------------------------------
+
+            if (
+                !name ||
+                !email ||
+                !password
+            ) {
 
                 return res.status(400).json({
+
                     success: false,
+
                     message:
-                        "Message cannot be empty."
+                        "Full name, email and password are required."
+
                 });
             }
 
-            if (message.length > 2000) {
+            if (!isValidEmail(email)) {
 
                 return res.status(400).json({
+
                     success: false,
+
                     message:
-                        "Message cannot exceed 2000 characters."
+                        "Please enter a valid email address."
+
                 });
             }
+
+            if (!isStrongPassword(password)) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "Password must contain at least 8 characters and include letters and numbers."
+
+                });
+            }
+
+            if (!consent) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "You must agree to the Terms & Conditions and Privacy Policy."
+
+                });
+            }
+
+            // -------------------------------------------------
+            // DUPLICATE EMAIL
+            // -------------------------------------------------
+
+            const existingUser =
+                db.prepare(`
+                    SELECT id
+                    FROM users
+                    WHERE email = ?
+                    LIMIT 1
+                `).get(email);
+
+            if (existingUser) {
+
+                return res.status(409).json({
+
+                    success: false,
+
+                    message:
+                        "An account with this email already exists. Please login instead."
+
+                });
+            }
+
+            // -------------------------------------------------
+            // HASH PASSWORD
+            // -------------------------------------------------
+
+            const passwordHash =
+                await bcrypt.hash(
+                    password,
+                    12
+                );
+
+            // -------------------------------------------------
+            // CREATE CUSTOMER
+            // -------------------------------------------------
 
             const result =
                 db.prepare(`
-                    INSERT INTO support_chat_messages
-                    (
-                        user_id,
-                        sender_type,
-                        message,
-                        is_read
+                    INSERT INTO users (
+                        name,
+                        email,
+                        phone,
+                        password_hash,
+                        role
                     )
-                    VALUES
-                    (?, 'customer', ?, 0)
+                    VALUES (?, ?, ?, ?, ?)
                 `).run(
-                    userId,
-                    message
+                    name,
+                    email,
+                    phone || null,
+                    passwordHash,
+                    "customer"
                 );
-
-            const savedMessage =
-                db.prepare(`
-                    SELECT
-                        id,
-                        user_id,
-                        sender_type,
-                        message,
-                        is_read,
-                        created_at
-                    FROM support_chat_messages
-                    WHERE id = ?
-                    LIMIT 1
-                `).get(
-                    result.lastInsertRowid
-                );
-
-            console.log(
-                `CHAT: Customer ${userId} sent message #${result.lastInsertRowid}`
-            );
 
             return res.status(201).json({
 
                 success: true,
 
                 message:
-                    "Message sent successfully.",
+                    "Account created successfully. Please login.",
 
-                data: savedMessage
+                userId:
+                    result.lastInsertRowid
 
             });
 
         } catch (error) {
 
             console.error(
-                "CHAT SEND CUSTOMER ERROR:",
+                "Customer registration error:",
                 error
             );
 
             return res.status(500).json({
+
                 success: false,
+
                 message:
-                    "Unable to send message."
+                    "Unable to create your account right now."
+
             });
         }
     }
 );
 
 // =========================================================
-// ADMIN - CUSTOMER CONVERSATION LIST
+// LOGIN
+// POST /api/auth/login
+// CUSTOMER + ADMIN
 // =========================================================
 
-router.get(
-    "/conversations",
-    requireAdmin,
-    (req, res) => {
+router.post(
+    "/login",
+    async (req, res) => {
 
         try {
 
-            const rows =
-                db.prepare(`
-                    SELECT
-                        u.id AS user_id,
-                        u.name,
-                        u.email,
+            // -------------------------------------------------
+            // NORMALIZE EMAIL
+            // -------------------------------------------------
 
-                        (
-                            SELECT cm.message
-                            FROM support_chat_messages cm
-                            WHERE cm.user_id = u.id
-                            ORDER BY cm.id DESC
-                            LIMIT 1
-                        ) AS last_message,
+            const email =
+                String(
+                    req.body?.email || ""
+                )
+                    .trim()
+                    .toLowerCase();
 
-                        (
-                            SELECT cm.created_at
-                            FROM support_chat_messages cm
-                            WHERE cm.user_id = u.id
-                            ORDER BY cm.id DESC
-                            LIMIT 1
-                        ) AS last_message_at,
+            // IMPORTANT:
+            // Do NOT trim password.
+            // Password must be checked exactly as entered.
 
-                        (
-                            SELECT COUNT(*)
-                            FROM support_chat_messages cm
-                            WHERE
-                                cm.user_id = u.id
-                                AND cm.sender_type = 'customer'
-                                AND cm.is_read = 0
-                        ) AS unread_count
-
-                    FROM users u
-
-                    WHERE
-                        u.role = 'customer'
-                        AND EXISTS (
-                            SELECT 1
-                            FROM support_chat_messages cm2
-                            WHERE cm2.user_id = u.id
-                        )
-
-                    ORDER BY
-                        last_message_at DESC
-                `).all();
-
-            return res.json({
-                success: true,
-                conversations: rows
-            });
-
-        } catch (error) {
-
-            console.error(
-                "CHAT ADMIN CONVERSATIONS ERROR:",
-                error
-            );
-
-            return res.status(500).json({
-                success: false,
-                message:
-                    "Unable to load chat conversations."
-            });
-        }
-    }
-);
-
-// =========================================================
-// ADMIN - GET CUSTOMER MESSAGES
-// =========================================================
-
-router.get(
-    "/conversations/:userId",
-    requireAdmin,
-    (req, res) => {
-
-        try {
-
-            const userId =
-                Number(
-                    req.params.userId
+            const password =
+                String(
+                    req.body?.password || ""
                 );
 
+            const remember =
+                Boolean(
+                    req.body?.remember
+                );
+
+            // -------------------------------------------------
+            // BASIC VALIDATION
+            // -------------------------------------------------
+
             if (
-                !Number.isInteger(userId) ||
-                userId <= 0
+                !email ||
+                !password
             ) {
 
                 return res.status(400).json({
                     success: false,
                     message:
-                        "Invalid customer."
+                        "Email and password are required."
                 });
+
             }
 
-            const customer =
-                getCustomerById(userId);
+            if (!isValidEmail(email)) {
 
-            if (
-                !customer ||
-                customer.role !== "customer"
-            ) {
-
-                return res.status(404).json({
+                return res.status(400).json({
                     success: false,
                     message:
-                        "Customer not found."
+                        "Please enter a valid email address."
                 });
+
             }
 
-            const messages =
+            // -------------------------------------------------
+            // FIND USER
+            // CASE + SPACE SAFE EMAIL MATCH
+            // -------------------------------------------------
+
+            const user =
                 db.prepare(`
                     SELECT
                         id,
-                        user_id,
-                        sender_type,
-                        message,
-                        is_read,
-                        created_at
-                    FROM support_chat_messages
-                    WHERE user_id = ?
-                    ORDER BY id ASC
-                `).all(userId);
+                        name,
+                        email,
+                        phone,
+                        password_hash,
+                        role
+                    FROM users
+                    WHERE LOWER(TRIM(email)) = ?
+                    LIMIT 1
+                `).get(email);
 
-            // Customer messages become read
-            // when admin opens the conversation.
-            db.prepare(`
-                UPDATE support_chat_messages
-                SET is_read = 1
-                WHERE
-                    user_id = ?
-                    AND sender_type = 'customer'
-            `).run(userId);
+            // -------------------------------------------------
+            // USER NOT FOUND
+            // -------------------------------------------------
 
-            return res.json({
+            if (!user) {
+
+                console.log(
+                    "LOGIN FAILED - USER NOT FOUND:",
+                    email
+                );
+
+                return res.status(401).json({
+                    success: false,
+                    message:
+                        "Invalid email or password."
+                });
+
+            }
+
+            // -------------------------------------------------
+            // PASSWORD CHECK
+            // -------------------------------------------------
+
+            if (
+                !user.password_hash
+            ) {
+
+                console.error(
+                    "LOGIN ERROR - PASSWORD HASH MISSING:",
+                    {
+                        userId: user.id,
+                        email: user.email
+                    }
+                );
+
+                return res.status(401).json({
+                    success: false,
+                    message:
+                        "Invalid email or password."
+                });
+
+            }
+
+            const passwordMatches =
+                await bcrypt.compare(
+                    password,
+                    user.password_hash
+                );
+
+            // -------------------------------------------------
+            // WRONG PASSWORD
+            // -------------------------------------------------
+
+            if (!passwordMatches) {
+
+                console.log(
+                    "LOGIN FAILED - PASSWORD MISMATCH:",
+                    email
+                );
+
+                return res.status(401).json({
+                    success: false,
+                    message:
+                        "Invalid email or password."
+                });
+
+            }
+
+            // -------------------------------------------------
+            // NORMALIZE ROLE
+            // -------------------------------------------------
+
+            const normalizedRole =
+                String(
+                    user.role || "customer"
+                )
+                    .trim()
+                    .toLowerCase();
+
+            // -------------------------------------------------
+            // CREATE SESSION
+            // -------------------------------------------------
+
+            const session =
+                createSession({
+                    ...user,
+                    role: normalizedRole
+                });
+
+            // -------------------------------------------------
+            // RESPONSE USER
+            // -------------------------------------------------
+
+            const responseUser = {
+
+                id: user.id,
+
+                name: user.name,
+
+                email:
+                    String(
+                        user.email || ""
+                    )
+                        .trim()
+                        .toLowerCase(),
+
+                phone: user.phone,
+
+                role: normalizedRole
+
+            };
+
+            // -------------------------------------------------
+            // SUCCESS
+            // -------------------------------------------------
+
+            console.log(
+                "LOGIN SUCCESS:",
+                {
+                    userId: user.id,
+                    email: responseUser.email,
+                    role: normalizedRole
+                }
+            );
+
+            return res.status(200).json({
 
                 success: true,
 
-                customer: {
-                    id: customer.id,
-                    name: customer.name,
-                    email: customer.email
-                },
+                message:
+                    "Login successful.",
 
-                messages
+                token:
+                    session.token,
+
+                expiresAt:
+                    session.expiresAt,
+
+                remember,
+
+                user:
+                    responseUser
 
             });
 
         } catch (error) {
 
             console.error(
-                "CHAT ADMIN MESSAGES ERROR:",
+                "Login error:",
                 error
             );
 
             return res.status(500).json({
+
                 success: false,
+
                 message:
-                    "Unable to load conversation."
+                    "Unable to process login right now."
+
             });
+
         }
+
     }
 );
 
 // =========================================================
-// ADMIN - REPLY
+// LOGOUT
 // =========================================================
 
 router.post(
-    "/conversations/:userId/reply",
+    "/logout",
+    requireAuth,
+    (req, res) => {
+
+        sessions.delete(
+            req.authToken
+        );
+
+        return res.status(200).json({
+
+            success: true,
+
+            message:
+                "Logout successful."
+
+        });
+    }
+);
+
+console.log("AUTH DEBUG requireAuth:", typeof requireAuth);
+console.log("AUTH DEBUG requireAdmin:", typeof requireAdmin);
+
+// =========================================================
+// CURRENT USER
+// GET /api/auth/me
+// =========================================================
+
+router.get(
+    "/me",
+    requireAuth,
+    (req, res) => {
+
+        return res.status(200).json({
+
+            success: true,
+
+            user:
+                req.user
+
+        });
+    }
+);
+
+// =========================================================
+// ADMIN CHECK
+// =========================================================
+
+router.get(
+    "/admin-check",
+    requireAdmin,
+    (req, res) => {
+
+        return res.status(200).json({
+
+            success: true,
+
+            message:
+                "Admin authentication verified.",
+
+            user:
+                req.user
+
+        });
+    }
+);
+
+// =========================================================
+// ADMIN CREATE USER
+// =========================================================
+
+router.post(
+    "/create-user",
     requireAdmin,
     async (req, res) => {
 
         try {
 
-            const userId =
-                Number(
-                    req.params.userId
+            const name =
+                cleanText(
+                    req.body.name
+                );
+
+            const email =
+                normalizeEmail(
+                    req.body.email
+                );
+
+            const phone =
+                cleanText(
+                    req.body.phone
+                );
+
+            const password =
+                cleanText(
+                    req.body.password
+                );
+
+            const role =
+                cleanText(
+                    req.body.role ||
+                    "customer"
                 );
 
             if (
-                !Number.isInteger(userId) ||
-                userId <= 0
+                !name ||
+                !email ||
+                !password
             ) {
 
                 return res.status(400).json({
+
                     success: false,
+
                     message:
-                        "Invalid customer."
+                        "Name, email and password are required."
+
                 });
             }
 
-            const message =
-                cleanMessage(
-                    req.body?.message
-                );
-
-            if (!message) {
+            if (!isValidEmail(email)) {
 
                 return res.status(400).json({
+
                     success: false,
+
                     message:
-                        "Reply cannot be empty."
+                        "Please enter a valid email address."
+
                 });
             }
 
-            if (message.length > 2000) {
+            if (!isStrongPassword(password)) {
 
                 return res.status(400).json({
+
                     success: false,
+
                     message:
-                        "Reply cannot exceed 2000 characters."
+                        "Password must contain at least 8 characters and include letters and numbers."
+
                 });
             }
-
-            const customer =
-                getCustomerById(userId);
 
             if (
-                !customer ||
-                customer.role !== "customer"
+                !["customer", "admin"]
+                    .includes(role)
             ) {
 
-                return res.status(404).json({
+                return res.status(400).json({
+
                     success: false,
+
                     message:
-                        "Customer not found."
+                        "Invalid account role."
+
                 });
             }
+
+            const existingUser =
+                db.prepare(`
+                    SELECT id
+                    FROM users
+                    WHERE email = ?
+                    LIMIT 1
+                `).get(email);
+
+            if (existingUser) {
+
+                return res.status(409).json({
+
+                    success: false,
+
+                    message:
+                        "An account with this email already exists."
+
+                });
+            }
+
+            const passwordHash =
+                await bcrypt.hash(
+                    password,
+                    12
+                );
 
             const result =
                 db.prepare(`
-                    INSERT INTO support_chat_messages
-                    (
-                        user_id,
-                        sender_type,
-                        message,
-                        is_read
+                    INSERT INTO users (
+                        name,
+                        email,
+                        phone,
+                        password_hash,
+                        role
                     )
-                    VALUES
-                    (?, 'admin', ?, 0)
+                    VALUES (?, ?, ?, ?, ?)
                 `).run(
-                    userId,
-                    message
+                    name,
+                    email,
+                    phone || null,
+                    passwordHash,
+                    role
                 );
-
-            const savedMessage =
-                db.prepare(`
-                    SELECT
-                        id,
-                        user_id,
-                        sender_type,
-                        message,
-                        is_read,
-                        created_at
-                    FROM support_chat_messages
-                    WHERE id = ?
-                    LIMIT 1
-                `).get(
-                    result.lastInsertRowid
-                );
-
-            console.log(
-                `CHAT: Admin replied to customer ${userId}`
-            );
-
-            // =================================================
-            // EMAIL CUSTOMER
-            // =================================================
-
-            if (
-                transporter &&
-                customer.email &&
-                process.env.MAIL_FROM
-            ) {
-
-                try {
-
-                    await transporter.sendMail({
-
-                        from:
-                            process.env.MAIL_FROM,
-
-                        to:
-                            customer.email,
-
-                        subject:
-                            "New message from U.S TRAVEL & TOURS",
-
-                        text:
-`Hello ${customer.name || "Customer"},
-
-You have received a new message from U.S TRAVEL & TOURS Support.
-
-Support message:
-
-${message}
-
-Please log in to your account to continue the conversation.
-
-U.S TRAVEL & TOURS
-Miami, Florida, USA`,
-
-                        html:
-`
-<div style="font-family:Arial,sans-serif;line-height:1.6;color:#222">
-
-    <h2>U.S TRAVEL & TOURS</h2>
-
-    <p>
-        Hello ${escapeHtml(
-            customer.name || "Customer"
-        )},
-    </p>
-
-    <p>
-        You have received a new message from
-        U.S TRAVEL & TOURS Support.
-    </p>
-
-    <div style="
-        background:#f5f5f5;
-        border-left:4px solid #b8944a;
-        padding:15px;
-        margin:20px 0;
-    ">
-        ${escapeHtml(message)}
-    </div>
-
-    <p>
-        Please log in to your account to continue
-        the conversation.
-    </p>
-
-    <p>
-        U.S TRAVEL & TOURS<br>
-        Miami, Florida, USA
-    </p>
-
-</div>
-`
-                    });
-
-                    console.log(
-                        `CHAT EMAIL: Notification sent to ${customer.email}`
-                    );
-
-                } catch (emailError) {
-
-                    console.error(
-                        "CHAT EMAIL ERROR:",
-                        emailError
-                    );
-                }
-            }
 
             return res.status(201).json({
 
                 success: true,
 
                 message:
-                    "Reply sent successfully.",
+                    "User account created successfully.",
 
-                data: savedMessage
+                userId:
+                    result.lastInsertRowid
 
             });
 
         } catch (error) {
 
             console.error(
-                "CHAT ADMIN REPLY ERROR:",
+                "Create user error:",
                 error
             );
 
             return res.status(500).json({
+
                 success: false,
+
                 message:
-                    "Unable to send reply."
+                    "Unable to create user account."
+
             });
         }
     }
 );
 
 // =========================================================
-// ADMIN - MARK CUSTOMER CHAT READ
+// FORGOT PASSWORD
+// POST /api/auth/forgot-password
 // =========================================================
 
-router.patch(
-    "/conversations/:userId/read",
-    requireAdmin,
-    (req, res) => {
+router.post(
+    "/forgot-password",
+    async (req, res) => {
 
         try {
 
-            const userId =
-                Number(
-                    req.params.userId
+            const email =
+                normalizeEmail(
+                    req.body.email
                 );
 
+            // Always return the same message.
+            // This prevents account enumeration.
+
+            const genericMessage =
+                "If an account exists for this email, a password reset link has been sent.";
+
             if (
-                !Number.isInteger(userId) ||
-                userId <= 0
+                !email ||
+                !isValidEmail(email)
             ) {
 
-                return res.status(400).json({
-                    success: false,
+                return res.status(200).json({
+
+                    success: true,
+
                     message:
-                        "Invalid customer."
+                        genericMessage
+
                 });
             }
 
-            db.prepare(`
-                UPDATE support_chat_messages
-                SET is_read = 1
-                WHERE
-                    user_id = ?
-                    AND sender_type = 'customer'
-            `).run(userId);
+            const user =
+                db.prepare(`
+                    SELECT
+                        id,
+                        name,
+                        email
+                    FROM users
+                    WHERE email = ?
+                    LIMIT 1
+                `).get(email);
 
-            return res.json({
-                success: true
+            if (!user) {
+
+                return res.status(200).json({
+
+                    success: true,
+
+                    message:
+                        genericMessage
+
+                });
+            }
+
+            // -------------------------------------------------
+            // REMOVE OLD RESET TOKENS
+            // -------------------------------------------------
+
+            db.prepare(`
+                DELETE FROM password_resets
+                WHERE user_id = ?
+            `).run(user.id);
+
+            // -------------------------------------------------
+            // GENERATE SECURE TOKEN
+            // -------------------------------------------------
+
+            const rawToken =
+                crypto
+                    .randomBytes(32)
+                    .toString("hex");
+
+            const tokenHash =
+                crypto
+                    .createHash("sha256")
+                    .update(rawToken)
+                    .digest("hex");
+
+            const expiresAt =
+                Date.now() +
+                RESET_TOKEN_DURATION_MS;
+
+            db.prepare(`
+                INSERT INTO password_resets (
+                    user_id,
+                    token_hash,
+                    expires_at
+                )
+                VALUES (?, ?, ?)
+            `).run(
+                user.id,
+                tokenHash,
+                expiresAt
+            );
+
+            // -------------------------------------------------
+            // SEND EMAIL
+            // -------------------------------------------------
+
+            try {
+
+                await sendPasswordResetEmail(
+                    user,
+                    rawToken
+                );
+
+            } catch (mailError) {
+
+                console.error(
+                    "Password reset email error:",
+                    mailError
+                );
+
+                // Delete unusable token
+                db.prepare(`
+                    DELETE FROM password_resets
+                    WHERE token_hash = ?
+                `).run(tokenHash);
+
+                return res.status(200).json({
+
+                    success: true,
+
+                    message:
+                        genericMessage
+
+                });
+            }
+
+            return res.status(200).json({
+
+                success: true,
+
+                message:
+                    genericMessage
+
             });
 
         } catch (error) {
 
             console.error(
-                "CHAT READ ERROR:",
+                "Forgot password error:",
                 error
             );
 
             return res.status(500).json({
+
                 success: false,
+
                 message:
-                    "Unable to update chat."
+                    "Unable to process your password reset request right now."
+
             });
         }
     }
 );
+
+// =========================================================
+// RESET PASSWORD
+// POST /api/auth/reset-password
+// =========================================================
+
+router.post(
+    "/reset-password",
+    async (req, res) => {
+
+        try {
+
+            const token =
+                cleanText(
+                    req.body.token
+                );
+
+            const newPassword =
+                cleanText(
+                    req.body.newPassword
+                );
+
+            const confirmPassword =
+                cleanText(
+                    req.body.confirmPassword
+                );
+
+            if (
+                !token ||
+                !newPassword ||
+                !confirmPassword
+            ) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "Reset token and password are required."
+
+                });
+            }
+
+            if (
+                newPassword !==
+                confirmPassword
+            ) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "Passwords do not match."
+
+                });
+            }
+
+            if (
+                !isStrongPassword(
+                    newPassword
+                )
+            ) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "Password must contain at least 8 characters and include letters and numbers."
+
+                });
+            }
+
+            const tokenHash =
+                crypto
+                    .createHash("sha256")
+                    .update(token)
+                    .digest("hex");
+
+            const resetRecord =
+                db.prepare(`
+                    SELECT
+                        id,
+                        user_id,
+                        expires_at,
+                        used_at
+                    FROM password_resets
+                    WHERE token_hash = ?
+                    LIMIT 1
+                `).get(tokenHash);
+
+            if (!resetRecord) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "This password reset link is invalid or has expired."
+
+                });
+            }
+
+            if (resetRecord.used_at) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "This password reset link has already been used."
+
+                });
+            }
+
+            if (
+                Date.now() >
+                Number(
+                    resetRecord.expires_at
+                )
+            ) {
+
+                db.prepare(`
+                    DELETE FROM password_resets
+                    WHERE id = ?
+                `).run(resetRecord.id);
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "This password reset link has expired. Please request a new one."
+
+                });
+            }
+
+            const passwordHash =
+                await bcrypt.hash(
+                    newPassword,
+                    12
+                );
+
+            // -------------------------------------------------
+            // UPDATE PASSWORD
+            // -------------------------------------------------
+
+            const transaction =
+                db.transaction(() => {
+
+                    db.prepare(`
+                        UPDATE users
+                        SET
+                            password_hash = ?,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                    `).run(
+                        passwordHash,
+                        resetRecord.user_id
+                    );
+
+                    db.prepare(`
+                        UPDATE password_resets
+                        SET used_at = ?
+                        WHERE id = ?
+                    `).run(
+                        Date.now(),
+                        resetRecord.id
+                    );
+                });
+
+            transaction();
+
+            // -------------------------------------------------
+            // INVALIDATE ALL EXISTING SESSIONS
+            // -------------------------------------------------
+
+            for (
+                const [
+                    sessionToken,
+                    session
+                ] of sessions.entries()
+            ) {
+
+                if (
+                    session.userId ===
+                    resetRecord.user_id
+                ) {
+
+                    sessions.delete(
+                        sessionToken
+                    );
+                }
+            }
+
+            return res.status(200).json({
+
+                success: true,
+
+                message:
+                    "Your password has been reset successfully. Please login with your new password."
+
+            });
+
+        } catch (error) {
+
+            console.error(
+                "Reset password error:",
+                error
+            );
+
+            return res.status(500).json({
+
+                success: false,
+
+                message:
+                    "Unable to reset your password right now."
+
+            });
+        }
+    }
+);
+
+// =========================================================
+// CHANGE PASSWORD
+// =========================================================
+
+router.post(
+    "/change-password",
+    requireAuth,
+    async (req, res) => {
+
+        try {
+
+            const currentPassword =
+                cleanText(
+                    req.body.currentPassword
+                );
+
+            const newPassword =
+                cleanText(
+                    req.body.newPassword
+                );
+
+            if (
+                !currentPassword ||
+                !newPassword
+            ) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "Current password and new password are required."
+
+                });
+            }
+
+            if (
+                !isStrongPassword(
+                    newPassword
+                )
+            ) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "New password must contain at least 8 characters and include letters and numbers."
+
+                });
+            }
+
+            const user =
+                db.prepare(`
+                    SELECT
+                        id,
+                        password_hash
+                    FROM users
+                    WHERE id = ?
+                    LIMIT 1
+                `).get(req.user.id);
+
+            if (!user) {
+
+                return res.status(404).json({
+
+                    success: false,
+
+                    message:
+                        "User account not found."
+
+                });
+            }
+
+            const currentMatches =
+                await bcrypt.compare(
+                    currentPassword,
+                    user.password_hash
+                );
+
+            if (!currentMatches) {
+
+                return res.status(401).json({
+
+                    success: false,
+
+                    message:
+                        "Current password is incorrect."
+
+                });
+            }
+
+            const newPasswordHash =
+                await bcrypt.hash(
+                    newPassword,
+                    12
+                );
+
+            db.prepare(`
+                UPDATE users
+                SET
+                    password_hash = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            `).run(
+                newPasswordHash,
+                req.user.id
+            );
+
+            for (
+                const [
+                    token,
+                    session
+                ] of sessions.entries()
+            ) {
+
+                if (
+                    session.userId ===
+                    req.user.id
+                ) {
+
+                    sessions.delete(token);
+                }
+            }
+
+            return res.status(200).json({
+
+                success: true,
+
+                message:
+                    "Password changed successfully. Please login again."
+
+            });
+
+        } catch (error) {
+
+            console.error(
+                "Change password error:",
+                error
+            );
+
+            return res.status(500).json({
+
+                success: false,
+
+                message:
+                    "Unable to change password right now."
+
+            });
+        }
+    }
+);
+
+// =========================================================
+// CLEAN EXPIRED SESSIONS / RESET TOKENS
+// =========================================================
+
+setInterval(() => {
+
+    const now =
+        Date.now();
+
+    for (
+        const [
+            token,
+            session
+        ] of sessions.entries()
+    ) {
+
+        if (
+            now >
+            session.expiresAt
+        ) {
+
+            sessions.delete(token);
+        }
+    }
+
+    db.prepare(`
+        DELETE FROM password_resets
+        WHERE expires_at < ?
+        OR used_at IS NOT NULL
+    `).run(now);
+
+}, 1000 * 60 * 30);
 
 // =========================================================
 // EXPORT
@@ -826,6 +1723,12 @@ router.patch(
 
 module.exports = router;
 
+module.exports.requireAuth =
+    requireAuth;
+
+module.exports.requireAdmin =
+    requireAdmin;
+
 console.log(
-    "CHAT: Live chat backend loaded."
+    "U.S TRAVEL & TOURS authentication system initialized."
 );
