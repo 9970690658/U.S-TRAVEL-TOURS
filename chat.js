@@ -3,7 +3,7 @@
 const express = require("express");
 const router = express.Router();
 
-const db = require("./database");
+const { db } = require("./database");
 const { requireAuth, requireAdmin } = require("./auth");
 
 const { Pool } = require("pg");
