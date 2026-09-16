@@ -598,7 +598,42 @@ app.use(
 
     }
 );
+
+// =========================================================
+// DATABASE USER CHECK
+// =========================================================
+
+try {
+
+    const userCount = db.prepare(
+        "SELECT COUNT(*) AS count FROM users"
+    ).get();
+
+    console.log("");
+    console.log(
+        "DATABASE USER CHECK"
+    );
+    console.log(
+        "Database path:",
+        require("./database").DB_PATH
+    );
+    console.log(
+        "Total users:",
+        userCount.count
+    );
+    console.log("");
+
+} catch (error) {
+
+    console.error(
+        "DATABASE USER CHECK ERROR:",
+        error
+    );
+
+}
+
 bootstrapAdmin();
+
 // =========================================================
 // START SERVER
 // RENDER
