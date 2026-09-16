@@ -549,6 +549,10 @@ router.get(
 // ADMIN - REPLY
 // =========================================================
 
+// =========================================================
+// ADMIN - REPLY
+// =========================================================
+
 router.post(
     "/conversations/:userId/reply",
     requireAdmin,
@@ -561,6 +565,16 @@ router.post(
                     req.params.userId
                 );
 
+            const source =
+                String(
+                    req.query.source || "sqlite"
+                ).toLowerCase();
+
+
+            // -------------------------------------------------
+            // VALIDATE USER ID
+            // -------------------------------------------------
+
             if (
                 !Number.isInteger(userId) ||
                 userId <= 0
@@ -571,12 +585,37 @@ router.post(
                     message:
                         "Invalid customer."
                 });
+
             }
+
+
+            // -------------------------------------------------
+            // VALIDATE SOURCE
+            // -------------------------------------------------
+
+            if (
+                source !== "sqlite" &&
+                source !== "supabase"
+            ) {
+
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        "Invalid customer source."
+                });
+
+            }
+
+
+            // -------------------------------------------------
+            // GET MESSAGE
+            // -------------------------------------------------
 
             const message =
                 cleanMessage(
                     req.body?.message
                 );
+
 
             if (!message) {
 
@@ -585,7 +624,9 @@ router.post(
                     message:
                         "Reply cannot be empty."
                 });
+
             }
+
 
             if (message.length > 2000) {
 
@@ -594,10 +635,23 @@ router.post(
                     message:
                         "Reply cannot exceed 2000 characters."
                 });
+
             }
 
+
+            // -------------------------------------------------
+            // GET CUSTOMER
+            //
+            // IMPORTANT:
+            // SQLite and Supabase use separate ID systems.
+            // -------------------------------------------------
+
             const customer =
-                getCustomerById(userId);
+                await getCustomerBySource(
+                    userId,
+                    source
+                );
+
 
             if (
                 !customer ||
@@ -609,29 +663,39 @@ router.post(
                     message:
                         "Customer not found."
                 });
+
             }
+
+
+            // -------------------------------------------------
+            // SAVE ADMIN MESSAGE
+            // -------------------------------------------------
 
             const result =
                 db.prepare(`
                     INSERT INTO support_chat_messages
                     (
                         user_id,
+                        user_source,
                         sender_type,
                         message,
                         is_read
                     )
                     VALUES
-                    (?, 'admin', ?, 0)
+                    (?, ?, 'admin', ?, 0)
                 `).run(
                     userId,
+                    source,
                     message
                 );
+
 
             const savedMessage =
                 db.prepare(`
                     SELECT
                         id,
                         user_id,
+                        user_source,
                         sender_type,
                         message,
                         is_read,
@@ -643,124 +707,175 @@ router.post(
                     result.lastInsertRowid
                 );
 
+
             console.log(
-                `CHAT: Admin replied to customer ${userId}`
+                `CHAT: Admin replied to customer ${userId} (${source})`
             );
 
-            // =================================================
-            // EMAIL CUSTOMER
-            // =================================================
 
-            if (
-                transporter &&
-                customer.email &&
-                process.env.MAIL_FROM
-            ) {
+            // -------------------------------------------------
+            // SEND EMAIL TO CUSTOMER
+            // -------------------------------------------------
 
-                try {
+            try {
+
+                const smtpHost =
+                    process.env.SMTP_HOST;
+
+                const smtpPort =
+                    Number(
+                        process.env.SMTP_PORT || 587
+                    );
+
+                const smtpUser =
+                    process.env.SMTP_USER;
+
+                const smtpPass =
+                    process.env.SMTP_PASS;
+
+                const smtpSecure =
+                    String(
+                        process.env.SMTP_SECURE || "false"
+                    ).toLowerCase() === "true";
+
+                const mailFrom =
+                    process.env.MAIL_FROM ||
+                    smtpUser;
+
+
+                if (
+                    customer.email &&
+                    smtpHost &&
+                    smtpUser &&
+                    smtpPass
+                ) {
+
+                    const transporter =
+                        nodemailer.createTransport({
+
+                            host:
+                                smtpHost,
+
+                            port:
+                                smtpPort,
+
+                            secure:
+                                smtpSecure,
+
+                            auth: {
+
+                                user:
+                                    smtpUser,
+
+                                pass:
+                                    smtpPass
+
+                            }
+
+                        });
+
 
                     await transporter.sendMail({
 
                         from:
-                            process.env.MAIL_FROM,
+                            mailFrom,
 
                         to:
                             customer.email,
 
                         subject:
-                            "New message from U.S TRAVEL & TOURS",
+                            "U.S TRAVEL & TOURS - New Live Chat Reply",
 
                         text:
-`Hello ${customer.name || "Customer"},
+                            `Hello ${customer.name || "Customer"},\n\n` +
+                            `You have received a new reply from U.S TRAVEL & TOURS support.\n\n` +
+                            `Message:\n\n${message}\n\n` +
+                            `Please login to your account to continue the conversation.\n\n` +
+                            `U.S TRAVEL & TOURS`
 
-You have received a new message from U.S TRAVEL & TOURS Support.
-
-Support message:
-
-${message}
-
-Please log in to your account to continue the conversation.
-
-U.S TRAVEL & TOURS
-Miami, Florida, USA`,
-
-                        html:
-`
-<div style="font-family:Arial,sans-serif;line-height:1.6;color:#222">
-
-    <h2>U.S TRAVEL & TOURS</h2>
-
-    <p>
-        Hello ${escapeHtml(
-            customer.name || "Customer"
-        )},
-    </p>
-
-    <p>
-        You have received a new message from
-        U.S TRAVEL & TOURS Support.
-    </p>
-
-    <div style="
-        background:#f5f5f5;
-        border-left:4px solid #b8944a;
-        padding:15px;
-        margin:20px 0;
-    ">
-        ${escapeHtml(message)}
-    </div>
-
-    <p>
-        Please log in to your account to continue
-        the conversation.
-    </p>
-
-    <p>
-        U.S TRAVEL & TOURS<br>
-        Miami, Florida, USA
-    </p>
-
-</div>
-`
                     });
 
+
                     console.log(
-                        `CHAT EMAIL: Notification sent to ${customer.email}`
+                        `CHAT: Email notification sent successfully to ${customer.email}`
                     );
 
-                } catch (emailError) {
+                } else {
 
-                    console.error(
-                        "CHAT EMAIL ERROR:",
-                        emailError
+                    console.warn(
+                        "CHAT: Email notification skipped because SMTP configuration or customer email is missing."
                     );
+
                 }
+
+            } catch (emailError) {
+
+                console.error(
+                    "CHAT: Email notification error:",
+                    emailError
+                );
+
             }
 
-            return res.status(201).json({
 
-                success: true,
+            // -------------------------------------------------
+            // RESPONSE
+            // -------------------------------------------------
+
+            return res.json({
+
+                success:
+                    true,
 
                 message:
                     "Reply sent successfully.",
 
-                data: savedMessage
+                data: {
+
+                    customer: {
+
+                        id:
+                            Number(customer.id),
+
+                        name:
+                            customer.name,
+
+                        email:
+                            customer.email,
+
+                        source:
+                            source
+
+                    },
+
+                    message:
+                        savedMessage
+
+                }
 
             });
+
 
         } catch (error) {
 
             console.error(
-                "CHAT ADMIN REPLY ERROR:",
+                "CHAT: Admin reply error:",
                 error
             );
 
+
             return res.status(500).json({
-                success: false,
+
+                success:
+                    false,
+
                 message:
                     "Unable to send reply."
+
             });
+
         }
+
     }
 );
 
