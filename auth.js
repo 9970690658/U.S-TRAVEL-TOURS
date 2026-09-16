@@ -1,14 +1,16 @@
+// =========================================================
+// U.S TRAVEL & TOURS
+// CUSTOMER + ADMIN AUTHENTICATION SYSTEM
+// =========================================================
+
 const express = require("express");
 const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
 const nodemailer = require("nodemailer");
-const { Pool } = require("pg");
 
-// Existing SQLite database is preserved for compatibility
 const { db } = require("./database");
 
 const router = express.Router();
-
 
 // =========================================================
 // CONFIGURATION
@@ -18,133 +20,250 @@ const SESSION_DURATION_MS =
     1000 * 60 * 60 * 24 * 7;
 
 const RESET_TOKEN_DURATION_MS =
-    1000 * 60 * 30;
+    1000 * 60 * 30; // 30 minutes
 
-// Login sessions remain temporary in RAM.
-// Customer accounts themselves are stored permanently
-// in Supabase PostgreSQL.
 const sessions = new Map();
 
-
 // =========================================================
-// SUPABASE / POSTGRES CONNECTION
+// PASSWORD RESET TABLE
 // =========================================================
 
-let supabasePool = null;
-
-if (process.env.DATABASE_URL) {
-
-    supabasePool = new Pool({
-        connectionString: process.env.DATABASE_URL,
-
-        ssl: {
-            rejectUnauthorized: false
-        },
-
-        max: 5,
-
-        idleTimeoutMillis: 30000,
-
-        connectionTimeoutMillis: 10000
-    });
-
-    supabasePool.on("error", (error) => {
-
-        console.error(
-            "Supabase PostgreSQL pool error:",
-            error
-        );
-
-    });
-
-    console.log(
-        "Supabase PostgreSQL authentication database configured."
+db.exec(`
+    CREATE TABLE IF NOT EXISTS password_resets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        expires_at INTEGER NOT NULL,
+        used_at INTEGER,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id)
     );
 
-} else {
+    CREATE INDEX IF NOT EXISTS idx_password_resets_token
+    ON password_resets(token_hash);
 
-    console.warn(
-        "DATABASE_URL is not configured. " +
-        "Customer Supabase authentication will not work."
-    );
-}
-
-
-// =========================================================
-// DATABASE CHECK
-// =========================================================
-
-async function checkSupabaseDatabase() {
-
-    if (!supabasePool) {
-
-        throw new Error(
-            "DATABASE_URL is not configured."
-        );
-
-    }
-
-    const result = await supabasePool.query(
-        "SELECT NOW() AS current_time"
-    );
-
-    return result.rows[0];
-}
-
+    CREATE INDEX IF NOT EXISTS idx_password_resets_user
+    ON password_resets(user_id);
+`);
 
 // =========================================================
 // HELPERS
 // =========================================================
 
 function normalizeEmail(email) {
-
     return String(email || "")
         .trim()
         .toLowerCase();
-
 }
-
 
 function cleanText(value) {
-
-    if (
-        value === undefined ||
-        value === null
-    ) {
-
-        return "";
-
-    }
-
-    return String(value).trim();
-
+    return String(value || "").trim();
 }
-
 
 function isValidEmail(email) {
-
-    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(
-        email
-    );
-
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
-
 
 function isStrongPassword(password) {
-
     return (
-        typeof password === "string" &&
-        password.length >= 6
+        password.length >= 8 &&
+        /[A-Za-z]/.test(password) &&
+        /\d/.test(password)
     );
-
 }
 
+// =========================================================
+// EMAIL CONFIGURATION - BREVO SMTP
+// =========================================================
+
+let mailTransporter = null;
+
+function getMailTransporter() {
+
+    if (mailTransporter) {
+        return mailTransporter;
+    }
+
+    const smtpHost = process.env.SMTP_HOST;
+    const smtpPort = Number(process.env.SMTP_PORT || 587);
+    const smtpUser = process.env.SMTP_USER;
+    const smtpPass = process.env.SMTP_PASS;
+
+    if (!smtpHost || !smtpUser || !smtpPass) {
+
+        console.error(
+            "SMTP CONFIG ERROR: SMTP_HOST / SMTP_USER / SMTP_PASS missing."
+        );
+
+        return null;
+    }
+
+    console.log("Creating SMTP transporter...");
+    console.log("SMTP Host:", smtpHost);
+    console.log("SMTP Port:", smtpPort);
+    console.log("SMTP User:", smtpUser);
+
+    mailTransporter = nodemailer.createTransport({
+        host: smtpHost,
+        port: smtpPort,
+        secure:
+            String(
+                process.env.SMTP_SECURE || "false"
+            ).toLowerCase() === "true",
+
+        auth: {
+            user: smtpUser,
+            pass: smtpPass
+        }
+    });
+
+    return mailTransporter;
+}
 
 // =========================================================
-// SESSION FUNCTIONS
+// SEND PASSWORD RESET EMAIL
 // =========================================================
 
-function createSession(user, source) {
+async function sendPasswordResetEmail(
+    user,
+    rawToken
+) {
+
+    const transporter =
+        getMailTransporter();
+
+    if (!transporter) {
+        throw new Error(
+            "Email service is not configured."
+        );
+    }
+
+    await transporter.verify();
+
+console.log("SMTP connection verified successfully.");
+
+    const baseUrl =
+        String(
+            process.env.APP_BASE_URL ||
+            "http://localhost:3000"
+        ).replace(/\/+$/, "");
+
+    const resetUrl =
+        `${baseUrl}/reset-password.html?token=${encodeURIComponent(rawToken)}`;
+
+    const mailFrom =
+        process.env.MAIL_FROM ||
+        process.env.SMTP_USER;
+
+    const mailResult = await transporter.sendMail({
+
+        from: mailFrom,
+
+        to: user.email,
+
+        subject:
+            "Reset your U.S TRAVEL & TOURS password",
+
+        text:
+`Hello ${user.name || "Customer"},
+
+We received a request to reset your U.S TRAVEL & TOURS account password.
+
+Use the link below to create a new password:
+
+${resetUrl}
+
+This link will expire in 30 minutes and can only be used once.
+
+If you did not request a password reset, you can safely ignore this email.
+
+U.S TRAVEL & TOURS`,
+
+        html:
+`
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Password Reset</title>
+</head>
+
+<body style="margin:0;padding:0;background:#f5f5f5;font-family:Arial,sans-serif;">
+
+<div style="max-width:600px;margin:40px auto;background:#ffffff;padding:40px;border-radius:10px;">
+
+    <h2 style="margin-top:0;">
+        U.S TRAVEL & TOURS
+    </h2>
+
+    <p>
+        Hello ${escapeHtml(user.name || "Customer")},
+    </p>
+
+    <p>
+        We received a request to reset your account password.
+    </p>
+
+    <p>
+        Click the button below to create a new password.
+    </p>
+
+    <p style="margin:30px 0;">
+        <a
+            href="${resetUrl}"
+            style="
+                display:inline-block;
+                padding:14px 24px;
+                background:#111111;
+                color:#ffffff;
+                text-decoration:none;
+                border-radius:6px;
+                font-weight:bold;
+            "
+        >
+            Reset Password
+        </a>
+    </p>
+
+    <p style="font-size:14px;color:#666;">
+        This link expires in 30 minutes and can only be used once.
+    </p>
+
+    <p style="font-size:14px;color:#666;">
+        If you did not request this password reset, you can safely ignore this email.
+    </p>
+
+</div>
+
+</body>
+</html>
+`
+    });
+     console.log("PASSWORD RESET EMAIL SENT");
+    console.log("Message ID:", mailResult.messageId);
+    console.log("Accepted:", mailResult.accepted);
+    console.log("Rejected:", mailResult.rejected);
+}
+
+// =========================================================
+// HTML ESCAPE
+// =========================================================
+
+function escapeHtml(value) {
+
+    return String(value || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+}
+
+// =========================================================
+// SESSION
+// =========================================================
+
+function createSession(user) {
 
     const token =
         crypto.randomBytes(32).toString("hex");
@@ -153,382 +272,205 @@ function createSession(user, source) {
         Date.now() + SESSION_DURATION_MS;
 
     sessions.set(token, {
-
-        userId:
-            Number(user.id),
-
-        role:
-            user.role,
-
-        source:
-            source,
-
-        expiresAt:
-            expiresAt
-
+        userId: user.id,
+        role: user.role,
+        expiresAt
     });
 
     return {
-
-        token:
-            token,
-
-        expiresAt:
-            expiresAt
-
+        token,
+        expiresAt
     };
-
 }
 
+// =========================================================
+// GET SESSION
+// =========================================================
 
 function getSession(token) {
 
     if (!token) {
-
         return null;
-
     }
 
     const session =
         sessions.get(token);
 
     if (!session) {
-
         return null;
-
     }
 
     if (
-        Date.now() >=
+        Date.now() >
         session.expiresAt
     ) {
-
         sessions.delete(token);
-
         return null;
-
     }
 
     return session;
-
 }
 
+// =========================================================
+// GET TOKEN
+// =========================================================
 
 function getTokenFromRequest(req) {
 
-    const authorization =
+    const authHeader =
         req.headers.authorization || "";
 
     if (
-        !authorization.startsWith(
-            "Bearer "
-        )
+        !authHeader.startsWith("Bearer ")
     ) {
-
         return null;
-
     }
 
-    return authorization
+    return authHeader
         .substring(7)
         .trim();
-
 }
 
-
 // =========================================================
-// GET USER BY ID
-//
-// IMPORTANT:
-// SQLite and Supabase have separate ID systems.
-//
-// source = "sqlite"
-// source = "supabase"
-//
-// This prevents an Admin SQLite ID from accidentally
-// matching a Customer Supabase ID.
+// GET AUTHENTICATED USER
 // =========================================================
 
-async function getUserById(userId, source) {
-
-    const numericId =
-        Number(userId);
-
-    if (
-        !Number.isInteger(numericId) ||
-        numericId <= 0
-    ) {
-
-        return null;
-
-    }
-
-
-    // =====================================================
-    // SQLITE USER
-    // =====================================================
-
-    if (source === "sqlite") {
-
-        try {
-
-            const user =
-                db.prepare(
-                    `
-                    SELECT
-                        id,
-                        name,
-                        email,
-                        phone,
-                        password_hash,
-                        role,
-                        created_at,
-                        updated_at
-                    FROM users
-                    WHERE id = ?
-                    LIMIT 1
-                    `
-                ).get(numericId);
-
-            return user || null;
-
-        } catch (error) {
-
-            console.error(
-                "SQLite user lookup error:",
-                error
-            );
-
-            return null;
-
-        }
-
-    }
-
-
-    // =====================================================
-    // SUPABASE USER
-    // =====================================================
-
-    if (
-        source === "supabase" &&
-        supabasePool
-    ) {
-
-        try {
-
-            const result =
-                await supabasePool.query(
-                    `
-                    SELECT
-                        id,
-                        name,
-                        email,
-                        phone,
-                        password_hash,
-                        role,
-                        created_at,
-                        updated_at
-                    FROM users
-                    WHERE id = $1
-                    LIMIT 1
-                    `,
-                    [numericId]
-                );
-
-            if (
-                result.rows.length > 0
-            ) {
-
-                return result.rows[0];
-
-            }
-
-            return null;
-
-        } catch (error) {
-
-            console.error(
-                "Supabase user lookup error:",
-                error
-            );
-
-            return null;
-
-        }
-
-    }
-
-
-    return null;
-
-}
-
-
-// =========================================================
-// AUTHENTICATED USER
-// =========================================================
-
-async function getAuthenticatedUser(req) {
+function getAuthenticatedUser(req) {
 
     const token =
         getTokenFromRequest(req);
 
     if (!token) {
-
         return null;
-
     }
 
     const session =
         getSession(token);
 
     if (!session) {
-
         return null;
-
     }
 
-    // IMPORTANT:
-    // Use the same database from which the session was created.
     const user =
-        await getUserById(
-            session.userId,
-            session.source
-        );
+        db.prepare(`
+            SELECT
+                id,
+                name,
+                email,
+                phone,
+                role,
+                created_at,
+                updated_at
+            FROM users
+            WHERE id = ?
+            LIMIT 1
+        `).get(session.userId);
 
     if (!user) {
 
         sessions.delete(token);
 
         return null;
-
     }
 
-    return user;
-
+    return {
+        token,
+        session,
+        user
+    };
 }
 
-
 // =========================================================
-// REQUIRE AUTH
+// REQUIRE LOGIN
 // =========================================================
 
-async function requireAuth(req, res, next) {
+function requireAuth(
+    req,
+    res,
+    next
+) {
 
-    try {
+    const authenticated =
+        getAuthenticatedUser(req);
 
-        const user =
-            await getAuthenticatedUser(req);
+    if (!authenticated) {
 
-        if (!user) {
-
-            return res.status(401).json({
-
-                success: false,
-
-                message:
-                    "Authentication required."
-
-            });
-
-        }
-
-        req.user = user;
-
-        req.authenticatedUser = user;
-
-        next();
-
-    } catch (error) {
-
-        console.error(
-            "Authentication error:",
-            error
-        );
-
-        return res.status(500).json({
+        return res.status(401).json({
 
             success: false,
 
             message:
-                "Authentication service error."
+                "Authentication required."
 
         });
-
     }
 
-}
+    req.user =
+        authenticated.user;
 
+    req.authToken =
+        authenticated.token;
+
+    req.session =
+        authenticated.session;
+
+    next();
+}
 
 // =========================================================
 // REQUIRE ADMIN
 // =========================================================
 
-async function requireAdmin(req, res, next) {
+function requireAdmin(
+    req,
+    res,
+    next
+) {
 
-    try {
+    const authenticated =
+        getAuthenticatedUser(req);
 
-        const user =
-            await getAuthenticatedUser(req);
+    if (!authenticated) {
 
-        if (!user) {
-
-            return res.status(401).json({
-
-                success: false,
-
-                message:
-                    "Authentication required."
-
-            });
-
-        }
-
-        if (
-            user.role !== "admin"
-        ) {
-
-            return res.status(403).json({
-
-                success: false,
-
-                message:
-                    "Administrator access required."
-
-            });
-
-        }
-
-        req.user = user;
-
-        req.authenticatedUser = user;
-
-        next();
-
-    } catch (error) {
-
-        console.error(
-            "Admin authentication error:",
-            error
-        );
-
-        return res.status(500).json({
+        return res.status(401).json({
 
             success: false,
 
             message:
-                "Authentication service error."
+                "Authentication required."
 
         });
-
     }
 
+    if (
+        authenticated.user.role !==
+        "admin"
+    ) {
+
+        return res.status(403).json({
+
+            success: false,
+
+            message:
+                "Admin access required."
+
+        });
+    }
+
+    req.user =
+        authenticated.user;
+
+    req.authToken =
+        authenticated.token;
+
+    req.session =
+        authenticated.session;
+
+    next();
 }
 
-
 // =========================================================
-// REGISTER CUSTOMER
+// CUSTOMER REGISTER
 // POST /api/auth/register
 // =========================================================
 
@@ -538,54 +480,59 @@ router.post(
 
         try {
 
-            if (!supabasePool) {
-
-                return res.status(500).json({
-
-                    success: false,
-
-                    message:
-                        "Customer database is not configured."
-
-                });
-
-            }
-
-
             const name =
-                cleanText(req.body?.name);
+                cleanText(
+                    req.body.name
+                );
 
             const email =
                 normalizeEmail(
-                    req.body?.email
+                    req.body.email
                 );
 
             const phone =
                 cleanText(
-                    req.body?.phone
+                    req.body.phone
+                );
+
+            const country =
+                cleanText(
+                    req.body.country
+                );
+
+            const city =
+                cleanText(
+                    req.body.city
                 );
 
             const password =
-                String(
-                    req.body?.password || ""
+                cleanText(
+                    req.body.password
                 );
 
+            const consent =
+                Boolean(
+                    req.body.consent
+                );
 
             // -------------------------------------------------
             // VALIDATION
             // -------------------------------------------------
 
-            if (!name) {
+            if (
+                !name ||
+                !email ||
+                !password
+            ) {
 
                 return res.status(400).json({
 
                     success: false,
 
                     message:
-                        "Please provide your name."
+                        "Full name, email and password are required."
 
                 });
-
             }
 
             if (!isValidEmail(email)) {
@@ -595,10 +542,9 @@ router.post(
                     success: false,
 
                     message:
-                        "Please provide a valid email address."
+                        "Please enter a valid email address."
 
                 });
-
             }
 
             if (!isStrongPassword(password)) {
@@ -608,32 +554,36 @@ router.post(
                     success: false,
 
                     message:
-                        "Password must be at least 6 characters."
+                        "Password must contain at least 8 characters and include letters and numbers."
 
                 });
-
             }
 
+            if (!consent) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "You must agree to the Terms & Conditions and Privacy Policy."
+
+                });
+            }
 
             // -------------------------------------------------
-            // CHECK EXISTING CUSTOMER
+            // DUPLICATE EMAIL
             // -------------------------------------------------
 
-            const existing =
-                await supabasePool.query(
-                    `
-                    SELECT id, email
+            const existingUser =
+                db.prepare(`
+                    SELECT id
                     FROM users
-                    WHERE LOWER(email) = LOWER($1)
+                    WHERE email = ?
                     LIMIT 1
-                    `,
-                    [email]
-                );
+                `).get(email);
 
-
-            if (
-                existing.rows.length > 0
-            ) {
+            if (existingUser) {
 
                 return res.status(409).json({
 
@@ -643,9 +593,7 @@ router.post(
                         "An account with this email already exists. Please login instead."
 
                 });
-
             }
-
 
             // -------------------------------------------------
             // HASH PASSWORD
@@ -657,14 +605,12 @@ router.post(
                     12
                 );
 
-
             // -------------------------------------------------
             // CREATE CUSTOMER
             // -------------------------------------------------
 
             const result =
-                await supabasePool.query(
-                    `
+                db.prepare(`
                     INSERT INTO users (
                         name,
                         email,
@@ -672,87 +618,26 @@ router.post(
                         password_hash,
                         role
                     )
-                    VALUES (
-                        $1,
-                        $2,
-                        $3,
-                        $4,
-                        'customer'
-                    )
-                    RETURNING
-                        id,
-                        name,
-                        email,
-                        phone,
-                        role,
-                        created_at,
-                        updated_at
-                    `,
-                    [
-                        name,
-                        email,
-                        phone || null,
-                        passwordHash
-                    ]
+                    VALUES (?, ?, ?, ?, ?)
+                `).run(
+                    name,
+                    email,
+                    phone || null,
+                    passwordHash,
+                    "customer"
                 );
-
-
-            const user =
-                result.rows[0];
-
-
-            console.log(
-                `New customer account created. ` +
-                `Customer ID: ${user.id}, ` +
-                `Email: ${user.email}`
-            );
-
-
-            // -------------------------------------------------
-            // CREATE SUPABASE LOGIN SESSION
-            // -------------------------------------------------
-
-            const session =
-                createSession(
-                    user,
-                    "supabase"
-                );
-
 
             return res.status(201).json({
 
                 success: true,
 
                 message:
-                    "Account created successfully.",
+                    "Account created successfully. Please login.",
 
-                token:
-                    session.token,
-
-                expiresAt:
-                    session.expiresAt,
-
-                user: {
-
-                    id:
-                        Number(user.id),
-
-                    name:
-                        user.name,
-
-                    email:
-                        user.email,
-
-                    phone:
-                        user.phone,
-
-                    role:
-                        user.role
-
-                }
+                userId:
+                    result.lastInsertRowid
 
             });
-
 
         } catch (error) {
 
@@ -761,51 +646,22 @@ router.post(
                 error
             );
 
-
-            if (
-                error.code === "23505"
-            ) {
-
-                return res.status(409).json({
-
-                    success: false,
-
-                    message:
-                        "An account with this email already exists. Please login instead."
-
-                });
-
-            }
-
-
             return res.status(500).json({
 
                 success: false,
 
                 message:
-                    "Unable to create account. Please try again."
+                    "Unable to create your account right now."
 
             });
-
         }
-
     }
 );
-
 
 // =========================================================
 // LOGIN
 // POST /api/auth/login
-//
-// IMPORTANT:
-//
-// 1. SQLite is checked FIRST.
-//    This keeps the existing Admin account working.
-//
-// 2. If SQLite user is not found,
-//    Supabase customer database is checked.
-//
-// 3. Session remembers the database source.
+// CUSTOMER + ADMIN
 // =========================================================
 
 router.post(
@@ -814,147 +670,76 @@ router.post(
 
         try {
 
+            // -------------------------------------------------
+            // NORMALIZE EMAIL
+            // -------------------------------------------------
+
             const email =
-                normalizeEmail(
-                    req.body?.email
-                );
+                String(
+                    req.body?.email || ""
+                )
+                    .trim()
+                    .toLowerCase();
+
+            // IMPORTANT:
+            // Do NOT trim password.
+            // Password must be checked exactly as entered.
 
             const password =
                 String(
                     req.body?.password || ""
                 );
 
+            const remember =
+                Boolean(
+                    req.body?.remember
+                );
+
+            // -------------------------------------------------
+            // BASIC VALIDATION
+            // -------------------------------------------------
+
+            if (
+                !email ||
+                !password
+            ) {
+
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        "Email and password are required."
+                });
+
+            }
 
             if (!isValidEmail(email)) {
 
                 return res.status(400).json({
-
                     success: false,
-
                     message:
-                        "Please provide a valid email address."
-
+                        "Please enter a valid email address."
                 });
 
             }
 
-            if (!password) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Please enter your password."
-
-                });
-
-            }
-
-
-            let user = null;
-
-            let authSource = null;
-
-
             // -------------------------------------------------
-            // FIRST: CHECK EXISTING SQLITE USERS
-            //
-            // This is important for the existing Admin account.
+            // FIND USER
+            // CASE + SPACE SAFE EMAIL MATCH
             // -------------------------------------------------
 
-            try {
-
-                user =
-                    db.prepare(
-                        `
-                        SELECT
-                            id,
-                            name,
-                            email,
-                            phone,
-                            password_hash,
-                            role,
-                            created_at,
-                            updated_at
-                        FROM users
-                        WHERE LOWER(email) = LOWER(?)
-                        LIMIT 1
-                        `
-                    ).get(email);
-
-
-                if (user) {
-
-                    authSource =
-                        "sqlite";
-
-                }
-
-            } catch (error) {
-
-                console.error(
-                    "SQLite login lookup error:",
-                    error
-                );
-
-            }
-
-
-            // -------------------------------------------------
-            // SECOND: CHECK SUPABASE CUSTOMER
-            // -------------------------------------------------
-
-            if (
-                !user &&
-                supabasePool
-            ) {
-
-                try {
-
-                    const result =
-                        await supabasePool.query(
-                            `
-                            SELECT
-                                id,
-                                name,
-                                email,
-                                phone,
-                                password_hash,
-                                role,
-                                created_at,
-                                updated_at
-                            FROM users
-                            WHERE LOWER(email) = LOWER($1)
-                            LIMIT 1
-                            `,
-                            [email]
-                        );
-
-
-                    if (
-                        result.rows.length > 0
-                    ) {
-
-                        user =
-                            result.rows[0];
-
-                        authSource =
-                            "supabase";
-
-                    }
-
-                } catch (error) {
-
-                    console.error(
-                        "Supabase login lookup error:",
-                        error
-                    );
-
-                }
-
-            }
-
+            const user =
+                db.prepare(`
+                    SELECT
+                        id,
+                        name,
+                        email,
+                        phone,
+                        password_hash,
+                        role
+                    FROM users
+                    WHERE LOWER(TRIM(email)) = ?
+                    LIMIT 1
+                `).get(email);
 
             // -------------------------------------------------
             // USER NOT FOUND
@@ -962,21 +747,42 @@ router.post(
 
             if (!user) {
 
+                console.log(
+                    "LOGIN FAILED - USER NOT FOUND:",
+                    email
+                );
+
                 return res.status(401).json({
-
                     success: false,
-
                     message:
                         "Invalid email or password."
-
                 });
 
             }
 
-
             // -------------------------------------------------
             // PASSWORD CHECK
             // -------------------------------------------------
+
+            if (
+                !user.password_hash
+            ) {
+
+                console.error(
+                    "LOGIN ERROR - PASSWORD HASH MISSING:",
+                    {
+                        userId: user.id,
+                        email: user.email
+                    }
+                );
+
+                return res.status(401).json({
+                    success: false,
+                    message:
+                        "Invalid email or password."
+                });
+
+            }
 
             const passwordMatches =
                 await bcrypt.compare(
@@ -984,43 +790,83 @@ router.post(
                     user.password_hash
                 );
 
+            // -------------------------------------------------
+            // WRONG PASSWORD
+            // -------------------------------------------------
 
             if (!passwordMatches) {
 
+                console.log(
+                    "LOGIN FAILED - PASSWORD MISMATCH:",
+                    email
+                );
+
                 return res.status(401).json({
-
                     success: false,
-
                     message:
                         "Invalid email or password."
-
                 });
 
             }
 
+            // -------------------------------------------------
+            // NORMALIZE ROLE
+            // -------------------------------------------------
+
+            const normalizedRole =
+                String(
+                    user.role || "customer"
+                )
+                    .trim()
+                    .toLowerCase();
 
             // -------------------------------------------------
             // CREATE SESSION
-            //
-            // IMPORTANT FIX:
-            // Save whether this user came from SQLite
-            // or Supabase.
             // -------------------------------------------------
 
             const session =
-                createSession(
-                    user,
-                    authSource
-                );
+                createSession({
+                    ...user,
+                    role: normalizedRole
+                });
 
+            // -------------------------------------------------
+            // RESPONSE USER
+            // -------------------------------------------------
+
+            const responseUser = {
+
+                id: user.id,
+
+                name: user.name,
+
+                email:
+                    String(
+                        user.email || ""
+                    )
+                        .trim()
+                        .toLowerCase(),
+
+                phone: user.phone,
+
+                role: normalizedRole
+
+            };
+
+            // -------------------------------------------------
+            // SUCCESS
+            // -------------------------------------------------
 
             console.log(
-                `User logged in: ${user.email} ` +
-                `(${authSource})`
+                "LOGIN SUCCESS:",
+                {
+                    userId: user.id,
+                    email: responseUser.email,
+                    role: normalizedRole
+                }
             );
 
-
-            return res.json({
+            return res.status(200).json({
 
                 success: true,
 
@@ -1033,27 +879,12 @@ router.post(
                 expiresAt:
                     session.expiresAt,
 
-                user: {
+                remember,
 
-                    id:
-                        Number(user.id),
-
-                    name:
-                        user.name,
-
-                    email:
-                        user.email,
-
-                    phone:
-                        user.phone,
-
-                    role:
-                        user.role
-
-                }
+                user:
+                    responseUser
 
             });
-
 
         } catch (error) {
 
@@ -1062,13 +893,12 @@ router.post(
                 error
             );
 
-
             return res.status(500).json({
 
                 success: false,
 
                 message:
-                    "Unable to login. Please try again."
+                    "Unable to process login right now."
 
             });
 
@@ -1077,10 +907,8 @@ router.post(
     }
 );
 
-
 // =========================================================
 // LOGOUT
-// POST /api/auth/logout
 // =========================================================
 
 router.post(
@@ -1088,47 +916,23 @@ router.post(
     requireAuth,
     (req, res) => {
 
-        try {
+        sessions.delete(
+            req.authToken
+        );
 
-            const token =
-                getTokenFromRequest(req);
+        return res.status(200).json({
 
-            if (token) {
+            success: true,
 
-                sessions.delete(token);
+            message:
+                "Logout successful."
 
-            }
-
-            return res.json({
-
-                success: true,
-
-                message:
-                    "Logged out successfully."
-
-            });
-
-        } catch (error) {
-
-            console.error(
-                "Logout error:",
-                error
-            );
-
-            return res.status(500).json({
-
-                success: false,
-
-                message:
-                    "Unable to logout."
-
-            });
-
-        }
-
+        });
     }
 );
 
+console.log("AUTH DEBUG requireAuth:", typeof requireAuth);
+console.log("AUTH DEBUG requireAdmin:", typeof requireAdmin);
 
 // =========================================================
 // CURRENT USER
@@ -1140,38 +944,19 @@ router.get(
     requireAuth,
     (req, res) => {
 
-        return res.json({
+        return res.status(200).json({
 
             success: true,
 
-            user: {
-
-                id:
-                    Number(req.user.id),
-
-                name:
-                    req.user.name,
-
-                email:
-                    req.user.email,
-
-                phone:
-                    req.user.phone,
-
-                role:
-                    req.user.role
-
-            }
+            user:
+                req.user
 
         });
-
     }
 );
 
-
 // =========================================================
 // ADMIN CHECK
-// GET /api/auth/admin-check
 // =========================================================
 
 router.get(
@@ -1179,42 +964,22 @@ router.get(
     requireAdmin,
     (req, res) => {
 
-        return res.json({
+        return res.status(200).json({
 
             success: true,
 
             message:
-                "Administrator access verified.",
+                "Admin authentication verified.",
 
-            user: {
-
-                id:
-                    Number(req.user.id),
-
-                name:
-                    req.user.name,
-
-                email:
-                    req.user.email,
-
-                role:
-                    req.user.role
-
-            }
+            user:
+                req.user
 
         });
-
     }
 );
 
-
 // =========================================================
-// CREATE USER
-// POST /api/auth/create-user
-//
-// ADMIN ONLY
-//
-// New users are created in Supabase.
+// ADMIN CREATE USER
 // =========================================================
 
 router.post(
@@ -1224,47 +989,36 @@ router.post(
 
         try {
 
-            if (!supabasePool) {
-
-                return res.status(500).json({
-
-                    success: false,
-
-                    message:
-                        "Customer database is not configured."
-
-                });
-
-            }
-
-
             const name =
-                cleanText(req.body?.name);
+                cleanText(
+                    req.body.name
+                );
 
             const email =
                 normalizeEmail(
-                    req.body?.email
+                    req.body.email
                 );
 
             const phone =
                 cleanText(
-                    req.body?.phone
+                    req.body.phone
                 );
 
             const password =
-                String(
-                    req.body?.password || ""
+                cleanText(
+                    req.body.password
                 );
 
             const role =
                 cleanText(
-                    req.body?.role
-                ) || "customer";
-
+                    req.body.role ||
+                    "customer"
+                );
 
             if (
                 !name ||
-                !isValidEmail(email)
+                !email ||
+                !password
             ) {
 
                 return res.status(400).json({
@@ -1272,10 +1026,21 @@ router.post(
                     success: false,
 
                     message:
-                        "Valid name and email are required."
+                        "Name, email and password are required."
 
                 });
+            }
 
+            if (!isValidEmail(email)) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "Please enter a valid email address."
+
+                });
             }
 
             if (!isStrongPassword(password)) {
@@ -1285,16 +1050,14 @@ router.post(
                     success: false,
 
                     message:
-                        "Password must be at least 6 characters."
+                        "Password must contain at least 8 characters and include letters and numbers."
 
                 });
-
             }
 
             if (
-                !["customer", "admin"].includes(
-                    role
-                )
+                !["customer", "admin"]
+                    .includes(role)
             ) {
 
                 return res.status(400).json({
@@ -1302,95 +1065,20 @@ router.post(
                     success: false,
 
                     message:
-                        "Invalid user role."
+                        "Invalid account role."
 
                 });
-
             }
 
+            const existingUser =
+                db.prepare(`
+                    SELECT id
+                    FROM users
+                    WHERE email = ?
+                    LIMIT 1
+                `).get(email);
 
-            const passwordHash =
-                await bcrypt.hash(
-                    password,
-                    12
-                );
-
-
-            const result =
-                await supabasePool.query(
-                    `
-                    INSERT INTO users (
-                        name,
-                        email,
-                        phone,
-                        password_hash,
-                        role
-                    )
-                    VALUES (
-                        $1,
-                        $2,
-                        $3,
-                        $4,
-                        $5
-                    )
-                    RETURNING
-                        id,
-                        name,
-                        email,
-                        phone,
-                        role,
-                        created_at
-                    `,
-                    [
-                        name,
-                        email,
-                        phone || null,
-                        passwordHash,
-                        role
-                    ]
-                );
-
-
-            return res.status(201).json({
-
-                success: true,
-
-                message:
-                    "User created successfully.",
-
-                user: {
-
-                    id:
-                        Number(result.rows[0].id),
-
-                    name:
-                        result.rows[0].name,
-
-                    email:
-                        result.rows[0].email,
-
-                    phone:
-                        result.rows[0].phone,
-
-                    role:
-                        result.rows[0].role
-
-                }
-
-            });
-
-
-        } catch (error) {
-
-            console.error(
-                "Create user error:",
-                error
-            );
-
-
-            if (
-                error.code === "23505"
-            ) {
+            if (existingUser) {
 
                 return res.status(409).json({
 
@@ -1400,24 +1088,62 @@ router.post(
                         "An account with this email already exists."
 
                 });
-
             }
 
+            const passwordHash =
+                await bcrypt.hash(
+                    password,
+                    12
+                );
+
+            const result =
+                db.prepare(`
+                    INSERT INTO users (
+                        name,
+                        email,
+                        phone,
+                        password_hash,
+                        role
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                `).run(
+                    name,
+                    email,
+                    phone || null,
+                    passwordHash,
+                    role
+                );
+
+            return res.status(201).json({
+
+                success: true,
+
+                message:
+                    "User account created successfully.",
+
+                userId:
+                    result.lastInsertRowid
+
+            });
+
+        } catch (error) {
+
+            console.error(
+                "Create user error:",
+                error
+            );
 
             return res.status(500).json({
 
                 success: false,
 
                 message:
-                    "Unable to create user."
+                    "Unable to create user account."
 
             });
-
         }
-
     }
 );
-
 
 // =========================================================
 // FORGOT PASSWORD
@@ -1430,78 +1156,66 @@ router.post(
 
         try {
 
-            if (!supabasePool) {
-
-                return res.status(500).json({
-
-                    success: false,
-
-                    message:
-                        "Customer database is not configured."
-
-                });
-
-            }
-
-
             const email =
                 normalizeEmail(
-                    req.body?.email
+                    req.body.email
                 );
 
+            // Always return the same message.
+            // This prevents account enumeration.
 
-            if (!isValidEmail(email)) {
+            const genericMessage =
+                "If an account exists for this email, a password reset link has been sent.";
 
-                return res.status(400).json({
+            if (
+                !email ||
+                !isValidEmail(email)
+            ) {
 
-                    success: false,
+                return res.status(200).json({
+
+                    success: true,
 
                     message:
-                        "Please provide a valid email address."
+                        genericMessage
 
                 });
-
             }
 
-
-            const result =
-                await supabasePool.query(
-                    `
+            const user =
+                db.prepare(`
                     SELECT
                         id,
                         name,
                         email
                     FROM users
-                    WHERE LOWER(email) = LOWER($1)
+                    WHERE email = ?
                     LIMIT 1
-                    `,
-                    [email]
-                );
+                `).get(email);
 
+            if (!user) {
 
-            // Do not reveal whether an email exists.
-            if (
-                result.rows.length === 0
-            ) {
-
-                return res.json({
+                return res.status(200).json({
 
                     success: true,
 
                     message:
-                        "If an account exists, a password reset email will be sent."
+                        genericMessage
 
                 });
-
             }
 
+            // -------------------------------------------------
+            // REMOVE OLD RESET TOKENS
+            // -------------------------------------------------
 
-            const user =
-                result.rows[0];
-
+            db.prepare(`
+                DELETE FROM password_resets
+                WHERE user_id = ?
+            `).run(user.id);
 
             // -------------------------------------------------
-            // CREATE RESET TOKEN
+            // GENERATE SECURE TOKEN
             // -------------------------------------------------
 
             const rawToken =
@@ -1516,158 +1230,64 @@ router.post(
                     .digest("hex");
 
             const expiresAt =
-                new Date(
-                    Date.now() +
-                    RESET_TOKEN_DURATION_MS
-                );
+                Date.now() +
+                RESET_TOKEN_DURATION_MS;
 
-
-            // -------------------------------------------------
-            // CREATE RESET TABLE IF REQUIRED
-            // -------------------------------------------------
-
-            await supabasePool.query(
-                `
-                CREATE TABLE IF NOT EXISTS password_resets (
-                    id BIGSERIAL PRIMARY KEY,
-                    user_id BIGINT NOT NULL,
-                    token_hash TEXT NOT NULL UNIQUE,
-                    expires_at TIMESTAMPTZ NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                )
-                `
-            );
-
-
-            await supabasePool.query(
-                `
-                DELETE FROM password_resets
-                WHERE user_id = $1
-                `,
-                [user.id]
-            );
-
-
-            await supabasePool.query(
-                `
+            db.prepare(`
                 INSERT INTO password_resets (
                     user_id,
                     token_hash,
                     expires_at
                 )
-                VALUES (
-                    $1,
-                    $2,
-                    $3
-                )
-                `,
-                [
-                    user.id,
-                    tokenHash,
-                    expiresAt
-                ]
+                VALUES (?, ?, ?)
+            `).run(
+                user.id,
+                tokenHash,
+                expiresAt
             );
-
 
             // -------------------------------------------------
             // SEND EMAIL
             // -------------------------------------------------
 
-            const smtpHost =
-                process.env.SMTP_HOST;
+            try {
 
-            const smtpPort =
-                Number(
-                    process.env.SMTP_PORT || 587
+                await sendPasswordResetEmail(
+                    user,
+                    rawToken
                 );
 
-            const smtpUser =
-                process.env.SMTP_USER;
+            } catch (mailError) {
 
-            const smtpPass =
-                process.env.SMTP_PASS;
+                console.error(
+                    "Password reset email error:",
+                    mailError
+                );
 
-            const smtpSecure =
-                String(
-                    process.env.SMTP_SECURE || "false"
-                ).toLowerCase() === "true";
+                // Delete unusable token
+                db.prepare(`
+                    DELETE FROM password_resets
+                    WHERE token_hash = ?
+                `).run(tokenHash);
 
-            const mailFrom =
-                process.env.MAIL_FROM ||
-                smtpUser;
+                return res.status(200).json({
 
-            const appBaseUrl =
-                process.env.APP_BASE_URL ||
-                "http://localhost:3000";
+                    success: true,
 
-
-            if (
-                smtpHost &&
-                smtpUser &&
-                smtpPass
-            ) {
-
-                const transporter =
-                    nodemailer.createTransport({
-
-                        host:
-                            smtpHost,
-
-                        port:
-                            smtpPort,
-
-                        secure:
-                            smtpSecure,
-
-                        auth: {
-
-                            user:
-                                smtpUser,
-
-                            pass:
-                                smtpPass
-
-                        }
-
-                    });
-
-
-                const resetUrl =
-                    `${appBaseUrl}/reset-password.html?token=${rawToken}`;
-
-
-                await transporter.sendMail({
-
-                    from:
-                        mailFrom,
-
-                    to:
-                        user.email,
-
-                    subject:
-                        "U.S TRAVEL & TOURS - Password Reset",
-
-                    text:
-                        `Hello ${user.name},\n\n` +
-                        `Use the following link to reset your password:\n\n` +
-                        `${resetUrl}\n\n` +
-                        `This link expires in 30 minutes.\n\n` +
-                        `If you did not request this, you can ignore this email.`
+                    message:
+                        genericMessage
 
                 });
-
             }
 
-
-            return res.json({
+            return res.status(200).json({
 
                 success: true,
 
                 message:
-                    "If an account exists, a password reset email will be sent."
+                    genericMessage
 
             });
-
 
         } catch (error) {
 
@@ -1676,21 +1296,17 @@ router.post(
                 error
             );
 
-
             return res.status(500).json({
 
                 success: false,
 
                 message:
-                    "Unable to process password reset request."
+                    "Unable to process your password reset request right now."
 
             });
-
         }
-
     }
 );
-
 
 // =========================================================
 // RESET PASSWORD
@@ -1703,42 +1319,50 @@ router.post(
 
         try {
 
-            if (!supabasePool) {
-
-                return res.status(500).json({
-
-                    success: false,
-
-                    message:
-                        "Customer database is not configured."
-
-                });
-
-            }
-
-
             const token =
                 cleanText(
-                    req.body?.token
+                    req.body.token
                 );
 
             const newPassword =
-                String(
-                    req.body?.password || ""
+                cleanText(
+                    req.body.newPassword
                 );
 
+            const confirmPassword =
+                cleanText(
+                    req.body.confirmPassword
+                );
 
-            if (!token) {
+            if (
+                !token ||
+                !newPassword ||
+                !confirmPassword
+            ) {
 
                 return res.status(400).json({
 
                     success: false,
 
                     message:
-                        "Reset token is required."
+                        "Reset token and password are required."
 
                 });
+            }
 
+            if (
+                newPassword !==
+                confirmPassword
+            ) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "Passwords do not match."
+
+                });
             }
 
             if (
@@ -1752,12 +1376,10 @@ router.post(
                     success: false,
 
                     message:
-                        "Password must be at least 6 characters."
+                        "Password must contain at least 8 characters and include letters and numbers."
 
                 });
-
             }
-
 
             const tokenHash =
                 crypto
@@ -1765,66 +1387,63 @@ router.post(
                     .update(token)
                     .digest("hex");
 
-
-            const resetResult =
-                await supabasePool.query(
-                    `
+            const resetRecord =
+                db.prepare(`
                     SELECT
                         id,
                         user_id,
-                        expires_at
+                        expires_at,
+                        used_at
                     FROM password_resets
-                    WHERE token_hash = $1
+                    WHERE token_hash = ?
                     LIMIT 1
-                    `,
-                    [tokenHash]
-                );
+                `).get(tokenHash);
 
-
-            if (
-                resetResult.rows.length === 0
-            ) {
+            if (!resetRecord) {
 
                 return res.status(400).json({
 
                     success: false,
 
                     message:
-                        "Invalid or expired reset token."
+                        "This password reset link is invalid or has expired."
 
                 });
-
             }
 
+            if (resetRecord.used_at) {
 
-            const reset =
-                resetResult.rows[0];
+                return res.status(400).json({
 
+                    success: false,
+
+                    message:
+                        "This password reset link has already been used."
+
+                });
+            }
 
             if (
-                new Date(reset.expires_at).getTime()
-                <= Date.now()
+                Date.now() >
+                Number(
+                    resetRecord.expires_at
+                )
             ) {
 
-                await supabasePool.query(
-                    `
+                db.prepare(`
                     DELETE FROM password_resets
-                    WHERE id = $1
-                    `,
-                    [reset.id]
-                );
+                    WHERE id = ?
+                `).run(resetRecord.id);
 
                 return res.status(400).json({
 
                     success: false,
 
                     message:
-                        "Invalid or expired reset token."
+                        "This password reset link has expired. Please request a new one."
 
                 });
-
             }
-
 
             const passwordHash =
                 await bcrypt.hash(
@@ -1832,32 +1451,40 @@ router.post(
                     12
                 );
 
+            // -------------------------------------------------
+            // UPDATE PASSWORD
+            // -------------------------------------------------
 
-            await supabasePool.query(
-                `
-                UPDATE users
-                SET
-                    password_hash = $1,
-                    updated_at = NOW()
-                WHERE id = $2
-                `,
-                [
-                    passwordHash,
-                    reset.user_id
-                ]
-            );
+            const transaction =
+                db.transaction(() => {
 
+                    db.prepare(`
+                        UPDATE users
+                        SET
+                            password_hash = ?,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                    `).run(
+                        passwordHash,
+                        resetRecord.user_id
+                    );
 
-            await supabasePool.query(
-                `
-                DELETE FROM password_resets
-                WHERE user_id = $1
-                `,
-                [reset.user_id]
-            );
+                    db.prepare(`
+                        UPDATE password_resets
+                        SET used_at = ?
+                        WHERE id = ?
+                    `).run(
+                        Date.now(),
+                        resetRecord.id
+                    );
+                });
 
+            transaction();
 
-            // Invalidate current temporary sessions
+            // -------------------------------------------------
+            // INVALIDATE ALL EXISTING SESSIONS
+            // -------------------------------------------------
+
             for (
                 const [
                     sessionToken,
@@ -1866,29 +1493,24 @@ router.post(
             ) {
 
                 if (
-                    session.source === "supabase" &&
-                    Number(session.userId) ===
-                    Number(reset.user_id)
+                    session.userId ===
+                    resetRecord.user_id
                 ) {
 
                     sessions.delete(
                         sessionToken
                     );
-
                 }
-
             }
 
-
-            return res.json({
+            return res.status(200).json({
 
                 success: true,
 
                 message:
-                    "Password reset successfully. Please login again."
+                    "Your password has been reset successfully. Please login with your new password."
 
             });
-
 
         } catch (error) {
 
@@ -1897,25 +1519,20 @@ router.post(
                 error
             );
 
-
             return res.status(500).json({
 
                 success: false,
 
                 message:
-                    "Unable to reset password."
+                    "Unable to reset your password right now."
 
             });
-
         }
-
     }
 );
 
-
 // =========================================================
 // CHANGE PASSWORD
-// POST /api/auth/change-password
 // =========================================================
 
 router.post(
@@ -1926,27 +1543,28 @@ router.post(
         try {
 
             const currentPassword =
-                String(
-                    req.body?.currentPassword || ""
+                cleanText(
+                    req.body.currentPassword
                 );
 
             const newPassword =
-                String(
-                    req.body?.newPassword || ""
+                cleanText(
+                    req.body.newPassword
                 );
 
-
-            if (!currentPassword) {
+            if (
+                !currentPassword ||
+                !newPassword
+            ) {
 
                 return res.status(400).json({
 
                     success: false,
 
                     message:
-                        "Current password is required."
+                        "Current password and new password are required."
 
                 });
-
             }
 
             if (
@@ -1960,21 +1578,40 @@ router.post(
                     success: false,
 
                     message:
-                        "New password must be at least 6 characters."
+                        "New password must contain at least 8 characters and include letters and numbers."
 
                 });
-
             }
 
+            const user =
+                db.prepare(`
+                    SELECT
+                        id,
+                        password_hash
+                    FROM users
+                    WHERE id = ?
+                    LIMIT 1
+                `).get(req.user.id);
 
-            const passwordMatches =
+            if (!user) {
+
+                return res.status(404).json({
+
+                    success: false,
+
+                    message:
+                        "User account not found."
+
+                });
+            }
+
+            const currentMatches =
                 await bcrypt.compare(
                     currentPassword,
-                    req.user.password_hash
+                    user.password_hash
                 );
 
-
-            if (!passwordMatches) {
+            if (!currentMatches) {
 
                 return res.status(401).json({
 
@@ -1984,153 +1621,42 @@ router.post(
                         "Current password is incorrect."
 
                 });
-
             }
 
-
-            const passwordHash =
+            const newPasswordHash =
                 await bcrypt.hash(
                     newPassword,
                     12
                 );
 
-
-            // -------------------------------------------------
-            // GET SOURCE FROM CURRENT SESSION
-            // -------------------------------------------------
-
-            const token =
-                getTokenFromRequest(req);
-
-            const session =
-                getSession(token);
-
-
-            // -------------------------------------------------
-            // SUPABASE CUSTOMER
-            // -------------------------------------------------
-
-            if (
-                session &&
-                session.source === "supabase" &&
-                supabasePool
-            ) {
-
-                const result =
-                    await supabasePool.query(
-                        `
-                        UPDATE users
-                        SET
-                            password_hash = $1,
-                            updated_at = NOW()
-                        WHERE id = $2
-                        RETURNING id
-                        `,
-                        [
-                            passwordHash,
-                            req.user.id
-                        ]
-                    );
-
-
-                if (
-                    result.rows.length > 0
-                ) {
-
-                    for (
-                        const [
-                            sessionToken,
-                            storedSession
-                        ] of sessions.entries()
-                    ) {
-
-                        if (
-                            storedSession.source === "supabase" &&
-                            Number(storedSession.userId) ===
-                            Number(req.user.id)
-                        ) {
-
-                            sessions.delete(
-                                sessionToken
-                            );
-
-                        }
-
-                    }
-
-
-                    return res.json({
-
-                        success: true,
-
-                        message:
-                            "Password changed successfully. Please login again."
-
-                    });
-
-                }
-
-            }
-
-
-            // -------------------------------------------------
-            // EXISTING SQLITE USER / ADMIN
-            // -------------------------------------------------
-
-            const result =
-                db.prepare(
-                    `
-                    UPDATE users
-                    SET
-                        password_hash = ?,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                    `
-                ).run(
-                    passwordHash,
-                    req.user.id
-                );
-
-
-            if (
-                result.changes === 0
-            ) {
-
-                return res.status(404).json({
-
-                    success: false,
-
-                    message:
-                        "User not found."
-
-                });
-
-            }
-
+            db.prepare(`
+                UPDATE users
+                SET
+                    password_hash = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            `).run(
+                newPasswordHash,
+                req.user.id
+            );
 
             for (
                 const [
-                    sessionToken,
-                    storedSession
+                    token,
+                    session
                 ] of sessions.entries()
             ) {
 
                 if (
-                    storedSession.source === "sqlite" &&
-                    Number(storedSession.userId) ===
-                    Number(req.user.id)
+                    session.userId ===
+                    req.user.id
                 ) {
 
-                    sessions.delete(
-                        sessionToken
-                    );
-
+                    sessions.delete(token);
                 }
-
             }
 
-
-            return res.json({
+            return res.status(200).json({
 
                 success: true,
 
@@ -2139,7 +1665,6 @@ router.post(
 
             });
 
-
         } catch (error) {
 
             console.error(
@@ -2147,80 +1672,50 @@ router.post(
                 error
             );
 
-
             return res.status(500).json({
 
                 success: false,
 
                 message:
-                    "Unable to change password."
+                    "Unable to change password right now."
 
             });
-
         }
-
     }
 );
 
-
 // =========================================================
-// CLEAN EXPIRED SESSIONS
+// CLEAN EXPIRED SESSIONS / RESET TOKENS
 // =========================================================
 
-setInterval(
-    () => {
+setInterval(() => {
 
-        const now =
-            Date.now();
+    const now =
+        Date.now();
 
-        for (
-            const [
-                token,
-                session
-            ] of sessions.entries()
+    for (
+        const [
+            token,
+            session
+        ] of sessions.entries()
+    ) {
+
+        if (
+            now >
+            session.expiresAt
         ) {
 
-            if (
-                now >=
-                session.expiresAt
-            ) {
-
-                sessions.delete(token);
-
-            }
-
+            sessions.delete(token);
         }
+    }
 
-    },
-    60 * 60 * 1000
-);
+    db.prepare(`
+        DELETE FROM password_resets
+        WHERE expires_at < ?
+        OR used_at IS NOT NULL
+    `).run(now);
 
-
-// =========================================================
-// SUPABASE CONNECTION TEST
-// =========================================================
-
-if (supabasePool) {
-
-    checkSupabaseDatabase()
-        .then(() => {
-
-            console.log(
-                "Supabase PostgreSQL connection successful."
-            );
-
-        })
-        .catch((error) => {
-
-            console.error(
-                "Supabase PostgreSQL connection failed:",
-                error.message
-            );
-
-        });
-
-}
-
+}, 1000 * 60 * 30);
 
 // =========================================================
 // EXPORT
@@ -2233,3 +1728,7 @@ module.exports.requireAuth =
 
 module.exports.requireAdmin =
     requireAdmin;
+
+console.log(
+    "U.S TRAVEL & TOURS authentication system initialized."
+);
