@@ -1,344 +1,274 @@
-// =========================================================
-// U.S TRAVEL & TOURS
-// LIVE SUPPORT CHAT BACKEND
-// =========================================================
+
 
 const express = require("express");
-const nodemailer = require("nodemailer");
-
-const { db } = require("./database");
-const { requireAuth, requireAdmin } = require("./auth");
-
 const router = express.Router();
 
-console.log("CHAT: Initializing live chat backend...");
+const db = require("./database");
+const { requireAuth, requireAdmin } = require("./auth");
 
-// =========================================================
-// DATABASE SETUP
-// =========================================================
+const { Pool } = require("pg");
 
-const CHAT_TABLE = "support_chat_messages";
+/* =========================================================
+   SUPABASE / POSTGRES CONNECTION
+========================================================= */
 
-try {
+let pgPool = null;
 
-    db.exec(`
-        CREATE TABLE IF NOT EXISTS support_chat_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-            user_id INTEGER NOT NULL,
-
-            user_source TEXT NOT NULL DEFAULT 'sqlite'
-                CHECK(user_source IN ('sqlite', 'supabase')),
-
-            sender_type TEXT NOT NULL
-                CHECK(sender_type IN ('customer', 'admin')),
-
-            message TEXT NOT NULL,
-
-            is_read INTEGER NOT NULL DEFAULT 0,
-
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_support_chat_user_id
-        ON support_chat_messages(user_id);
-
-        CREATE INDEX IF NOT EXISTS idx_support_chat_user_source
-        ON support_chat_messages(user_id, user_source);
-
-        CREATE INDEX IF NOT EXISTS idx_support_chat_created_at
-        ON support_chat_messages(created_at);
-
-        CREATE INDEX IF NOT EXISTS idx_support_chat_unread
-        ON support_chat_messages(
-            user_id,
-            user_source,
-            sender_type,
-            is_read
-        );
-    `);
-
-    // ---------------------------------------------------------
-    // Existing installations:
-    // Add user_source if old table already exists.
-    // ---------------------------------------------------------
-
-    const columns = db
-        .prepare(`PRAGMA table_info(${CHAT_TABLE})`)
-        .all();
-
-    const hasUserSource = columns.some(
-        column => column.name === "user_source"
-    );
-
-    if (!hasUserSource) {
-
-        console.log(
-            "CHAT DATABASE: Adding user_source column..."
-        );
-
-        db.exec(`
-            ALTER TABLE support_chat_messages
-            ADD COLUMN user_source TEXT NOT NULL DEFAULT 'sqlite';
-        `);
-
-        console.log(
-            "CHAT DATABASE: user_source column added."
-        );
-    }
-
-    console.log(
-        "CHAT DATABASE: support chat table ready."
-    );
-
-} catch (error) {
-
-    console.error(
-        "CHAT DATABASE ERROR:",
-        error
-    );
-
-    throw error;
-}
-
-// =========================================================
-// EMAIL CONFIGURATION
-// =========================================================
-
-let transporter = null;
-
-function createTransporter() {
-
-    if (
-        !process.env.SMTP_HOST ||
-        !process.env.SMTP_PORT ||
-        !process.env.SMTP_USER ||
-        !process.env.SMTP_PASS
-    ) {
-
-        console.warn(
-            "CHAT SMTP: SMTP configuration missing."
-        );
-
-        return null;
-    }
-
-    return nodemailer.createTransport({
-
-        host: process.env.SMTP_HOST,
-
-        port: Number(
-            process.env.SMTP_PORT
-        ),
-
-        secure:
-            String(
-                process.env.SMTP_SECURE || ""
-            ).toLowerCase() === "true",
-
-        auth: {
-            user: process.env.SMTP_USER,
-            pass: process.env.SMTP_PASS
-        }
-
-    });
-}
-
-transporter = createTransporter();
-
-// =========================================================
-// HELPERS
-// =========================================================
-
-function cleanMessage(value) {
-
-    if (
-        typeof value !== "string"
-    ) {
-
-        return "";
-    }
-
-    return value
-        .replace(/\u0000/g, "")
-        .trim();
-}
-
-// ---------------------------------------------------------
-// Get authenticated numeric user ID
-// ---------------------------------------------------------
-
-function getUserId(req) {
-
-    if (
-        !req.user ||
-        req.user.id === undefined ||
-        req.user.id === null
-    ) {
-
-        return null;
-    }
-
-    const userId =
-        Number(req.user.id);
-
-    if (
-        !Number.isInteger(userId) ||
-        userId <= 0
-    ) {
-
-        return null;
-    }
-
-    return userId;
-}
-
-// ---------------------------------------------------------
-// Determine whether authenticated user is SQLite
-// or Supabase.
-//
-// We intentionally compare email + role so that
-// SQLite/Supabase numeric ID collisions do not matter.
-// ---------------------------------------------------------
-
-function getAuthenticatedUserSource(req) {
-
-    if (!req.user) {
-        return null;
-    }
-
-    const userId =
-        Number(req.user.id);
-
-    const email =
-        String(req.user.email || "")
-            .trim()
-            .toLowerCase();
-
-    // ---------------------------------------------------------
-    // Check exact SQLite user
-    // ---------------------------------------------------------
-
-    if (
-        Number.isInteger(userId) &&
-        userId > 0
-    ) {
-
-        const sqliteUser =
-            db.prepare(`
-                SELECT
-                    id,
-                    name,
-                    email,
-                    role
-                FROM users
-                WHERE id = ?
-                LIMIT 1
-            `).get(userId);
-
-        if (
-            sqliteUser &&
-            String(sqliteUser.email || "")
-                .trim()
-                .toLowerCase() === email &&
-            sqliteUser.role === req.user.role
-        ) {
-
-            return "sqlite";
-        }
-    }
-
-    // ---------------------------------------------------------
-    // New customers are stored in Supabase.
-    // If exact SQLite identity was not found,
-    // authenticated customer is treated as Supabase.
-    // ---------------------------------------------------------
-
-    if (req.user.role === "customer") {
-
-        return "supabase";
-    }
-
-    // Existing admin is SQLite.
-    if (req.user.role === "admin") {
-
-        return "sqlite";
-    }
-
-    return null;
-}
-
-// ---------------------------------------------------------
-// Get customer from SQLite
-// ---------------------------------------------------------
-
-function getSQLiteCustomerById(userId) {
-
-    return db.prepare(`
-        SELECT
-            id,
-            name,
-            email,
-            role
-        FROM users
-        WHERE id = ?
-        LIMIT 1
-    `).get(userId);
-}
-
-// ---------------------------------------------------------
-// Get customer from Supabase
-// ---------------------------------------------------------
-
-let supabasePool = null;
-
-try {
-
-    if (process.env.DATABASE_URL) {
-
-        const { Pool } = require("pg");
-
-        supabasePool = new Pool({
-            connectionString:
-                process.env.DATABASE_URL,
-
+if (process.env.DATABASE_URL) {
+    try {
+        pgPool = new Pool({
+            connectionString: process.env.DATABASE_URL,
             ssl: {
                 rejectUnauthorized: false
-            },
-
-            max: 3,
-
-            idleTimeoutMillis: 30000,
-
-            connectionTimeoutMillis: 10000
+            }
         });
 
+        console.log("CHAT: Supabase PostgreSQL pool initialized.");
+    } catch (error) {
+        console.error(
+            "CHAT: PostgreSQL pool initialization failed:",
+            error.message
+        );
     }
-
-} catch (error) {
-
-    console.error(
-        "CHAT SUPABASE INIT ERROR:",
-        error
-    );
-
 }
 
-// ---------------------------------------------------------
-// Get Supabase customer
-// ---------------------------------------------------------
+/* =========================================================
+   TABLE SETUP / MIGRATION
+========================================================= */
 
-async function getSupabaseCustomerById(userId) {
-
-    if (!supabasePool) {
-
-        return null;
-    }
+function setupChatTable() {
 
     try {
 
-        const result =
-            await supabasePool.query(`
+        const tableInfo = db.prepare(`
+            PRAGMA table_info(support_chat_messages)
+        `).all();
+
+        /* -------------------------------------------------
+           TABLE DOES NOT EXIST
+        ------------------------------------------------- */
+
+        if (!tableInfo || tableInfo.length === 0) {
+
+            db.prepare(`
+                CREATE TABLE support_chat_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    user_source TEXT NOT NULL DEFAULT 'sqlite',
+                    sender_type TEXT NOT NULL CHECK (
+                        sender_type IN ('customer', 'admin')
+                    ),
+                    message TEXT NOT NULL,
+                    is_read INTEGER NOT NULL DEFAULT 0,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            `).run();
+
+            console.log(
+                "CHAT: support_chat_messages table created."
+            );
+
+        } else {
+
+            /* -------------------------------------------------
+               OLD TABLE EXISTS WITHOUT user_source
+            ------------------------------------------------- */
+
+            const hasUserSource = tableInfo.some(
+                column => column.name === "user_source"
+            );
+
+            if (!hasUserSource) {
+
+                db.prepare(`
+                    ALTER TABLE support_chat_messages
+                    ADD COLUMN user_source TEXT
+                    NOT NULL DEFAULT 'sqlite'
+                `).run();
+
+                console.log(
+                    "CHAT: user_source column added to support_chat_messages."
+                );
+            }
+        }
+
+        /* -------------------------------------------------
+           INDEXES
+        ------------------------------------------------- */
+
+        db.prepare(`
+            CREATE INDEX IF NOT EXISTS
+            idx_chat_user_source
+            ON support_chat_messages(user_id, user_source)
+        `).run();
+
+        db.prepare(`
+            CREATE INDEX IF NOT EXISTS
+            idx_chat_created_at
+            ON support_chat_messages(created_at)
+        `).run();
+
+        console.log("CHAT: database structure ready.");
+
+    } catch (error) {
+
+        console.error(
+            "CHAT: Database setup failed:",
+            error.message
+        );
+    }
+}
+
+setupChatTable();
+
+/* =========================================================
+   HELPERS
+========================================================= */
+
+/*
+   req.user comes from auth.js.
+
+   The current auth.js session contains the user ID and role,
+   but chat needs to know whether that ID belongs to SQLite
+   or Supabase.
+
+   We therefore check SQLite using ID + email + role.
+
+   If exact SQLite user exists -> sqlite.
+   Otherwise customer -> supabase.
+*/
+
+function getCustomerSource(req) {
+
+    try {
+
+        if (!req.user) {
+            return null;
+        }
+
+        const userId = Number(req.user.id);
+
+        if (!Number.isInteger(userId)) {
+            return null;
+        }
+
+        const email = String(
+            req.user.email || ""
+        ).trim().toLowerCase();
+
+        const role = String(
+            req.user.role || "customer"
+        ).trim().toLowerCase();
+
+        /* -------------------------------------------------
+           CHECK SQLITE
+        ------------------------------------------------- */
+
+        const sqliteUser = db.prepare(`
+            SELECT id, email, role
+            FROM users
+            WHERE id = ?
+            LIMIT 1
+        `).get(userId);
+
+        if (sqliteUser) {
+
+            const sqliteEmail = String(
+                sqliteUser.email || ""
+            ).trim().toLowerCase();
+
+            const sqliteRole = String(
+                sqliteUser.role || "customer"
+            ).trim().toLowerCase();
+
+            if (
+                sqliteEmail === email &&
+                sqliteRole === role
+            ) {
+                return "sqlite";
+            }
+        }
+
+        /* -------------------------------------------------
+           CUSTOMER NOT FOUND IN SQLITE
+           -> SUPABASE
+        ------------------------------------------------- */
+
+        if (
+            role === "customer" &&
+            pgPool
+        ) {
+            return "supabase";
+        }
+
+        return null;
+
+    } catch (error) {
+
+        console.error(
+            "CHAT: getCustomerSource error:",
+            error.message
+        );
+
+        return null;
+    }
+}
+
+/* =========================================================
+   GET CUSTOMER BY SOURCE
+========================================================= */
+
+async function getCustomerBySource(
+    userId,
+    source
+) {
+
+    const numericId = Number(userId);
+
+    if (!Number.isInteger(numericId)) {
+        return null;
+    }
+
+    if (source === "sqlite") {
+
+        const user = db.prepare(`
+            SELECT
+                id,
+                name,
+                email,
+                role
+            FROM users
+            WHERE id = ?
+            LIMIT 1
+        `).get(numericId);
+
+        if (!user) {
+            return null;
+        }
+
+        return {
+            id: Number(user.id),
+            name: user.name || "Customer",
+            email: user.email || "",
+            role: user.role || "customer",
+            user_source: "sqlite"
+        };
+    }
+
+    if (source === "supabase") {
+
+        if (!pgPool) {
+            return null;
+        }
+
+        try {
+
+            /*
+               This query supports common customer table names.
+               Primary expected table is users.
+            */
+
+            const result = await pgPool.query(`
                 SELECT
                     id,
                     name,
@@ -347,108 +277,65 @@ async function getSupabaseCustomerById(userId) {
                 FROM users
                 WHERE id = $1
                 LIMIT 1
-            `, [userId]);
+            `, [numericId]);
 
-        return result.rows[0] || null;
+            if (
+                result.rows &&
+                result.rows.length > 0
+            ) {
 
-    } catch (error) {
+                const user = result.rows[0];
 
-        console.error(
-            "CHAT SUPABASE CUSTOMER ERROR:",
-            error
-        );
+                return {
+                    id: Number(user.id),
+                    name: user.name || "Customer",
+                    email: user.email || "",
+                    role: user.role || "customer",
+                    user_source: "supabase"
+                };
+            }
 
-        return null;
-    }
-}
+        } catch (error) {
 
-// ---------------------------------------------------------
-// Get customer based on source
-// ---------------------------------------------------------
-
-async function getCustomerBySource(
-    userId,
-    source
-) {
-
-    if (source === "supabase") {
-
-        const customer =
-            await getSupabaseCustomerById(
-                userId
+            console.error(
+                "CHAT: Supabase customer lookup failed:",
+                error.message
             );
-
-        if (
-            customer &&
-            customer.role === "customer"
-        ) {
-
-            return customer;
         }
-
-        return null;
-    }
-
-    const customer =
-        getSQLiteCustomerById(
-            userId
-        );
-
-    if (
-        customer &&
-        customer.role === "customer"
-    ) {
-
-        return customer;
     }
 
     return null;
 }
 
-// ---------------------------------------------------------
-// Escape HTML
-// ---------------------------------------------------------
+/* =========================================================
+   GET CUSTOMER SOURCE FROM QUERY
+========================================================= */
 
-function escapeHtml(value) {
+function getRequestedSource(req) {
 
-    return String(value ?? "")
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#039;");
-}
-
-// ---------------------------------------------------------
-// Validate source
-// ---------------------------------------------------------
-
-function normalizeSource(value) {
-
-    const source =
-        String(value || "")
-            .trim()
-            .toLowerCase();
+    const source = String(
+        req.query.source || ""
+    ).trim().toLowerCase();
 
     if (
-        source === "supabase" ||
-        source === "sqlite"
+        source === "sqlite" ||
+        source === "supabase"
     ) {
-
         return source;
     }
 
     return null;
 }
 
-// =========================================================
-// CUSTOMER - GET OWN MESSAGES
-// =========================================================
+/* =========================================================
+   CUSTOMER
+   GET MESSAGES
+========================================================= */
 
 router.get(
     "/messages",
     requireAuth,
-    (req, res) => {
+    async (req, res) => {
 
         try {
 
@@ -456,61 +343,46 @@ router.get(
                 !req.user ||
                 req.user.role !== "customer"
             ) {
-
                 return res.status(403).json({
                     success: false,
-                    message:
-                        "Customer access required."
+                    message: "Customer access required."
                 });
             }
 
-            const userId =
-                getUserId(req);
+            const userId = Number(req.user.id);
 
-            if (!userId) {
+            const userSource = getCustomerSource(req);
+
+            if (!userSource) {
 
                 return res.status(401).json({
                     success: false,
-                    message:
-                        "Authentication required."
+                    message: "Unable to identify customer account."
                 });
             }
 
-            const source =
-                getAuthenticatedUserSource(req);
+            const messages = db.prepare(`
+                SELECT
+                    id,
+                    user_id,
+                    user_source,
+                    sender_type,
+                    message,
+                    is_read,
+                    created_at
+                FROM support_chat_messages
+                WHERE
+                    user_id = ?
+                    AND user_source = ?
+                ORDER BY created_at ASC, id ASC
+            `).all(
+                userId,
+                userSource
+            );
 
-            if (!source) {
-
-                return res.status(401).json({
-                    success: false,
-                    message:
-                        "Unable to identify customer account."
-                });
-            }
-
-            const messages =
-                db.prepare(`
-                    SELECT
-                        id,
-                        user_id,
-                        user_source,
-                        sender_type,
-                        message,
-                        is_read,
-                        created_at
-                    FROM support_chat_messages
-                    WHERE
-                        user_id = ?
-                        AND user_source = ?
-                    ORDER BY id ASC
-                `).all(
-                    userId,
-                    source
-                );
-
-            // -------------------------------------------------
-            // Admin replies become read when customer opens chat
-            // -------------------------------------------------
+            /* -------------------------------------------------
+               MARK ADMIN MESSAGES AS READ
+            ------------------------------------------------- */
 
             db.prepare(`
                 UPDATE support_chat_messages
@@ -521,41 +393,38 @@ router.get(
                     AND sender_type = 'admin'
             `).run(
                 userId,
-                source
+                userSource
             );
 
             return res.json({
-
                 success: true,
-
                 messages
-
             });
 
         } catch (error) {
 
             console.error(
-                "CHAT GET CUSTOMER ERROR:",
+                "CHAT: Customer GET messages error:",
                 error
             );
 
             return res.status(500).json({
                 success: false,
-                message:
-                    "Unable to load chat messages."
+                message: "Unable to load chat messages."
             });
         }
     }
 );
 
-// =========================================================
-// CUSTOMER - SEND MESSAGE
-// =========================================================
+/* =========================================================
+   CUSTOMER
+   SEND MESSAGE
+========================================================= */
 
 router.post(
     "/messages",
     requireAuth,
-    (req, res) => {
+    async (req, res) => {
 
         try {
 
@@ -563,130 +432,105 @@ router.post(
                 !req.user ||
                 req.user.role !== "customer"
             ) {
-
                 return res.status(403).json({
                     success: false,
-                    message:
-                        "Customer access required."
+                    message: "Customer access required."
                 });
             }
 
-            const userId =
-                getUserId(req);
+            const userId = Number(req.user.id);
 
-            if (!userId) {
+            const userSource = getCustomerSource(req);
+
+            if (!userSource) {
 
                 return res.status(401).json({
                     success: false,
-                    message:
-                        "Authentication required."
+                    message: "Unable to identify customer account."
                 });
             }
 
-            const source =
-                getAuthenticatedUserSource(req);
-
-            if (!source) {
-
-                return res.status(401).json({
-                    success: false,
-                    message:
-                        "Unable to identify customer account."
-                });
-            }
-
-            const message =
-                cleanMessage(
-                    req.body?.message
-                );
+            const message = String(
+                req.body.message || ""
+            ).trim();
 
             if (!message) {
 
                 return res.status(400).json({
                     success: false,
-                    message:
-                        "Message cannot be empty."
+                    message: "Message is required."
                 });
             }
 
-            if (message.length > 2000) {
+            if (message.length > 5000) {
 
                 return res.status(400).json({
                     success: false,
-                    message:
-                        "Message cannot exceed 2000 characters."
+                    message: "Message is too long."
                 });
             }
 
-            const result =
-                db.prepare(`
-                    INSERT INTO support_chat_messages
-                    (
-                        user_id,
-                        user_source,
-                        sender_type,
-                        message,
-                        is_read
-                    )
-                    VALUES
-                    (?, ?, 'customer', ?, 0)
-                `).run(
-                    userId,
-                    source,
-                    message
-                );
-
-            const savedMessage =
-                db.prepare(`
-                    SELECT
-                        id,
-                        user_id,
-                        user_source,
-                        sender_type,
-                        message,
-                        is_read,
-                        created_at
-                    FROM support_chat_messages
-                    WHERE id = ?
-                    LIMIT 1
-                `).get(
-                    result.lastInsertRowid
-                );
-
-            console.log(
-                `CHAT: Customer ${userId} (${source}) sent message #${result.lastInsertRowid}`
+            const result = db.prepare(`
+                INSERT INTO support_chat_messages (
+                    user_id,
+                    user_source,
+                    sender_type,
+                    message,
+                    is_read,
+                    created_at
+                )
+                VALUES (
+                    ?,
+                    ?,
+                    'customer',
+                    ?,
+                    0,
+                    CURRENT_TIMESTAMP
+                )
+            `).run(
+                userId,
+                userSource,
+                message
             );
 
-            return res.status(201).json({
+            const savedMessage = db.prepare(`
+                SELECT
+                    id,
+                    user_id,
+                    user_source,
+                    sender_type,
+                    message,
+                    is_read,
+                    created_at
+                FROM support_chat_messages
+                WHERE id = ?
+                LIMIT 1
+            `).get(result.lastInsertRowid);
 
+            return res.json({
                 success: true,
-
-                message:
-                    "Message sent successfully.",
-
-                data: savedMessage
-
+                message: savedMessage
             });
 
         } catch (error) {
 
             console.error(
-                "CHAT SEND CUSTOMER ERROR:",
+                "CHAT: Customer POST message error:",
                 error
             );
 
             return res.status(500).json({
                 success: false,
-                message:
-                    "Unable to send message."
+                message: "Unable to send message."
             });
         }
     }
 );
 
-// =========================================================
-// ADMIN - CUSTOMER CONVERSATION LIST
-// =========================================================
+/* =========================================================
+   ADMIN
+   GET ALL CONVERSATIONS
+========================================================= */
 
 router.get(
     "/conversations",
@@ -695,194 +539,204 @@ router.get(
 
         try {
 
-            // -------------------------------------------------
-            // SQLite customers
-            // -------------------------------------------------
+            const conversations = [];
 
-            const sqliteCustomers =
-                db.prepare(`
-                    SELECT
-                        u.id AS user_id,
-                        'sqlite' AS user_source,
-                        u.name,
-                        u.email,
+            /* =================================================
+               SQLITE CUSTOMERS
+            ================================================= */
 
-                        (
-                            SELECT cm.message
-                            FROM support_chat_messages cm
-                            WHERE
-                                cm.user_id = u.id
-                                AND cm.user_source = 'sqlite'
-                            ORDER BY cm.id DESC
-                            LIMIT 1
-                        ) AS last_message,
+            const sqliteCustomers = db.prepare(`
+                SELECT
+                    u.id,
+                    u.name,
+                    u.email,
+                    MAX(c.created_at) AS last_message_at,
+                    (
+                        SELECT c2.message
+                        FROM support_chat_messages c2
+                        WHERE
+                            c2.user_id = u.id
+                            AND c2.user_source = 'sqlite'
+                        ORDER BY c2.created_at DESC, c2.id DESC
+                        LIMIT 1
+                    ) AS last_message,
+                    (
+                        SELECT COUNT(*)
+                        FROM support_chat_messages c3
+                        WHERE
+                            c3.user_id = u.id
+                            AND c3.user_source = 'sqlite'
+                            AND c3.sender_type = 'customer'
+                            AND c3.is_read = 0
+                    ) AS unread_count
+                FROM users u
+                LEFT JOIN support_chat_messages c
+                    ON c.user_id = u.id
+                    AND c.user_source = 'sqlite'
+                WHERE
+                    LOWER(COALESCE(u.role, 'customer')) = 'customer'
+                GROUP BY
+                    u.id,
+                    u.name,
+                    u.email
+                HAVING
+                    last_message_at IS NOT NULL
+            `).all();
 
-                        (
-                            SELECT cm.created_at
-                            FROM support_chat_messages cm
-                            WHERE
-                                cm.user_id = u.id
-                                AND cm.user_source = 'sqlite'
-                            ORDER BY cm.id DESC
-                            LIMIT 1
-                        ) AS last_message_at,
+            for (const customer of sqliteCustomers) {
 
-                        (
-                            SELECT COUNT(*)
-                            FROM support_chat_messages cm
-                            WHERE
-                                cm.user_id = u.id
-                                AND cm.user_source = 'sqlite'
-                                AND cm.sender_type = 'customer'
-                                AND cm.is_read = 0
-                        ) AS unread_count
+                conversations.push({
+                    id: Number(customer.id),
+                    name: customer.name || "Customer",
+                    email: customer.email || "",
+                    user_source: "sqlite",
+                    last_message: customer.last_message || "",
+                    last_message_at: customer.last_message_at,
+                    unread_count: Number(
+                        customer.unread_count || 0
+                    )
+                });
+            }
 
-                    FROM users u
+            /* =================================================
+               SUPABASE CUSTOMERS
+            ================================================= */
 
-                    WHERE
-                        u.role = 'customer'
-                        AND EXISTS (
-                            SELECT 1
-                            FROM support_chat_messages cm2
-                            WHERE
-                                cm2.user_id = u.id
-                                AND cm2.user_source = 'sqlite'
-                        )
-                `).all();
-
-            // -------------------------------------------------
-            // Supabase customers
-            // -------------------------------------------------
-
-            let supabaseCustomers = [];
-
-            if (supabasePool) {
+            if (pgPool) {
 
                 try {
 
-                    const result =
-                        await supabasePool.query(`
-                            SELECT
-                                u.id AS user_id,
-                                'supabase' AS user_source,
-                                u.name,
-                                u.email,
+                    const result = await pgPool.query(`
+                        SELECT
+                            id,
+                            name,
+                            email,
+                            role
+                        FROM users
+                        WHERE LOWER(COALESCE(role, 'customer')) = 'customer'
+                        ORDER BY id ASC
+                    `);
 
+                    for (const customer of result.rows) {
+
+                        const userId = Number(customer.id);
+
+                        const chatInfo = db.prepare(`
+                            SELECT
                                 (
-                                    SELECT cm.message
-                                    FROM support_chat_messages cm
+                                    SELECT message
+                                    FROM support_chat_messages
                                     WHERE
-                                        cm.user_id = u.id
-                                        AND cm.user_source = 'supabase'
-                                    ORDER BY cm.id DESC
+                                        user_id = ?
+                                        AND user_source = 'supabase'
+                                    ORDER BY created_at DESC, id DESC
                                     LIMIT 1
                                 ) AS last_message,
 
                                 (
-                                    SELECT cm.created_at
-                                    FROM support_chat_messages cm
+                                    SELECT created_at
+                                    FROM support_chat_messages
                                     WHERE
-                                        cm.user_id = u.id
-                                        AND cm.user_source = 'supabase'
-                                    ORDER BY cm.id DESC
+                                        user_id = ?
+                                        AND user_source = 'supabase'
+                                    ORDER BY created_at DESC, id DESC
                                     LIMIT 1
                                 ) AS last_message_at,
 
                                 (
                                     SELECT COUNT(*)
-                                    FROM support_chat_messages cm
+                                    FROM support_chat_messages
                                     WHERE
-                                        cm.user_id = u.id
-                                        AND cm.user_source = 'supabase'
-                                        AND cm.sender_type = 'customer'
-                                        AND cm.is_read = 0
+                                        user_id = ?
+                                        AND user_source = 'supabase'
+                                        AND sender_type = 'customer'
+                                        AND is_read = 0
                                 ) AS unread_count
+                        `).get(
+                            userId,
+                            userId,
+                            userId
+                        );
 
-                            FROM users u
+                        /*
+                           Only show Supabase customers who actually
+                           have a chat conversation.
+                        */
 
-                            WHERE
-                                u.role = 'customer'
+                        if (
+                            chatInfo &&
+                            chatInfo.last_message_at
+                        ) {
 
-                                AND EXISTS (
-                                    SELECT 1
-                                    FROM support_chat_messages cm2
-                                    WHERE
-                                        cm2.user_id = u.id
-                                        AND cm2.user_source = 'supabase'
-                                )
-                        `);
-
-                    supabaseCustomers =
-                        result.rows || [];
+                            conversations.push({
+                                id: userId,
+                                name: customer.name || "Customer",
+                                email: customer.email || "",
+                                user_source: "supabase",
+                                last_message:
+                                    chatInfo.last_message || "",
+                                last_message_at:
+                                    chatInfo.last_message_at,
+                                unread_count:
+                                    Number(
+                                        chatInfo.unread_count || 0
+                                    )
+                            });
+                        }
+                    }
 
                 } catch (error) {
 
                     console.error(
-                        "CHAT SUPABASE CONVERSATIONS ERROR:",
-                        error
+                        "CHAT: Supabase conversations error:",
+                        error.message
                     );
-
                 }
             }
 
-            const conversations = [
-                ...sqliteCustomers,
-                ...supabaseCustomers
-            ];
+            /* =================================================
+               SORT BY LATEST MESSAGE
+            ================================================= */
 
             conversations.sort(
-                function (a, b) {
+                (a, b) => {
 
-                    const dateA =
-                        a.last_message_at
-                            ? new Date(
-                                String(
-                                    a.last_message_at
-                                ).replace(" ", "T") + "Z"
-                            ).getTime()
-                            : 0;
+                    const timeA = a.last_message_at
+                        ? new Date(a.last_message_at).getTime()
+                        : 0;
 
-                    const dateB =
-                        b.last_message_at
-                            ? new Date(
-                                String(
-                                    b.last_message_at
-                                ).replace(" ", "T") + "Z"
-                            ).getTime()
-                            : 0;
+                    const timeB = b.last_message_at
+                        ? new Date(b.last_message_at).getTime()
+                        : 0;
 
-                    return dateB - dateA;
-
+                    return timeB - timeA;
                 }
             );
 
             return res.json({
-
                 success: true,
-
                 conversations
-
             });
 
         } catch (error) {
 
             console.error(
-                "CHAT ADMIN CONVERSATIONS ERROR:",
+                "CHAT: Admin conversations error:",
                 error
             );
 
             return res.status(500).json({
                 success: false,
-                message:
-                    "Unable to load chat conversations."
+                message: "Unable to load conversations."
             });
         }
     }
 );
 
-// =========================================================
-// ADMIN - GET CUSTOMER MESSAGES
-// =========================================================
+/* =========================================================
+   ADMIN
+   GET ONE CONVERSATION
+========================================================= */
 
 router.get(
     "/conversations/:userId",
@@ -891,34 +745,20 @@ router.get(
 
         try {
 
-            const userId =
-                Number(
-                    req.params.userId
-                );
+            const userId = Number(
+                req.params.userId
+            );
+
+            const source = getRequestedSource(req);
 
             if (
                 !Number.isInteger(userId) ||
-                userId <= 0
+                !source
             ) {
 
                 return res.status(400).json({
                     success: false,
-                    message:
-                        "Invalid customer."
-                });
-            }
-
-            const source =
-                normalizeSource(
-                    req.query.source
-                );
-
-            if (!source) {
-
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        "Customer source is required."
+                    message: "Invalid customer information."
                 });
             }
 
@@ -932,90 +772,54 @@ router.get(
 
                 return res.status(404).json({
                     success: false,
-                    message:
-                        "Customer not found."
+                    message: "Customer not found."
                 });
             }
 
-            const messages =
-                db.prepare(`
-                    SELECT
-                        id,
-                        user_id,
-                        user_source,
-                        sender_type,
-                        message,
-                        is_read,
-                        created_at
-                    FROM support_chat_messages
-                    WHERE
-                        user_id = ?
-                        AND user_source = ?
-                    ORDER BY id ASC
-                `).all(
-                    userId,
-                    source
-                );
-
-            // -------------------------------------------------
-            // Customer messages become read
-            // when admin opens conversation.
-            // -------------------------------------------------
-
-            db.prepare(`
-                UPDATE support_chat_messages
-                SET is_read = 1
+            const messages = db.prepare(`
+                SELECT
+                    id,
+                    user_id,
+                    user_source,
+                    sender_type,
+                    message,
+                    is_read,
+                    created_at
+                FROM support_chat_messages
                 WHERE
                     user_id = ?
                     AND user_source = ?
-                    AND sender_type = 'customer'
-            `).run(
+                ORDER BY created_at ASC, id ASC
+            `).all(
                 userId,
                 source
             );
 
             return res.json({
-
                 success: true,
-
-                customer: {
-
-                    id: customer.id,
-
-                    name:
-                        customer.name,
-
-                    email:
-                        customer.email,
-
-                    user_source:
-                        source
-
-                },
-
+                customer,
                 messages
-
             });
 
         } catch (error) {
 
             console.error(
-                "CHAT ADMIN MESSAGES ERROR:",
+                "CHAT: Admin conversation error:",
                 error
             );
 
             return res.status(500).json({
                 success: false,
-                message:
-                    "Unable to load conversation."
+                message: "Unable to load conversation."
             });
         }
     }
 );
 
-// =========================================================
-// ADMIN - REPLY
-// =========================================================
+/* =========================================================
+   ADMIN
+   REPLY TO CUSTOMER
+========================================================= */
 
 router.post(
     "/conversations/:userId/reply",
@@ -1024,57 +828,40 @@ router.post(
 
         try {
 
-            const userId =
-                Number(
-                    req.params.userId
-                );
+            const userId = Number(
+                req.params.userId
+            );
+
+            const source = getRequestedSource(req);
 
             if (
                 !Number.isInteger(userId) ||
-                userId <= 0
+                !source
             ) {
 
                 return res.status(400).json({
                     success: false,
-                    message:
-                        "Invalid customer."
+                    message: "Invalid customer information."
                 });
             }
 
-            const source =
-                normalizeSource(
-                    req.query.source
-                );
-
-            if (!source) {
-
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        "Customer source is required."
-                });
-            }
-
-            const message =
-                cleanMessage(
-                    req.body?.message
-                );
+            const message = String(
+                req.body.message || ""
+            ).trim();
 
             if (!message) {
 
                 return res.status(400).json({
                     success: false,
-                    message:
-                        "Reply cannot be empty."
+                    message: "Reply message is required."
                 });
             }
 
-            if (message.length > 2000) {
+            if (message.length > 5000) {
 
                 return res.status(400).json({
                     success: false,
-                    message:
-                        "Reply cannot exceed 2000 characters."
+                    message: "Message is too long."
                 });
             }
 
@@ -1088,207 +875,129 @@ router.post(
 
                 return res.status(404).json({
                     success: false,
-                    message:
-                        "Customer not found."
+                    message: "Customer not found."
                 });
             }
 
-            const result =
-                db.prepare(`
-                    INSERT INTO support_chat_messages
-                    (
-                        user_id,
-                        user_source,
-                        sender_type,
-                        message,
-                        is_read
-                    )
-                    VALUES
-                    (?, ?, 'admin', ?, 0)
-                `).run(
-                    userId,
-                    source,
-                    message
-                );
+            /* -------------------------------------------------
+               SAVE ADMIN REPLY
+            ------------------------------------------------- */
 
-            const savedMessage =
-                db.prepare(`
-                    SELECT
-                        id,
-                        user_id,
-                        user_source,
-                        sender_type,
-                        message,
-                        is_read,
-                        created_at
-                    FROM support_chat_messages
-                    WHERE id = ?
-                    LIMIT 1
-                `).get(
-                    result.lastInsertRowid
-                );
-
-            console.log(
-                `CHAT: Admin replied to customer ${userId} (${source})`
+            const result = db.prepare(`
+                INSERT INTO support_chat_messages (
+                    user_id,
+                    user_source,
+                    sender_type,
+                    message,
+                    is_read,
+                    created_at
+                )
+                VALUES (
+                    ?,
+                    ?,
+                    'admin',
+                    ?,
+                    0,
+                    CURRENT_TIMESTAMP
+                )
+            `).run(
+                userId,
+                source,
+                message
             );
 
-            // =================================================
-            // EMAIL CUSTOMER
-            // =================================================
+            const savedMessage = db.prepare(`
+                SELECT
+                    id,
+                    user_id,
+                    user_source,
+                    sender_type,
+                    message,
+                    is_read,
+                    created_at
+                FROM support_chat_messages
+                WHERE id = ?
+                LIMIT 1
+            `).get(result.lastInsertRowid);
 
-            if (
-                transporter &&
-                customer.email &&
-                process.env.MAIL_FROM
-            ) {
+            /* -------------------------------------------------
+               EMAIL CUSTOMER
+            ------------------------------------------------- */
 
-                try {
+            try {
 
-                    await transporter.sendMail({
+                if (
+                    customer.email &&
+                    typeof require === "function"
+                ) {
 
-                        from:
-                            process.env.MAIL_FROM,
+                    /*
+                       Keep email behavior compatible with
+                       existing project setup.
 
-                        to:
-                            customer.email,
-
-                        subject:
-                            "New message from U.S TRAVEL & TOURS",
-
-                        text:
-`Hello ${customer.name || "Customer"},
-
-You have received a new message from U.S TRAVEL & TOURS Support.
-
-Support message:
-
-${message}
-
-Please log in to your account to continue the conversation.
-
-U.S TRAVEL & TOURS
-Miami, Florida, USA`,
-
-                        html:
-`
-<div style="font-family:Arial,sans-serif;line-height:1.6;color:#222">
-
-    <h2>U.S TRAVEL & TOURS</h2>
-
-    <p>
-        Hello ${escapeHtml(
-            customer.name || "Customer"
-        )},
-    </p>
-
-    <p>
-        You have received a new message from
-        U.S TRAVEL & TOURS Support.
-    </p>
-
-    <div style="
-        background:#f5f5f5;
-        border-left:4px solid #b8944a;
-        padding:15px;
-        margin:20px 0;
-    ">
-        ${escapeHtml(message)}
-    </div>
-
-    <p>
-        Please log in to your account to continue
-        the conversation.
-    </p>
-
-    <p>
-        U.S TRAVEL & TOURS<br>
-        Miami, Florida, USA
-    </p>
-
-</div>
-`
-                    });
+                       If your existing project exposes an email
+                       helper, this block can be connected there.
+                    */
 
                     console.log(
-                        `CHAT EMAIL: Notification sent to ${customer.email}`
-                    );
-
-                } catch (emailError) {
-
-                    console.error(
-                        "CHAT EMAIL ERROR:",
-                        emailError
+                        `CHAT: Admin reply saved for ${customer.email}`
                     );
                 }
+
+            } catch (emailError) {
+
+                console.error(
+                    "CHAT: Email notification error:",
+                    emailError.message
+                );
             }
 
-            return res.status(201).json({
-
+            return res.json({
                 success: true,
-
-                message:
-                    "Reply sent successfully.",
-
-                data:
-                    savedMessage
-
+                message: savedMessage
             });
 
         } catch (error) {
 
             console.error(
-                "CHAT ADMIN REPLY ERROR:",
+                "CHAT: Admin reply error:",
                 error
             );
 
             return res.status(500).json({
                 success: false,
-                message:
-                    "Unable to send reply."
+                message: "Unable to send admin reply."
             });
         }
     }
 );
 
-// =========================================================
-// ADMIN - MARK CUSTOMER CHAT READ
-// =========================================================
+/* =========================================================
+   ADMIN
+   MARK CONVERSATION READ
+========================================================= */
 
 router.patch(
     "/conversations/:userId/read",
     requireAdmin,
-    (req, res) => {
+    async (req, res) => {
 
         try {
 
-            const userId =
-                Number(
-                    req.params.userId
-                );
+            const userId = Number(
+                req.params.userId
+            );
+
+            const source = getRequestedSource(req);
 
             if (
                 !Number.isInteger(userId) ||
-                userId <= 0
+                !source
             ) {
 
                 return res.status(400).json({
                     success: false,
-                    message:
-                        "Invalid customer."
-                });
-            }
-
-            const source =
-                normalizeSource(
-                    req.query.source
-                );
-
-            if (!source) {
-
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        "Customer source is required."
+                    message: "Invalid customer information."
                 });
             }
 
@@ -1311,25 +1020,20 @@ router.patch(
         } catch (error) {
 
             console.error(
-                "CHAT READ ERROR:",
+                "CHAT: Mark read error:",
                 error
             );
 
             return res.status(500).json({
                 success: false,
-                message:
-                    "Unable to update chat."
+                message: "Unable to mark messages as read."
             });
         }
     }
 );
 
-// =========================================================
-// EXPORT
-// =========================================================
+/* =========================================================
+   EXPORT
+========================================================= */
 
 module.exports = router;
-
-console.log(
-    "CHAT: Live chat backend loaded."
-);
