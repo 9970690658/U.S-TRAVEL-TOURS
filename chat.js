@@ -1,1039 +1,2217 @@
-
-
 const express = require("express");
-const router = express.Router();
-
-const { db } = require("./database");
-const { requireAuth, requireAdmin } = require("./auth");
-
+const bcrypt = require("bcryptjs");
+const crypto = require("crypto");
+const nodemailer = require("nodemailer");
 const { Pool } = require("pg");
 
-/* =========================================================
-   SUPABASE / POSTGRES CONNECTION
-========================================================= */
+// Existing SQLite database is preserved for compatibility
+const { db } = require("./database");
 
-let pgPool = null;
+const router = express.Router();
+
+
+// =========================================================
+// CONFIGURATION
+// =========================================================
+
+const SESSION_DURATION_MS =
+    1000 * 60 * 60 * 24 * 7;
+
+const RESET_TOKEN_DURATION_MS =
+    1000 * 60 * 30;
+
+// Login sessions remain temporary in RAM.
+// Customer accounts themselves are stored permanently
+// in Supabase PostgreSQL.
+const sessions = new Map();
+
+
+// =========================================================
+// SUPABASE / POSTGRES CONNECTION
+// =========================================================
+
+let supabasePool = null;
 
 if (process.env.DATABASE_URL) {
-    try {
-        pgPool = new Pool({
-            connectionString: process.env.DATABASE_URL,
-            ssl: {
-                rejectUnauthorized: false
-            }
-        });
 
-        console.log("CHAT: Supabase PostgreSQL pool initialized.");
-    } catch (error) {
-        console.error(
-            "CHAT: PostgreSQL pool initialization failed:",
-            error.message
-        );
-    }
-}
+    supabasePool = new Pool({
+        connectionString: process.env.DATABASE_URL,
 
-/* =========================================================
-   TABLE SETUP / MIGRATION
-========================================================= */
+        ssl: {
+            rejectUnauthorized: false
+        },
 
-function setupChatTable() {
+        max: 5,
 
-    try {
+        idleTimeoutMillis: 30000,
 
-        const tableInfo = db.prepare(`
-            PRAGMA table_info(support_chat_messages)
-        `).all();
+        connectionTimeoutMillis: 10000
+    });
 
-        /* -------------------------------------------------
-           TABLE DOES NOT EXIST
-        ------------------------------------------------- */
-
-        if (!tableInfo || tableInfo.length === 0) {
-
-            db.prepare(`
-                CREATE TABLE support_chat_messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    user_source TEXT NOT NULL DEFAULT 'sqlite',
-                    sender_type TEXT NOT NULL CHECK (
-                        sender_type IN ('customer', 'admin')
-                    ),
-                    message TEXT NOT NULL,
-                    is_read INTEGER NOT NULL DEFAULT 0,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            `).run();
-
-            console.log(
-                "CHAT: support_chat_messages table created."
-            );
-
-        } else {
-
-            /* -------------------------------------------------
-               OLD TABLE EXISTS WITHOUT user_source
-            ------------------------------------------------- */
-
-            const hasUserSource = tableInfo.some(
-                column => column.name === "user_source"
-            );
-
-            if (!hasUserSource) {
-
-                db.prepare(`
-                    ALTER TABLE support_chat_messages
-                    ADD COLUMN user_source TEXT
-                    NOT NULL DEFAULT 'sqlite'
-                `).run();
-
-                console.log(
-                    "CHAT: user_source column added to support_chat_messages."
-                );
-            }
-        }
-
-        /* -------------------------------------------------
-           INDEXES
-        ------------------------------------------------- */
-
-        db.prepare(`
-            CREATE INDEX IF NOT EXISTS
-            idx_chat_user_source
-            ON support_chat_messages(user_id, user_source)
-        `).run();
-
-        db.prepare(`
-            CREATE INDEX IF NOT EXISTS
-            idx_chat_created_at
-            ON support_chat_messages(created_at)
-        `).run();
-
-        console.log("CHAT: database structure ready.");
-
-    } catch (error) {
+    supabasePool.on("error", (error) => {
 
         console.error(
-            "CHAT: Database setup failed:",
-            error.message
+            "Supabase PostgreSQL pool error:",
+            error
         );
-    }
+
+    });
+
+    console.log(
+        "Supabase PostgreSQL authentication database configured."
+    );
+
+} else {
+
+    console.warn(
+        "DATABASE_URL is not configured. " +
+        "Customer Supabase authentication will not work."
+    );
 }
 
-setupChatTable();
 
-/* =========================================================
-   HELPERS
-========================================================= */
+// =========================================================
+// DATABASE CHECK
+// =========================================================
 
-/*
-   req.user comes from auth.js.
+async function checkSupabaseDatabase() {
 
-   The current auth.js session contains the user ID and role,
-   but chat needs to know whether that ID belongs to SQLite
-   or Supabase.
+    if (!supabasePool) {
 
-   We therefore check SQLite using ID + email + role.
+        throw new Error(
+            "DATABASE_URL is not configured."
+        );
 
-   If exact SQLite user exists -> sqlite.
-   Otherwise customer -> supabase.
-*/
+    }
 
-function getCustomerSource(req) {
+    const result = await supabasePool.query(
+        "SELECT NOW() AS current_time"
+    );
 
-    try {
+    return result.rows[0];
+}
 
-        if (!req.user) {
-            return null;
-        }
 
-        const userId = Number(req.user.id);
+// =========================================================
+// HELPERS
+// =========================================================
 
-        if (!Number.isInteger(userId)) {
-            return null;
-        }
+function normalizeEmail(email) {
 
-        const email = String(
-            req.user.email || ""
-        ).trim().toLowerCase();
+    return String(email || "")
+        .trim()
+        .toLowerCase();
 
-        const role = String(
-            req.user.role || "customer"
-        ).trim().toLowerCase();
+}
 
-        /* -------------------------------------------------
-           CHECK SQLITE
-        ------------------------------------------------- */
 
-        const sqliteUser = db.prepare(`
-            SELECT id, email, role
-            FROM users
-            WHERE id = ?
-            LIMIT 1
-        `).get(userId);
+function cleanText(value) {
 
-        if (sqliteUser) {
+    if (
+        value === undefined ||
+        value === null
+    ) {
 
-            const sqliteEmail = String(
-                sqliteUser.email || ""
-            ).trim().toLowerCase();
+        return "";
 
-            const sqliteRole = String(
-                sqliteUser.role || "customer"
-            ).trim().toLowerCase();
+    }
 
-            if (
-                sqliteEmail === email &&
-                sqliteRole === role
-            ) {
-                return "sqlite";
-            }
-        }
+    return String(value).trim();
 
-        /* -------------------------------------------------
-           CUSTOMER NOT FOUND IN SQLITE
-           -> SUPABASE
-        ------------------------------------------------- */
+}
 
-        if (
-            role === "customer" &&
-            pgPool
-        ) {
-            return "supabase";
-        }
+
+function isValidEmail(email) {
+
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(
+        email
+    );
+
+}
+
+
+function isStrongPassword(password) {
+
+    return (
+        typeof password === "string" &&
+        password.length >= 6
+    );
+
+}
+
+
+// =========================================================
+// SESSION FUNCTIONS
+// =========================================================
+
+function createSession(user, source) {
+
+    const token =
+        crypto.randomBytes(32).toString("hex");
+
+    const expiresAt =
+        Date.now() + SESSION_DURATION_MS;
+
+    sessions.set(token, {
+
+        userId:
+            Number(user.id),
+
+        role:
+            user.role,
+
+        source:
+            source,
+
+        expiresAt:
+            expiresAt
+
+    });
+
+    return {
+
+        token:
+            token,
+
+        expiresAt:
+            expiresAt
+
+    };
+
+}
+
+
+function getSession(token) {
+
+    if (!token) {
 
         return null;
 
-    } catch (error) {
+    }
 
-        console.error(
-            "CHAT: getCustomerSource error:",
-            error.message
-        );
+    const session =
+        sessions.get(token);
+
+    if (!session) {
 
         return null;
+
     }
+
+    if (
+        Date.now() >=
+        session.expiresAt
+    ) {
+
+        sessions.delete(token);
+
+        return null;
+
+    }
+
+    return session;
+
 }
 
-/* =========================================================
-   GET CUSTOMER BY SOURCE
-========================================================= */
 
-async function getCustomerBySource(
-    userId,
-    source
-) {
+function getTokenFromRequest(req) {
 
-    const numericId = Number(userId);
+    const authorization =
+        req.headers.authorization || "";
 
-    if (!Number.isInteger(numericId)) {
+    if (
+        !authorization.startsWith(
+            "Bearer "
+        )
+    ) {
+
         return null;
+
     }
+
+    return authorization
+        .substring(7)
+        .trim();
+
+}
+
+
+// =========================================================
+// GET USER BY ID
+//
+// IMPORTANT:
+// SQLite and Supabase have separate ID systems.
+//
+// source = "sqlite"
+// source = "supabase"
+//
+// This prevents an Admin SQLite ID from accidentally
+// matching a Customer Supabase ID.
+// =========================================================
+
+async function getUserById(userId, source) {
+
+    const numericId =
+        Number(userId);
+
+    if (
+        !Number.isInteger(numericId) ||
+        numericId <= 0
+    ) {
+
+        return null;
+
+    }
+
+
+    // =====================================================
+    // SQLITE USER
+    // =====================================================
 
     if (source === "sqlite") {
 
-        const user = db.prepare(`
-            SELECT
-                id,
-                name,
-                email,
-                role
-            FROM users
-            WHERE id = ?
-            LIMIT 1
-        `).get(numericId);
+        try {
 
-        if (!user) {
+            const user =
+                db.prepare(
+                    `
+                    SELECT
+                        id,
+                        name,
+                        email,
+                        phone,
+                        password_hash,
+                        role,
+                        created_at,
+                        updated_at
+                    FROM users
+                    WHERE id = ?
+                    LIMIT 1
+                    `
+                ).get(numericId);
+
+            return user || null;
+
+        } catch (error) {
+
+            console.error(
+                "SQLite user lookup error:",
+                error
+            );
+
             return null;
+
         }
 
-        return {
-            id: Number(user.id),
-            name: user.name || "Customer",
-            email: user.email || "",
-            role: user.role || "customer",
-            user_source: "sqlite"
-        };
     }
 
-    if (source === "supabase") {
 
-        if (!pgPool) {
-            return null;
-        }
+    // =====================================================
+    // SUPABASE USER
+    // =====================================================
+
+    if (
+        source === "supabase" &&
+        supabasePool
+    ) {
 
         try {
 
-            /*
-               This query supports common customer table names.
-               Primary expected table is users.
-            */
-
-            const result = await pgPool.query(`
-                SELECT
-                    id,
-                    name,
-                    email,
-                    role
-                FROM users
-                WHERE id = $1
-                LIMIT 1
-            `, [numericId]);
+            const result =
+                await supabasePool.query(
+                    `
+                    SELECT
+                        id,
+                        name,
+                        email,
+                        phone,
+                        password_hash,
+                        role,
+                        created_at,
+                        updated_at
+                    FROM users
+                    WHERE id = $1
+                    LIMIT 1
+                    `,
+                    [numericId]
+                );
 
             if (
-                result.rows &&
                 result.rows.length > 0
             ) {
 
-                const user = result.rows[0];
+                return result.rows[0];
 
-                return {
-                    id: Number(user.id),
-                    name: user.name || "Customer",
-                    email: user.email || "",
-                    role: user.role || "customer",
-                    user_source: "supabase"
-                };
             }
+
+            return null;
 
         } catch (error) {
 
             console.error(
-                "CHAT: Supabase customer lookup failed:",
-                error.message
-            );
-        }
-    }
-
-    return null;
-}
-
-/* =========================================================
-   GET CUSTOMER SOURCE FROM QUERY
-========================================================= */
-
-function getRequestedSource(req) {
-
-    const source = String(
-        req.query.source || ""
-    ).trim().toLowerCase();
-
-    if (
-        source === "sqlite" ||
-        source === "supabase"
-    ) {
-        return source;
-    }
-
-    return null;
-}
-
-/* =========================================================
-   CUSTOMER
-   GET MESSAGES
-========================================================= */
-
-router.get(
-    "/messages",
-    requireAuth,
-    async (req, res) => {
-
-        try {
-
-            if (
-                !req.user ||
-                req.user.role !== "customer"
-            ) {
-                return res.status(403).json({
-                    success: false,
-                    message: "Customer access required."
-                });
-            }
-
-            const userId = Number(req.user.id);
-
-            const userSource = getCustomerSource(req);
-
-            if (!userSource) {
-
-                return res.status(401).json({
-                    success: false,
-                    message: "Unable to identify customer account."
-                });
-            }
-
-            const messages = db.prepare(`
-                SELECT
-                    id,
-                    user_id,
-                    user_source,
-                    sender_type,
-                    message,
-                    is_read,
-                    created_at
-                FROM support_chat_messages
-                WHERE
-                    user_id = ?
-                    AND user_source = ?
-                ORDER BY created_at ASC, id ASC
-            `).all(
-                userId,
-                userSource
-            );
-
-            /* -------------------------------------------------
-               MARK ADMIN MESSAGES AS READ
-            ------------------------------------------------- */
-
-            db.prepare(`
-                UPDATE support_chat_messages
-                SET is_read = 1
-                WHERE
-                    user_id = ?
-                    AND user_source = ?
-                    AND sender_type = 'admin'
-            `).run(
-                userId,
-                userSource
-            );
-
-            return res.json({
-                success: true,
-                messages
-            });
-
-        } catch (error) {
-
-            console.error(
-                "CHAT: Customer GET messages error:",
+                "Supabase user lookup error:",
                 error
             );
 
-            return res.status(500).json({
-                success: false,
-                message: "Unable to load chat messages."
-            });
-        }
-    }
-);
+            return null;
 
-/* =========================================================
-   CUSTOMER
-   SEND MESSAGE
-========================================================= */
+        }
+
+    }
+
+
+    return null;
+
+}
+
+
+// =========================================================
+// AUTHENTICATED USER
+// =========================================================
+
+async function getAuthenticatedUser(req) {
+
+    const token =
+        getTokenFromRequest(req);
+
+    if (!token) {
+
+        return null;
+
+    }
+
+    const session =
+        getSession(token);
+
+    if (!session) {
+
+        return null;
+
+    }
+
+    // IMPORTANT:
+    // Use the same database from which the session was created.
+    const user =
+        await getUserById(
+            session.userId,
+            session.source
+        );
+
+    if (!user) {
+
+        sessions.delete(token);
+
+        return null;
+
+    }
+
+    return user;
+
+}
+
+
+// =========================================================
+// REQUIRE AUTH
+// =========================================================
+
+async function requireAuth(req, res, next) {
+
+    try {
+
+        const user =
+            await getAuthenticatedUser(req);
+
+        if (!user) {
+
+            return res.status(401).json({
+
+                success: false,
+
+                message:
+                    "Authentication required."
+
+            });
+
+        }
+
+        req.user = user;
+
+        req.authenticatedUser = user;
+
+        next();
+
+    } catch (error) {
+
+        console.error(
+            "Authentication error:",
+            error
+        );
+
+        return res.status(500).json({
+
+            success: false,
+
+            message:
+                "Authentication service error."
+
+        });
+
+    }
+
+}
+
+
+// =========================================================
+// REQUIRE ADMIN
+// =========================================================
+
+async function requireAdmin(req, res, next) {
+
+    try {
+
+        const user =
+            await getAuthenticatedUser(req);
+
+        if (!user) {
+
+            return res.status(401).json({
+
+                success: false,
+
+                message:
+                    "Authentication required."
+
+            });
+
+        }
+
+        if (
+            user.role !== "admin"
+        ) {
+
+            return res.status(403).json({
+
+                success: false,
+
+                message:
+                    "Administrator access required."
+
+            });
+
+        }
+
+        req.user = user;
+
+        req.authenticatedUser = user;
+
+        next();
+
+    } catch (error) {
+
+        console.error(
+            "Admin authentication error:",
+            error
+        );
+
+        return res.status(500).json({
+
+            success: false,
+
+            message:
+                "Authentication service error."
+
+        });
+
+    }
+
+}
+
+
+// =========================================================
+// REGISTER CUSTOMER
+// POST /api/auth/register
+// =========================================================
 
 router.post(
-    "/messages",
-    requireAuth,
+    "/register",
     async (req, res) => {
 
         try {
 
+            if (!supabasePool) {
+
+                return res.status(500).json({
+
+                    success: false,
+
+                    message:
+                        "Customer database is not configured."
+
+                });
+
+            }
+
+
+            const name =
+                cleanText(req.body?.name);
+
+            const email =
+                normalizeEmail(
+                    req.body?.email
+                );
+
+            const phone =
+                cleanText(
+                    req.body?.phone
+                );
+
+            const password =
+                String(
+                    req.body?.password || ""
+                );
+
+
+            // -------------------------------------------------
+            // VALIDATION
+            // -------------------------------------------------
+
+            if (!name) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "Please provide your name."
+
+                });
+
+            }
+
+            if (!isValidEmail(email)) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "Please provide a valid email address."
+
+                });
+
+            }
+
+            if (!isStrongPassword(password)) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "Password must be at least 6 characters."
+
+                });
+
+            }
+
+
+            // -------------------------------------------------
+            // CHECK EXISTING CUSTOMER
+            // -------------------------------------------------
+
+            const existing =
+                await supabasePool.query(
+                    `
+                    SELECT id, email
+                    FROM users
+                    WHERE LOWER(email) = LOWER($1)
+                    LIMIT 1
+                    `,
+                    [email]
+                );
+
+
             if (
-                !req.user ||
-                req.user.role !== "customer"
+                existing.rows.length > 0
             ) {
-                return res.status(403).json({
+
+                return res.status(409).json({
+
                     success: false,
-                    message: "Customer access required."
+
+                    message:
+                        "An account with this email already exists. Please login instead."
+
                 });
+
             }
 
-            const userId = Number(req.user.id);
 
-            const userSource = getCustomerSource(req);
+            // -------------------------------------------------
+            // HASH PASSWORD
+            // -------------------------------------------------
 
-            if (!userSource) {
+            const passwordHash =
+                await bcrypt.hash(
+                    password,
+                    12
+                );
 
-                return res.status(401).json({
-                    success: false,
-                    message: "Unable to identify customer account."
-                });
-            }
 
-            const message = String(
-                req.body.message || ""
-            ).trim();
+            // -------------------------------------------------
+            // CREATE CUSTOMER
+            // -------------------------------------------------
 
-            if (!message) {
+            const result =
+                await supabasePool.query(
+                    `
+                    INSERT INTO users (
+                        name,
+                        email,
+                        phone,
+                        password_hash,
+                        role
+                    )
+                    VALUES (
+                        $1,
+                        $2,
+                        $3,
+                        $4,
+                        'customer'
+                    )
+                    RETURNING
+                        id,
+                        name,
+                        email,
+                        phone,
+                        role,
+                        created_at,
+                        updated_at
+                    `,
+                    [
+                        name,
+                        email,
+                        phone || null,
+                        passwordHash
+                    ]
+                );
 
-                return res.status(400).json({
-                    success: false,
-                    message: "Message is required."
-                });
-            }
 
-            if (message.length > 5000) {
+            const user =
+                result.rows[0];
 
-                return res.status(400).json({
-                    success: false,
-                    message: "Message is too long."
-                });
-            }
 
-            const result = db.prepare(`
-                INSERT INTO support_chat_messages (
-                    user_id,
-                    user_source,
-                    sender_type,
-                    message,
-                    is_read,
-                    created_at
-                )
-                VALUES (
-                    ?,
-                    ?,
-                    'customer',
-                    ?,
-                    0,
-                    CURRENT_TIMESTAMP
-                )
-            `).run(
-                userId,
-                userSource,
-                message
+            console.log(
+                `New customer account created. ` +
+                `Customer ID: ${user.id}, ` +
+                `Email: ${user.email}`
             );
 
-            const savedMessage = db.prepare(`
-                SELECT
-                    id,
-                    user_id,
-                    user_source,
-                    sender_type,
-                    message,
-                    is_read,
-                    created_at
-                FROM support_chat_messages
-                WHERE id = ?
-                LIMIT 1
-            `).get(result.lastInsertRowid);
 
-            return res.json({
+            // -------------------------------------------------
+            // CREATE SUPABASE LOGIN SESSION
+            // -------------------------------------------------
+
+            const session =
+                createSession(
+                    user,
+                    "supabase"
+                );
+
+
+            return res.status(201).json({
+
                 success: true,
-                message: savedMessage
+
+                message:
+                    "Account created successfully.",
+
+                token:
+                    session.token,
+
+                expiresAt:
+                    session.expiresAt,
+
+                user: {
+
+                    id:
+                        Number(user.id),
+
+                    name:
+                        user.name,
+
+                    email:
+                        user.email,
+
+                    phone:
+                        user.phone,
+
+                    role:
+                        user.role
+
+                }
+
             });
+
 
         } catch (error) {
 
             console.error(
-                "CHAT: Customer POST message error:",
+                "Customer registration error:",
                 error
             );
 
+
+            if (
+                error.code === "23505"
+            ) {
+
+                return res.status(409).json({
+
+                    success: false,
+
+                    message:
+                        "An account with this email already exists. Please login instead."
+
+                });
+
+            }
+
+
             return res.status(500).json({
+
                 success: false,
-                message: "Unable to send message."
+
+                message:
+                    "Unable to create account. Please try again."
+
             });
+
         }
+
     }
 );
 
-/* =========================================================
-   ADMIN
-   GET ALL CONVERSATIONS
-========================================================= */
 
-router.get(
-    "/conversations",
-    requireAdmin,
+// =========================================================
+// LOGIN
+// POST /api/auth/login
+//
+// IMPORTANT:
+//
+// 1. SQLite is checked FIRST.
+//    This keeps the existing Admin account working.
+//
+// 2. If SQLite user is not found,
+//    Supabase customer database is checked.
+//
+// 3. Session remembers the database source.
+// =========================================================
+
+router.post(
+    "/login",
     async (req, res) => {
 
         try {
 
-            const conversations = [];
+            const email =
+                normalizeEmail(
+                    req.body?.email
+                );
 
-            /* =================================================
-               SQLITE CUSTOMERS
-            ================================================= */
+            const password =
+                String(
+                    req.body?.password || ""
+                );
 
-            const sqliteCustomers = db.prepare(`
-                SELECT
-                    u.id,
-                    u.name,
-                    u.email,
-                    MAX(c.created_at) AS last_message_at,
-                    (
-                        SELECT c2.message
-                        FROM support_chat_messages c2
-                        WHERE
-                            c2.user_id = u.id
-                            AND c2.user_source = 'sqlite'
-                        ORDER BY c2.created_at DESC, c2.id DESC
-                        LIMIT 1
-                    ) AS last_message,
-                    (
-                        SELECT COUNT(*)
-                        FROM support_chat_messages c3
-                        WHERE
-                            c3.user_id = u.id
-                            AND c3.user_source = 'sqlite'
-                            AND c3.sender_type = 'customer'
-                            AND c3.is_read = 0
-                    ) AS unread_count
-                FROM users u
-                LEFT JOIN support_chat_messages c
-                    ON c.user_id = u.id
-                    AND c.user_source = 'sqlite'
-                WHERE
-                    LOWER(COALESCE(u.role, 'customer')) = 'customer'
-                GROUP BY
-                    u.id,
-                    u.name,
-                    u.email
-                HAVING
-                    last_message_at IS NOT NULL
-            `).all();
 
-            for (const customer of sqliteCustomers) {
+            if (!isValidEmail(email)) {
 
-                conversations.push({
-                    id: Number(customer.id),
-                    name: customer.name || "Customer",
-                    email: customer.email || "",
-                    user_source: "sqlite",
-                    last_message: customer.last_message || "",
-                    last_message_at: customer.last_message_at,
-                    unread_count: Number(
-                        customer.unread_count || 0
-                    )
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "Please provide a valid email address."
+
                 });
+
             }
 
-            /* =================================================
-               SUPABASE CUSTOMERS
-            ================================================= */
+            if (!password) {
 
-            if (pgPool) {
+                return res.status(400).json({
 
-                try {
+                    success: false,
 
-                    const result = await pgPool.query(`
+                    message:
+                        "Please enter your password."
+
+                });
+
+            }
+
+
+            let user = null;
+
+            let authSource = null;
+
+
+            // -------------------------------------------------
+            // FIRST: CHECK EXISTING SQLITE USERS
+            //
+            // This is important for the existing Admin account.
+            // -------------------------------------------------
+
+            try {
+
+                user =
+                    db.prepare(
+                        `
                         SELECT
                             id,
                             name,
                             email,
-                            role
+                            phone,
+                            password_hash,
+                            role,
+                            created_at,
+                            updated_at
                         FROM users
-                        WHERE LOWER(COALESCE(role, 'customer')) = 'customer'
-                        ORDER BY id ASC
-                    `);
+                        WHERE LOWER(email) = LOWER(?)
+                        LIMIT 1
+                        `
+                    ).get(email);
 
-                    for (const customer of result.rows) {
 
-                        const userId = Number(customer.id);
+                if (user) {
 
-                        const chatInfo = db.prepare(`
+                    authSource =
+                        "sqlite";
+
+                }
+
+            } catch (error) {
+
+                console.error(
+                    "SQLite login lookup error:",
+                    error
+                );
+
+            }
+
+
+            // -------------------------------------------------
+            // SECOND: CHECK SUPABASE CUSTOMER
+            // -------------------------------------------------
+
+            if (
+                !user &&
+                supabasePool
+            ) {
+
+                try {
+
+                    const result =
+                        await supabasePool.query(
+                            `
                             SELECT
-                                (
-                                    SELECT message
-                                    FROM support_chat_messages
-                                    WHERE
-                                        user_id = ?
-                                        AND user_source = 'supabase'
-                                    ORDER BY created_at DESC, id DESC
-                                    LIMIT 1
-                                ) AS last_message,
-
-                                (
-                                    SELECT created_at
-                                    FROM support_chat_messages
-                                    WHERE
-                                        user_id = ?
-                                        AND user_source = 'supabase'
-                                    ORDER BY created_at DESC, id DESC
-                                    LIMIT 1
-                                ) AS last_message_at,
-
-                                (
-                                    SELECT COUNT(*)
-                                    FROM support_chat_messages
-                                    WHERE
-                                        user_id = ?
-                                        AND user_source = 'supabase'
-                                        AND sender_type = 'customer'
-                                        AND is_read = 0
-                                ) AS unread_count
-                        `).get(
-                            userId,
-                            userId,
-                            userId
+                                id,
+                                name,
+                                email,
+                                phone,
+                                password_hash,
+                                role,
+                                created_at,
+                                updated_at
+                            FROM users
+                            WHERE LOWER(email) = LOWER($1)
+                            LIMIT 1
+                            `,
+                            [email]
                         );
 
-                        /*
-                           Only show Supabase customers who actually
-                           have a chat conversation.
-                        */
 
-                        if (
-                            chatInfo &&
-                            chatInfo.last_message_at
-                        ) {
+                    if (
+                        result.rows.length > 0
+                    ) {
 
-                            conversations.push({
-                                id: userId,
-                                name: customer.name || "Customer",
-                                email: customer.email || "",
-                                user_source: "supabase",
-                                last_message:
-                                    chatInfo.last_message || "",
-                                last_message_at:
-                                    chatInfo.last_message_at,
-                                unread_count:
-                                    Number(
-                                        chatInfo.unread_count || 0
-                                    )
-                            });
-                        }
+                        user =
+                            result.rows[0];
+
+                        authSource =
+                            "supabase";
+
                     }
 
                 } catch (error) {
 
                     console.error(
-                        "CHAT: Supabase conversations error:",
-                        error.message
+                        "Supabase login lookup error:",
+                        error
                     );
+
                 }
+
             }
 
-            /* =================================================
-               SORT BY LATEST MESSAGE
-            ================================================= */
 
-            conversations.sort(
-                (a, b) => {
+            // -------------------------------------------------
+            // USER NOT FOUND
+            // -------------------------------------------------
 
-                    const timeA = a.last_message_at
-                        ? new Date(a.last_message_at).getTime()
-                        : 0;
+            if (!user) {
 
-                    const timeB = b.last_message_at
-                        ? new Date(b.last_message_at).getTime()
-                        : 0;
+                return res.status(401).json({
 
-                    return timeB - timeA;
-                }
-            );
-
-            return res.json({
-                success: true,
-                conversations
-            });
-
-        } catch (error) {
-
-            console.error(
-                "CHAT: Admin conversations error:",
-                error
-            );
-
-            return res.status(500).json({
-                success: false,
-                message: "Unable to load conversations."
-            });
-        }
-    }
-);
-
-/* =========================================================
-   ADMIN
-   GET ONE CONVERSATION
-========================================================= */
-
-router.get(
-    "/conversations/:userId",
-    requireAdmin,
-    async (req, res) => {
-
-        try {
-
-            const userId = Number(
-                req.params.userId
-            );
-
-            const source = getRequestedSource(req);
-
-            if (
-                !Number.isInteger(userId) ||
-                !source
-            ) {
-
-                return res.status(400).json({
                     success: false,
-                    message: "Invalid customer information."
+
+                    message:
+                        "Invalid email or password."
+
                 });
+
             }
 
-            const customer =
-                await getCustomerBySource(
-                    userId,
-                    source
+
+            // -------------------------------------------------
+            // PASSWORD CHECK
+            // -------------------------------------------------
+
+            const passwordMatches =
+                await bcrypt.compare(
+                    password,
+                    user.password_hash
                 );
 
-            if (!customer) {
 
-                return res.status(404).json({
+            if (!passwordMatches) {
+
+                return res.status(401).json({
+
                     success: false,
-                    message: "Customer not found."
+
+                    message:
+                        "Invalid email or password."
+
                 });
+
             }
 
-            const messages = db.prepare(`
-                SELECT
-                    id,
-                    user_id,
-                    user_source,
-                    sender_type,
-                    message,
-                    is_read,
-                    created_at
-                FROM support_chat_messages
-                WHERE
-                    user_id = ?
-                    AND user_source = ?
-                ORDER BY created_at ASC, id ASC
-            `).all(
-                userId,
-                source
+
+            // -------------------------------------------------
+            // CREATE SESSION
+            //
+            // IMPORTANT FIX:
+            // Save whether this user came from SQLite
+            // or Supabase.
+            // -------------------------------------------------
+
+            const session =
+                createSession(
+                    user,
+                    authSource
+                );
+
+
+            console.log(
+                `User logged in: ${user.email} ` +
+                `(${authSource})`
             );
 
+
             return res.json({
+
                 success: true,
-                customer,
-                messages
+
+                message:
+                    "Login successful.",
+
+                token:
+                    session.token,
+
+                expiresAt:
+                    session.expiresAt,
+
+                user: {
+
+                    id:
+                        Number(user.id),
+
+                    name:
+                        user.name,
+
+                    email:
+                        user.email,
+
+                    phone:
+                        user.phone,
+
+                    role:
+                        user.role
+
+                }
+
             });
+
 
         } catch (error) {
 
             console.error(
-                "CHAT: Admin conversation error:",
+                "Login error:",
                 error
             );
 
+
             return res.status(500).json({
+
                 success: false,
-                message: "Unable to load conversation."
+
+                message:
+                    "Unable to login. Please try again."
+
             });
+
         }
+
     }
 );
 
-/* =========================================================
-   ADMIN
-   REPLY TO CUSTOMER
-========================================================= */
+
+// =========================================================
+// LOGOUT
+// POST /api/auth/logout
+// =========================================================
 
 router.post(
-    "/conversations/:userId/reply",
+    "/logout",
+    requireAuth,
+    (req, res) => {
+
+        try {
+
+            const token =
+                getTokenFromRequest(req);
+
+            if (token) {
+
+                sessions.delete(token);
+
+            }
+
+            return res.json({
+
+                success: true,
+
+                message:
+                    "Logged out successfully."
+
+            });
+
+        } catch (error) {
+
+            console.error(
+                "Logout error:",
+                error
+            );
+
+            return res.status(500).json({
+
+                success: false,
+
+                message:
+                    "Unable to logout."
+
+            });
+
+        }
+
+    }
+);
+
+
+// =========================================================
+// CURRENT USER
+// GET /api/auth/me
+// =========================================================
+
+router.get(
+    "/me",
+    requireAuth,
+    (req, res) => {
+
+        return res.json({
+
+            success: true,
+
+            user: {
+
+                id:
+                    Number(req.user.id),
+
+                name:
+                    req.user.name,
+
+                email:
+                    req.user.email,
+
+                phone:
+                    req.user.phone,
+
+                role:
+                    req.user.role
+
+            }
+
+        });
+
+    }
+);
+
+
+// =========================================================
+// ADMIN CHECK
+// GET /api/auth/admin-check
+// =========================================================
+
+router.get(
+    "/admin-check",
+    requireAdmin,
+    (req, res) => {
+
+        return res.json({
+
+            success: true,
+
+            message:
+                "Administrator access verified.",
+
+            user: {
+
+                id:
+                    Number(req.user.id),
+
+                name:
+                    req.user.name,
+
+                email:
+                    req.user.email,
+
+                role:
+                    req.user.role
+
+            }
+
+        });
+
+    }
+);
+
+
+// =========================================================
+// CREATE USER
+// POST /api/auth/create-user
+//
+// ADMIN ONLY
+//
+// New users are created in Supabase.
+// =========================================================
+
+router.post(
+    "/create-user",
     requireAdmin,
     async (req, res) => {
 
         try {
 
-            const userId = Number(
-                req.params.userId
-            );
+            if (!supabasePool) {
 
-            const source = getRequestedSource(req);
+                return res.status(500).json({
+
+                    success: false,
+
+                    message:
+                        "Customer database is not configured."
+
+                });
+
+            }
+
+
+            const name =
+                cleanText(req.body?.name);
+
+            const email =
+                normalizeEmail(
+                    req.body?.email
+                );
+
+            const phone =
+                cleanText(
+                    req.body?.phone
+                );
+
+            const password =
+                String(
+                    req.body?.password || ""
+                );
+
+            const role =
+                cleanText(
+                    req.body?.role
+                ) || "customer";
+
 
             if (
-                !Number.isInteger(userId) ||
-                !source
+                !name ||
+                !isValidEmail(email)
             ) {
 
                 return res.status(400).json({
+
                     success: false,
-                    message: "Invalid customer information."
+
+                    message:
+                        "Valid name and email are required."
+
                 });
+
             }
 
-            const message = String(
-                req.body.message || ""
-            ).trim();
-
-            if (!message) {
+            if (!isStrongPassword(password)) {
 
                 return res.status(400).json({
+
                     success: false,
-                    message: "Reply message is required."
+
+                    message:
+                        "Password must be at least 6 characters."
+
                 });
+
             }
 
-            if (message.length > 5000) {
+            if (
+                !["customer", "admin"].includes(
+                    role
+                )
+            ) {
 
                 return res.status(400).json({
+
                     success: false,
-                    message: "Message is too long."
+
+                    message:
+                        "Invalid user role."
+
                 });
+
             }
 
-            const customer =
-                await getCustomerBySource(
-                    userId,
-                    source
+
+            const passwordHash =
+                await bcrypt.hash(
+                    password,
+                    12
                 );
 
-            if (!customer) {
 
-                return res.status(404).json({
-                    success: false,
-                    message: "Customer not found."
-                });
-            }
+            const result =
+                await supabasePool.query(
+                    `
+                    INSERT INTO users (
+                        name,
+                        email,
+                        phone,
+                        password_hash,
+                        role
+                    )
+                    VALUES (
+                        $1,
+                        $2,
+                        $3,
+                        $4,
+                        $5
+                    )
+                    RETURNING
+                        id,
+                        name,
+                        email,
+                        phone,
+                        role,
+                        created_at
+                    `,
+                    [
+                        name,
+                        email,
+                        phone || null,
+                        passwordHash,
+                        role
+                    ]
+                );
 
-            /* -------------------------------------------------
-               SAVE ADMIN REPLY
-            ------------------------------------------------- */
 
-            const result = db.prepare(`
-                INSERT INTO support_chat_messages (
-                    user_id,
-                    user_source,
-                    sender_type,
-                    message,
-                    is_read,
-                    created_at
-                )
-                VALUES (
-                    ?,
-                    ?,
-                    'admin',
-                    ?,
-                    0,
-                    CURRENT_TIMESTAMP
-                )
-            `).run(
-                userId,
-                source,
-                message
-            );
+            return res.status(201).json({
 
-            const savedMessage = db.prepare(`
-                SELECT
-                    id,
-                    user_id,
-                    user_source,
-                    sender_type,
-                    message,
-                    is_read,
-                    created_at
-                FROM support_chat_messages
-                WHERE id = ?
-                LIMIT 1
-            `).get(result.lastInsertRowid);
+                success: true,
 
-            /* -------------------------------------------------
-               EMAIL CUSTOMER
-            ------------------------------------------------- */
+                message:
+                    "User created successfully.",
 
-            try {
+                user: {
 
-                if (
-                    customer.email &&
-                    typeof require === "function"
-                ) {
+                    id:
+                        Number(result.rows[0].id),
 
-                    /*
-                       Keep email behavior compatible with
-                       existing project setup.
+                    name:
+                        result.rows[0].name,
 
-                       If your existing project exposes an email
-                       helper, this block can be connected there.
-                    */
+                    email:
+                        result.rows[0].email,
 
-                    console.log(
-                        `CHAT: Admin reply saved for ${customer.email}`
-                    );
+                    phone:
+                        result.rows[0].phone,
+
+                    role:
+                        result.rows[0].role
+
                 }
 
-            } catch (emailError) {
-
-                console.error(
-                    "CHAT: Email notification error:",
-                    emailError.message
-                );
-            }
-
-            return res.json({
-                success: true,
-                message: savedMessage
             });
+
 
         } catch (error) {
 
             console.error(
-                "CHAT: Admin reply error:",
+                "Create user error:",
                 error
             );
 
+
+            if (
+                error.code === "23505"
+            ) {
+
+                return res.status(409).json({
+
+                    success: false,
+
+                    message:
+                        "An account with this email already exists."
+
+                });
+
+            }
+
+
             return res.status(500).json({
+
                 success: false,
-                message: "Unable to send admin reply."
+
+                message:
+                    "Unable to create user."
+
             });
+
         }
+
     }
 );
 
-/* =========================================================
-   ADMIN
-   MARK CONVERSATION READ
-========================================================= */
 
-router.patch(
-    "/conversations/:userId/read",
-    requireAdmin,
+// =========================================================
+// FORGOT PASSWORD
+// POST /api/auth/forgot-password
+// =========================================================
+
+router.post(
+    "/forgot-password",
     async (req, res) => {
 
         try {
 
-            const userId = Number(
-                req.params.userId
+            if (!supabasePool) {
+
+                return res.status(500).json({
+
+                    success: false,
+
+                    message:
+                        "Customer database is not configured."
+
+                });
+
+            }
+
+
+            const email =
+                normalizeEmail(
+                    req.body?.email
+                );
+
+
+            if (!isValidEmail(email)) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "Please provide a valid email address."
+
+                });
+
+            }
+
+
+            const result =
+                await supabasePool.query(
+                    `
+                    SELECT
+                        id,
+                        name,
+                        email
+                    FROM users
+                    WHERE LOWER(email) = LOWER($1)
+                    LIMIT 1
+                    `,
+                    [email]
+                );
+
+
+            // Do not reveal whether an email exists.
+            if (
+                result.rows.length === 0
+            ) {
+
+                return res.json({
+
+                    success: true,
+
+                    message:
+                        "If an account exists, a password reset email will be sent."
+
+                });
+
+            }
+
+
+            const user =
+                result.rows[0];
+
+
+            // -------------------------------------------------
+            // CREATE RESET TOKEN
+            // -------------------------------------------------
+
+            const rawToken =
+                crypto
+                    .randomBytes(32)
+                    .toString("hex");
+
+            const tokenHash =
+                crypto
+                    .createHash("sha256")
+                    .update(rawToken)
+                    .digest("hex");
+
+            const expiresAt =
+                new Date(
+                    Date.now() +
+                    RESET_TOKEN_DURATION_MS
+                );
+
+
+            // -------------------------------------------------
+            // CREATE RESET TABLE IF REQUIRED
+            // -------------------------------------------------
+
+            await supabasePool.query(
+                `
+                CREATE TABLE IF NOT EXISTS password_resets (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                `
             );
 
-            const source = getRequestedSource(req);
+
+            await supabasePool.query(
+                `
+                DELETE FROM password_resets
+                WHERE user_id = $1
+                `,
+                [user.id]
+            );
+
+
+            await supabasePool.query(
+                `
+                INSERT INTO password_resets (
+                    user_id,
+                    token_hash,
+                    expires_at
+                )
+                VALUES (
+                    $1,
+                    $2,
+                    $3
+                )
+                `,
+                [
+                    user.id,
+                    tokenHash,
+                    expiresAt
+                ]
+            );
+
+
+           // -------------------------------------------------
+// SEND EMAIL TO CUSTOMER
+// -------------------------------------------------
+
+try {
+
+    const smtpHost =
+        process.env.SMTP_HOST;
+
+    const smtpPort =
+        Number(
+            process.env.SMTP_PORT || 587
+        );
+
+    const smtpUser =
+        process.env.SMTP_USER;
+
+    const smtpPass =
+        process.env.SMTP_PASS;
+
+    const smtpSecure =
+        String(
+            process.env.SMTP_SECURE || "false"
+        ).toLowerCase() === "true";
+
+    const mailFrom =
+        process.env.MAIL_FROM ||
+        smtpUser;
+
+
+    if (
+        customer.email &&
+        smtpHost &&
+        smtpUser &&
+        smtpPass
+    ) {
+
+        const transporter =
+            nodemailer.createTransport({
+
+                host:
+                    smtpHost,
+
+                port:
+                    smtpPort,
+
+                secure:
+                    smtpSecure,
+
+                auth: {
+
+                    user:
+                        smtpUser,
+
+                    pass:
+                        smtpPass
+
+                }
+
+            });
+
+
+        await transporter.sendMail({
+
+            from:
+                mailFrom,
+
+            to:
+                customer.email,
+
+            subject:
+                "U.S TRAVEL & TOURS - New Live Chat Reply",
+
+            text:
+                `Hello ${customer.name || "Customer"},\n\n` +
+                `You have received a new reply from U.S TRAVEL & TOURS support.\n\n` +
+                `Message:\n\n${message}\n\n` +
+                `Please login to your account to continue the conversation.\n\n` +
+                `U.S TRAVEL & TOURS`
+
+        });
+
+
+        console.log(
+            `CHAT: Email notification sent successfully to ${customer.email}`
+        );
+
+    } else {
+
+        console.warn(
+            "CHAT: Email notification skipped because SMTP configuration or customer email is missing."
+        );
+
+    }
+
+} catch (emailError) {
+
+    console.error(
+        "CHAT: Email notification error:",
+        emailError
+    );
+
+}
+
+
+// =========================================================
+// RESET PASSWORD
+// POST /api/auth/reset-password
+// =========================================================
+
+router.post(
+    "/reset-password",
+    async (req, res) => {
+
+        try {
+
+            if (!supabasePool) {
+
+                return res.status(500).json({
+
+                    success: false,
+
+                    message:
+                        "Customer database is not configured."
+
+                });
+
+            }
+
+
+            const token =
+                cleanText(
+                    req.body?.token
+                );
+
+            const newPassword =
+                String(
+                    req.body?.password || ""
+                );
+
+
+            if (!token) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "Reset token is required."
+
+                });
+
+            }
 
             if (
-                !Number.isInteger(userId) ||
-                !source
+                !isStrongPassword(
+                    newPassword
+                )
             ) {
 
                 return res.status(400).json({
+
                     success: false,
-                    message: "Invalid customer information."
+
+                    message:
+                        "Password must be at least 6 characters."
+
                 });
+
             }
 
-            db.prepare(`
-                UPDATE support_chat_messages
-                SET is_read = 1
-                WHERE
-                    user_id = ?
-                    AND user_source = ?
-                    AND sender_type = 'customer'
-            `).run(
-                userId,
-                source
+
+            const tokenHash =
+                crypto
+                    .createHash("sha256")
+                    .update(token)
+                    .digest("hex");
+
+
+            const resetResult =
+                await supabasePool.query(
+                    `
+                    SELECT
+                        id,
+                        user_id,
+                        expires_at
+                    FROM password_resets
+                    WHERE token_hash = $1
+                    LIMIT 1
+                    `,
+                    [tokenHash]
+                );
+
+
+            if (
+                resetResult.rows.length === 0
+            ) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "Invalid or expired reset token."
+
+                });
+
+            }
+
+
+            const reset =
+                resetResult.rows[0];
+
+
+            if (
+                new Date(reset.expires_at).getTime()
+                <= Date.now()
+            ) {
+
+                await supabasePool.query(
+                    `
+                    DELETE FROM password_resets
+                    WHERE id = $1
+                    `,
+                    [reset.id]
+                );
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "Invalid or expired reset token."
+
+                });
+
+            }
+
+
+            const passwordHash =
+                await bcrypt.hash(
+                    newPassword,
+                    12
+                );
+
+
+            await supabasePool.query(
+                `
+                UPDATE users
+                SET
+                    password_hash = $1,
+                    updated_at = NOW()
+                WHERE id = $2
+                `,
+                [
+                    passwordHash,
+                    reset.user_id
+                ]
             );
 
+
+            await supabasePool.query(
+                `
+                DELETE FROM password_resets
+                WHERE user_id = $1
+                `,
+                [reset.user_id]
+            );
+
+
+            // Invalidate current temporary sessions
+            for (
+                const [
+                    sessionToken,
+                    session
+                ] of sessions.entries()
+            ) {
+
+                if (
+                    session.source === "supabase" &&
+                    Number(session.userId) ===
+                    Number(reset.user_id)
+                ) {
+
+                    sessions.delete(
+                        sessionToken
+                    );
+
+                }
+
+            }
+
+
             return res.json({
-                success: true
+
+                success: true,
+
+                message:
+                    "Password reset successfully. Please login again."
+
             });
+
 
         } catch (error) {
 
             console.error(
-                "CHAT: Mark read error:",
+                "Reset password error:",
                 error
             );
 
+
             return res.status(500).json({
+
                 success: false,
-                message: "Unable to mark messages as read."
+
+                message:
+                    "Unable to reset password."
+
             });
+
         }
+
     }
 );
 
-/* =========================================================
-   EXPORT
-========================================================= */
+
+// =========================================================
+// CHANGE PASSWORD
+// POST /api/auth/change-password
+// =========================================================
+
+router.post(
+    "/change-password",
+    requireAuth,
+    async (req, res) => {
+
+        try {
+
+            const currentPassword =
+                String(
+                    req.body?.currentPassword || ""
+                );
+
+            const newPassword =
+                String(
+                    req.body?.newPassword || ""
+                );
+
+
+            if (!currentPassword) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "Current password is required."
+
+                });
+
+            }
+
+            if (
+                !isStrongPassword(
+                    newPassword
+                )
+            ) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "New password must be at least 6 characters."
+
+                });
+
+            }
+
+
+            const passwordMatches =
+                await bcrypt.compare(
+                    currentPassword,
+                    req.user.password_hash
+                );
+
+
+            if (!passwordMatches) {
+
+                return res.status(401).json({
+
+                    success: false,
+
+                    message:
+                        "Current password is incorrect."
+
+                });
+
+            }
+
+
+            const passwordHash =
+                await bcrypt.hash(
+                    newPassword,
+                    12
+                );
+
+
+            // -------------------------------------------------
+            // GET SOURCE FROM CURRENT SESSION
+            // -------------------------------------------------
+
+            const token =
+                getTokenFromRequest(req);
+
+            const session =
+                getSession(token);
+
+
+            // -------------------------------------------------
+            // SUPABASE CUSTOMER
+            // -------------------------------------------------
+
+            if (
+                session &&
+                session.source === "supabase" &&
+                supabasePool
+            ) {
+
+                const result =
+                    await supabasePool.query(
+                        `
+                        UPDATE users
+                        SET
+                            password_hash = $1,
+                            updated_at = NOW()
+                        WHERE id = $2
+                        RETURNING id
+                        `,
+                        [
+                            passwordHash,
+                            req.user.id
+                        ]
+                    );
+
+
+                if (
+                    result.rows.length > 0
+                ) {
+
+                    for (
+                        const [
+                            sessionToken,
+                            storedSession
+                        ] of sessions.entries()
+                    ) {
+
+                        if (
+                            storedSession.source === "supabase" &&
+                            Number(storedSession.userId) ===
+                            Number(req.user.id)
+                        ) {
+
+                            sessions.delete(
+                                sessionToken
+                            );
+
+                        }
+
+                    }
+
+
+                    return res.json({
+
+                        success: true,
+
+                        message:
+                            "Password changed successfully. Please login again."
+
+                    });
+
+                }
+
+            }
+
+
+            // -------------------------------------------------
+            // EXISTING SQLITE USER / ADMIN
+            // -------------------------------------------------
+
+            const result =
+                db.prepare(
+                    `
+                    UPDATE users
+                    SET
+                        password_hash = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    `
+                ).run(
+                    passwordHash,
+                    req.user.id
+                );
+
+
+            if (
+                result.changes === 0
+            ) {
+
+                return res.status(404).json({
+
+                    success: false,
+
+                    message:
+                        "User not found."
+
+                });
+
+            }
+
+
+            for (
+                const [
+                    sessionToken,
+                    storedSession
+                ] of sessions.entries()
+            ) {
+
+                if (
+                    storedSession.source === "sqlite" &&
+                    Number(storedSession.userId) ===
+                    Number(req.user.id)
+                ) {
+
+                    sessions.delete(
+                        sessionToken
+                    );
+
+                }
+
+            }
+
+
+            return res.json({
+
+                success: true,
+
+                message:
+                    "Password changed successfully. Please login again."
+
+            });
+
+
+        } catch (error) {
+
+            console.error(
+                "Change password error:",
+                error
+            );
+
+
+            return res.status(500).json({
+
+                success: false,
+
+                message:
+                    "Unable to change password."
+
+            });
+
+        }
+
+    }
+);
+
+
+// =========================================================
+// CLEAN EXPIRED SESSIONS
+// =========================================================
+
+setInterval(
+    () => {
+
+        const now =
+            Date.now();
+
+        for (
+            const [
+                token,
+                session
+            ] of sessions.entries()
+        ) {
+
+            if (
+                now >=
+                session.expiresAt
+            ) {
+
+                sessions.delete(token);
+
+            }
+
+        }
+
+    },
+    60 * 60 * 1000
+);
+
+
+// =========================================================
+// SUPABASE CONNECTION TEST
+// =========================================================
+
+if (supabasePool) {
+
+    checkSupabaseDatabase()
+        .then(() => {
+
+            console.log(
+                "Supabase PostgreSQL connection successful."
+            );
+
+        })
+        .catch((error) => {
+
+            console.error(
+                "Supabase PostgreSQL connection failed:",
+                error.message
+            );
+
+        });
+
+}
+
+
+// =========================================================
+// EXPORT
+// =========================================================
 
 module.exports = router;
+
+module.exports.requireAuth =
+    requireAuth;
+
+module.exports.requireAdmin =
+    requireAdmin;
