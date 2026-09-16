@@ -24,16 +24,27 @@ try {
     db.exec(`
         CREATE TABLE IF NOT EXISTS support_chat_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+
             user_id INTEGER NOT NULL,
+
+            user_source TEXT NOT NULL DEFAULT 'sqlite'
+                CHECK(user_source IN ('sqlite', 'supabase')),
+
             sender_type TEXT NOT NULL
                 CHECK(sender_type IN ('customer', 'admin')),
+
             message TEXT NOT NULL,
+
             is_read INTEGER NOT NULL DEFAULT 0,
+
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
         CREATE INDEX IF NOT EXISTS idx_support_chat_user_id
         ON support_chat_messages(user_id);
+
+        CREATE INDEX IF NOT EXISTS idx_support_chat_user_source
+        ON support_chat_messages(user_id, user_source);
 
         CREATE INDEX IF NOT EXISTS idx_support_chat_created_at
         ON support_chat_messages(created_at);
@@ -41,10 +52,40 @@ try {
         CREATE INDEX IF NOT EXISTS idx_support_chat_unread
         ON support_chat_messages(
             user_id,
+            user_source,
             sender_type,
             is_read
         );
     `);
+
+    // ---------------------------------------------------------
+    // Existing installations:
+    // Add user_source if old table already exists.
+    // ---------------------------------------------------------
+
+    const columns = db
+        .prepare(`PRAGMA table_info(${CHAT_TABLE})`)
+        .all();
+
+    const hasUserSource = columns.some(
+        column => column.name === "user_source"
+    );
+
+    if (!hasUserSource) {
+
+        console.log(
+            "CHAT DATABASE: Adding user_source column..."
+        );
+
+        db.exec(`
+            ALTER TABLE support_chat_messages
+            ADD COLUMN user_source TEXT NOT NULL DEFAULT 'sqlite';
+        `);
+
+        console.log(
+            "CHAT DATABASE: user_source column added."
+        );
+    }
 
     console.log(
         "CHAT DATABASE: support chat table ready."
@@ -114,6 +155,7 @@ function cleanMessage(value) {
     if (
         typeof value !== "string"
     ) {
+
         return "";
     }
 
@@ -122,6 +164,10 @@ function cleanMessage(value) {
         .trim();
 }
 
+// ---------------------------------------------------------
+// Get authenticated numeric user ID
+// ---------------------------------------------------------
+
 function getUserId(req) {
 
     if (
@@ -129,6 +175,7 @@ function getUserId(req) {
         req.user.id === undefined ||
         req.user.id === null
     ) {
+
         return null;
     }
 
@@ -139,13 +186,93 @@ function getUserId(req) {
         !Number.isInteger(userId) ||
         userId <= 0
     ) {
+
         return null;
     }
 
     return userId;
 }
 
-function getCustomerById(userId) {
+// ---------------------------------------------------------
+// Determine whether authenticated user is SQLite
+// or Supabase.
+//
+// We intentionally compare email + role so that
+// SQLite/Supabase numeric ID collisions do not matter.
+// ---------------------------------------------------------
+
+function getAuthenticatedUserSource(req) {
+
+    if (!req.user) {
+        return null;
+    }
+
+    const userId =
+        Number(req.user.id);
+
+    const email =
+        String(req.user.email || "")
+            .trim()
+            .toLowerCase();
+
+    // ---------------------------------------------------------
+    // Check exact SQLite user
+    // ---------------------------------------------------------
+
+    if (
+        Number.isInteger(userId) &&
+        userId > 0
+    ) {
+
+        const sqliteUser =
+            db.prepare(`
+                SELECT
+                    id,
+                    name,
+                    email,
+                    role
+                FROM users
+                WHERE id = ?
+                LIMIT 1
+            `).get(userId);
+
+        if (
+            sqliteUser &&
+            String(sqliteUser.email || "")
+                .trim()
+                .toLowerCase() === email &&
+            sqliteUser.role === req.user.role
+        ) {
+
+            return "sqlite";
+        }
+    }
+
+    // ---------------------------------------------------------
+    // New customers are stored in Supabase.
+    // If exact SQLite identity was not found,
+    // authenticated customer is treated as Supabase.
+    // ---------------------------------------------------------
+
+    if (req.user.role === "customer") {
+
+        return "supabase";
+    }
+
+    // Existing admin is SQLite.
+    if (req.user.role === "admin") {
+
+        return "sqlite";
+    }
+
+    return null;
+}
+
+// ---------------------------------------------------------
+// Get customer from SQLite
+// ---------------------------------------------------------
+
+function getSQLiteCustomerById(userId) {
 
     return db.prepare(`
         SELECT
@@ -159,6 +286,129 @@ function getCustomerById(userId) {
     `).get(userId);
 }
 
+// ---------------------------------------------------------
+// Get customer from Supabase
+// ---------------------------------------------------------
+
+let supabasePool = null;
+
+try {
+
+    if (process.env.DATABASE_URL) {
+
+        const { Pool } = require("pg");
+
+        supabasePool = new Pool({
+            connectionString:
+                process.env.DATABASE_URL,
+
+            ssl: {
+                rejectUnauthorized: false
+            },
+
+            max: 3,
+
+            idleTimeoutMillis: 30000,
+
+            connectionTimeoutMillis: 10000
+        });
+
+    }
+
+} catch (error) {
+
+    console.error(
+        "CHAT SUPABASE INIT ERROR:",
+        error
+    );
+
+}
+
+// ---------------------------------------------------------
+// Get Supabase customer
+// ---------------------------------------------------------
+
+async function getSupabaseCustomerById(userId) {
+
+    if (!supabasePool) {
+
+        return null;
+    }
+
+    try {
+
+        const result =
+            await supabasePool.query(`
+                SELECT
+                    id,
+                    name,
+                    email,
+                    role
+                FROM users
+                WHERE id = $1
+                LIMIT 1
+            `, [userId]);
+
+        return result.rows[0] || null;
+
+    } catch (error) {
+
+        console.error(
+            "CHAT SUPABASE CUSTOMER ERROR:",
+            error
+        );
+
+        return null;
+    }
+}
+
+// ---------------------------------------------------------
+// Get customer based on source
+// ---------------------------------------------------------
+
+async function getCustomerBySource(
+    userId,
+    source
+) {
+
+    if (source === "supabase") {
+
+        const customer =
+            await getSupabaseCustomerById(
+                userId
+            );
+
+        if (
+            customer &&
+            customer.role === "customer"
+        ) {
+
+            return customer;
+        }
+
+        return null;
+    }
+
+    const customer =
+        getSQLiteCustomerById(
+            userId
+        );
+
+    if (
+        customer &&
+        customer.role === "customer"
+    ) {
+
+        return customer;
+    }
+
+    return null;
+}
+
+// ---------------------------------------------------------
+// Escape HTML
+// ---------------------------------------------------------
+
 function escapeHtml(value) {
 
     return String(value ?? "")
@@ -167,6 +417,28 @@ function escapeHtml(value) {
         .replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;")
         .replace(/'/g, "&#039;");
+}
+
+// ---------------------------------------------------------
+// Validate source
+// ---------------------------------------------------------
+
+function normalizeSource(value) {
+
+    const source =
+        String(value || "")
+            .trim()
+            .toLowerCase();
+
+    if (
+        source === "supabase" ||
+        source === "sqlite"
+    ) {
+
+        return source;
+    }
+
+    return null;
 }
 
 // =========================================================
@@ -204,33 +476,60 @@ router.get(
                 });
             }
 
+            const source =
+                getAuthenticatedUserSource(req);
+
+            if (!source) {
+
+                return res.status(401).json({
+                    success: false,
+                    message:
+                        "Unable to identify customer account."
+                });
+            }
+
             const messages =
                 db.prepare(`
                     SELECT
                         id,
                         user_id,
+                        user_source,
                         sender_type,
                         message,
                         is_read,
                         created_at
                     FROM support_chat_messages
-                    WHERE user_id = ?
+                    WHERE
+                        user_id = ?
+                        AND user_source = ?
                     ORDER BY id ASC
-                `).all(userId);
+                `).all(
+                    userId,
+                    source
+                );
 
-            // Admin replies become read when
-            // customer opens the chat.
+            // -------------------------------------------------
+            // Admin replies become read when customer opens chat
+            // -------------------------------------------------
+
             db.prepare(`
                 UPDATE support_chat_messages
                 SET is_read = 1
                 WHERE
                     user_id = ?
+                    AND user_source = ?
                     AND sender_type = 'admin'
-            `).run(userId);
+            `).run(
+                userId,
+                source
+            );
 
             return res.json({
+
                 success: true,
+
                 messages
+
             });
 
         } catch (error) {
@@ -284,6 +583,18 @@ router.post(
                 });
             }
 
+            const source =
+                getAuthenticatedUserSource(req);
+
+            if (!source) {
+
+                return res.status(401).json({
+                    success: false,
+                    message:
+                        "Unable to identify customer account."
+                });
+            }
+
             const message =
                 cleanMessage(
                     req.body?.message
@@ -312,14 +623,16 @@ router.post(
                     INSERT INTO support_chat_messages
                     (
                         user_id,
+                        user_source,
                         sender_type,
                         message,
                         is_read
                     )
                     VALUES
-                    (?, 'customer', ?, 0)
+                    (?, ?, 'customer', ?, 0)
                 `).run(
                     userId,
+                    source,
                     message
                 );
 
@@ -328,6 +641,7 @@ router.post(
                     SELECT
                         id,
                         user_id,
+                        user_source,
                         sender_type,
                         message,
                         is_read,
@@ -340,7 +654,7 @@ router.post(
                 );
 
             console.log(
-                `CHAT: Customer ${userId} sent message #${result.lastInsertRowid}`
+                `CHAT: Customer ${userId} (${source}) sent message #${result.lastInsertRowid}`
             );
 
             return res.status(201).json({
@@ -377,21 +691,28 @@ router.post(
 router.get(
     "/conversations",
     requireAdmin,
-    (req, res) => {
+    async (req, res) => {
 
         try {
 
-            const rows =
+            // -------------------------------------------------
+            // SQLite customers
+            // -------------------------------------------------
+
+            const sqliteCustomers =
                 db.prepare(`
                     SELECT
                         u.id AS user_id,
+                        'sqlite' AS user_source,
                         u.name,
                         u.email,
 
                         (
                             SELECT cm.message
                             FROM support_chat_messages cm
-                            WHERE cm.user_id = u.id
+                            WHERE
+                                cm.user_id = u.id
+                                AND cm.user_source = 'sqlite'
                             ORDER BY cm.id DESC
                             LIMIT 1
                         ) AS last_message,
@@ -399,7 +720,9 @@ router.get(
                         (
                             SELECT cm.created_at
                             FROM support_chat_messages cm
-                            WHERE cm.user_id = u.id
+                            WHERE
+                                cm.user_id = u.id
+                                AND cm.user_source = 'sqlite'
                             ORDER BY cm.id DESC
                             LIMIT 1
                         ) AS last_message_at,
@@ -409,6 +732,7 @@ router.get(
                             FROM support_chat_messages cm
                             WHERE
                                 cm.user_id = u.id
+                                AND cm.user_source = 'sqlite'
                                 AND cm.sender_type = 'customer'
                                 AND cm.is_read = 0
                         ) AS unread_count
@@ -420,16 +744,124 @@ router.get(
                         AND EXISTS (
                             SELECT 1
                             FROM support_chat_messages cm2
-                            WHERE cm2.user_id = u.id
+                            WHERE
+                                cm2.user_id = u.id
+                                AND cm2.user_source = 'sqlite'
                         )
-
-                    ORDER BY
-                        last_message_at DESC
                 `).all();
 
+            // -------------------------------------------------
+            // Supabase customers
+            // -------------------------------------------------
+
+            let supabaseCustomers = [];
+
+            if (supabasePool) {
+
+                try {
+
+                    const result =
+                        await supabasePool.query(`
+                            SELECT
+                                u.id AS user_id,
+                                'supabase' AS user_source,
+                                u.name,
+                                u.email,
+
+                                (
+                                    SELECT cm.message
+                                    FROM support_chat_messages cm
+                                    WHERE
+                                        cm.user_id = u.id
+                                        AND cm.user_source = 'supabase'
+                                    ORDER BY cm.id DESC
+                                    LIMIT 1
+                                ) AS last_message,
+
+                                (
+                                    SELECT cm.created_at
+                                    FROM support_chat_messages cm
+                                    WHERE
+                                        cm.user_id = u.id
+                                        AND cm.user_source = 'supabase'
+                                    ORDER BY cm.id DESC
+                                    LIMIT 1
+                                ) AS last_message_at,
+
+                                (
+                                    SELECT COUNT(*)
+                                    FROM support_chat_messages cm
+                                    WHERE
+                                        cm.user_id = u.id
+                                        AND cm.user_source = 'supabase'
+                                        AND cm.sender_type = 'customer'
+                                        AND cm.is_read = 0
+                                ) AS unread_count
+
+                            FROM users u
+
+                            WHERE
+                                u.role = 'customer'
+
+                                AND EXISTS (
+                                    SELECT 1
+                                    FROM support_chat_messages cm2
+                                    WHERE
+                                        cm2.user_id = u.id
+                                        AND cm2.user_source = 'supabase'
+                                )
+                        `);
+
+                    supabaseCustomers =
+                        result.rows || [];
+
+                } catch (error) {
+
+                    console.error(
+                        "CHAT SUPABASE CONVERSATIONS ERROR:",
+                        error
+                    );
+
+                }
+            }
+
+            const conversations = [
+                ...sqliteCustomers,
+                ...supabaseCustomers
+            ];
+
+            conversations.sort(
+                function (a, b) {
+
+                    const dateA =
+                        a.last_message_at
+                            ? new Date(
+                                String(
+                                    a.last_message_at
+                                ).replace(" ", "T") + "Z"
+                            ).getTime()
+                            : 0;
+
+                    const dateB =
+                        b.last_message_at
+                            ? new Date(
+                                String(
+                                    b.last_message_at
+                                ).replace(" ", "T") + "Z"
+                            ).getTime()
+                            : 0;
+
+                    return dateB - dateA;
+
+                }
+            );
+
             return res.json({
+
                 success: true,
-                conversations: rows
+
+                conversations
+
             });
 
         } catch (error) {
@@ -455,7 +887,7 @@ router.get(
 router.get(
     "/conversations/:userId",
     requireAdmin,
-    (req, res) => {
+    async (req, res) => {
 
         try {
 
@@ -476,13 +908,27 @@ router.get(
                 });
             }
 
-            const customer =
-                getCustomerById(userId);
+            const source =
+                normalizeSource(
+                    req.query.source
+                );
 
-            if (
-                !customer ||
-                customer.role !== "customer"
-            ) {
+            if (!source) {
+
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        "Customer source is required."
+                });
+            }
+
+            const customer =
+                await getCustomerBySource(
+                    userId,
+                    source
+                );
+
+            if (!customer) {
 
                 return res.status(404).json({
                     success: false,
@@ -496,33 +942,55 @@ router.get(
                     SELECT
                         id,
                         user_id,
+                        user_source,
                         sender_type,
                         message,
                         is_read,
                         created_at
                     FROM support_chat_messages
-                    WHERE user_id = ?
+                    WHERE
+                        user_id = ?
+                        AND user_source = ?
                     ORDER BY id ASC
-                `).all(userId);
+                `).all(
+                    userId,
+                    source
+                );
 
+            // -------------------------------------------------
             // Customer messages become read
-            // when admin opens the conversation.
+            // when admin opens conversation.
+            // -------------------------------------------------
+
             db.prepare(`
                 UPDATE support_chat_messages
                 SET is_read = 1
                 WHERE
                     user_id = ?
+                    AND user_source = ?
                     AND sender_type = 'customer'
-            `).run(userId);
+            `).run(
+                userId,
+                source
+            );
 
             return res.json({
 
                 success: true,
 
                 customer: {
+
                     id: customer.id,
-                    name: customer.name,
-                    email: customer.email
+
+                    name:
+                        customer.name,
+
+                    email:
+                        customer.email,
+
+                    user_source:
+                        source
+
                 },
 
                 messages
@@ -573,6 +1041,20 @@ router.post(
                 });
             }
 
+            const source =
+                normalizeSource(
+                    req.query.source
+                );
+
+            if (!source) {
+
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        "Customer source is required."
+                });
+            }
+
             const message =
                 cleanMessage(
                     req.body?.message
@@ -597,12 +1079,12 @@ router.post(
             }
 
             const customer =
-                getCustomerById(userId);
+                await getCustomerBySource(
+                    userId,
+                    source
+                );
 
-            if (
-                !customer ||
-                customer.role !== "customer"
-            ) {
+            if (!customer) {
 
                 return res.status(404).json({
                     success: false,
@@ -616,14 +1098,16 @@ router.post(
                     INSERT INTO support_chat_messages
                     (
                         user_id,
+                        user_source,
                         sender_type,
                         message,
                         is_read
                     )
                     VALUES
-                    (?, 'admin', ?, 0)
+                    (?, ?, 'admin', ?, 0)
                 `).run(
                     userId,
+                    source,
                     message
                 );
 
@@ -632,6 +1116,7 @@ router.post(
                     SELECT
                         id,
                         user_id,
+                        user_source,
                         sender_type,
                         message,
                         is_read,
@@ -644,7 +1129,7 @@ router.post(
                 );
 
             console.log(
-                `CHAT: Admin replied to customer ${userId}`
+                `CHAT: Admin replied to customer ${userId} (${source})`
             );
 
             // =================================================
@@ -744,7 +1229,8 @@ Miami, Florida, USA`,
                 message:
                     "Reply sent successfully.",
 
-                data: savedMessage
+                data:
+                    savedMessage
 
             });
 
@@ -792,13 +1278,31 @@ router.patch(
                 });
             }
 
+            const source =
+                normalizeSource(
+                    req.query.source
+                );
+
+            if (!source) {
+
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        "Customer source is required."
+                });
+            }
+
             db.prepare(`
                 UPDATE support_chat_messages
                 SET is_read = 1
                 WHERE
                     user_id = ?
+                    AND user_source = ?
                     AND sender_type = 'customer'
-            `).run(userId);
+            `).run(
+                userId,
+                source
+            );
 
             return res.json({
                 success: true
