@@ -143,7 +143,9 @@ function isStrongPassword(password) {
 // =========================================================
 // SESSION FUNCTIONS
 // =========================================================
+
 function createSession(user, source) {
+
     const token =
         crypto.randomBytes(32).toString("hex");
 
@@ -151,17 +153,33 @@ function createSession(user, source) {
         Date.now() + SESSION_DURATION_MS;
 
     sessions.set(token, {
-        userId: Number(user.id),
-        role: user.role,
-        source: source,
-        expiresAt: expiresAt
+
+        userId:
+            Number(user.id),
+
+        role:
+            user.role,
+
+        source:
+            source,
+
+        expiresAt:
+            expiresAt
+
     });
 
     return {
-        token: token,
-        expiresAt: expiresAt
+
+        token:
+            token,
+
+        expiresAt:
+            expiresAt
+
     };
+
 }
+
 
 function getSession(token) {
 
@@ -219,64 +237,89 @@ function getTokenFromRequest(req) {
 
 
 // =========================================================
-// GET USER
+// GET USER BY ID
 //
-// CUSTOMER:
-// Supabase
+// IMPORTANT:
+// SQLite and Supabase have separate ID systems.
 //
-// ADMIN:
-// Existing SQLite fallback
+// source = "sqlite"
+// source = "supabase"
+//
+// This prevents an Admin SQLite ID from accidentally
+// matching a Customer Supabase ID.
 // =========================================================
 
 async function getUserById(userId, source) {
-    const numericId = Number(userId);
+
+    const numericId =
+        Number(userId);
 
     if (
         !Number.isInteger(numericId) ||
         numericId <= 0
     ) {
+
         return null;
+
     }
+
 
     // =====================================================
     // SQLITE USER
     // =====================================================
+
     if (source === "sqlite") {
+
         try {
-            const user = db.prepare(`
-                SELECT
-                    id,
-                    name,
-                    email,
-                    phone,
-                    password_hash,
-                    role,
-                    created_at,
-                    updated_at
-                FROM users
-                WHERE id = ?
-                LIMIT 1
-            `).get(numericId);
+
+            const user =
+                db.prepare(
+                    `
+                    SELECT
+                        id,
+                        name,
+                        email,
+                        phone,
+                        password_hash,
+                        role,
+                        created_at,
+                        updated_at
+                    FROM users
+                    WHERE id = ?
+                    LIMIT 1
+                    `
+                ).get(numericId);
 
             return user || null;
 
         } catch (error) {
+
             console.error(
                 "SQLite user lookup error:",
                 error
             );
 
             return null;
+
         }
+
     }
+
 
     // =====================================================
     // SUPABASE USER
     // =====================================================
-    if (source === "supabase" && supabasePool) {
+
+    if (
+        source === "supabase" &&
+        supabasePool
+    ) {
+
         try {
+
             const result =
-                await supabasePool.query(`
+                await supabasePool.query(
+                    `
                     SELECT
                         id,
                         name,
@@ -289,64 +332,37 @@ async function getUserById(userId, source) {
                     FROM users
                     WHERE id = $1
                     LIMIT 1
-                `, [numericId]);
+                    `,
+                    [numericId]
+                );
 
-            return result.rows.length > 0
-                ? result.rows[0]
-                : null;
+            if (
+                result.rows.length > 0
+            ) {
+
+                return result.rows[0];
+
+            }
+
+            return null;
 
         } catch (error) {
+
             console.error(
                 "Supabase user lookup error:",
                 error
             );
 
             return null;
+
         }
+
     }
+
 
     return null;
+
 }
-
-
-    // -------------------------------------------------------
-    // FALLBACK: EXISTING SQLITE
-    // -------------------------------------------------------
-
-    try {
-
-        const user =
-            db.prepare(
-                `
-                SELECT
-                    id,
-                    name,
-                    email,
-                    phone,
-                    password_hash,
-                    role,
-                    created_at,
-                    updated_at
-                FROM users
-                WHERE id = ?
-                LIMIT 1
-                `
-            ).get(numericId);
-
-        return user || null;
-
-    } catch (error) {
-
-        console.error(
-            "SQLite user lookup error:",
-            error
-        );
-
-        return null;
-
-    }
-
-
 
 
 // =========================================================
@@ -373,9 +389,12 @@ async function getAuthenticatedUser(req) {
 
     }
 
+    // IMPORTANT:
+    // Use the same database from which the session was created.
     const user =
         await getUserById(
-            session.userId
+            session.userId,
+            session.source
         );
 
     if (!user) {
@@ -690,11 +709,14 @@ router.post(
 
 
             // -------------------------------------------------
-            // CREATE LOGIN SESSION
+            // CREATE SUPABASE LOGIN SESSION
             // -------------------------------------------------
 
             const session =
-                createSession(user);
+                createSession(
+                    user,
+                    "supabase"
+                );
 
 
             return res.status(201).json({
@@ -774,6 +796,16 @@ router.post(
 // =========================================================
 // LOGIN
 // POST /api/auth/login
+//
+// IMPORTANT:
+//
+// 1. SQLite is checked FIRST.
+//    This keeps the existing Admin account working.
+//
+// 2. If SQLite user is not found,
+//    Supabase customer database is checked.
+//
+// 3. Session remembers the database source.
 // =========================================================
 
 router.post(
@@ -822,12 +854,61 @@ router.post(
 
             let user = null;
 
+            let authSource = null;
+
 
             // -------------------------------------------------
-            // FIRST: CHECK SUPABASE
+            // FIRST: CHECK EXISTING SQLITE USERS
+            //
+            // This is important for the existing Admin account.
             // -------------------------------------------------
 
-            if (supabasePool) {
+            try {
+
+                user =
+                    db.prepare(
+                        `
+                        SELECT
+                            id,
+                            name,
+                            email,
+                            phone,
+                            password_hash,
+                            role,
+                            created_at,
+                            updated_at
+                        FROM users
+                        WHERE LOWER(email) = LOWER(?)
+                        LIMIT 1
+                        `
+                    ).get(email);
+
+
+                if (user) {
+
+                    authSource =
+                        "sqlite";
+
+                }
+
+            } catch (error) {
+
+                console.error(
+                    "SQLite login lookup error:",
+                    error
+                );
+
+            }
+
+
+            // -------------------------------------------------
+            // SECOND: CHECK SUPABASE CUSTOMER
+            // -------------------------------------------------
+
+            if (
+                !user &&
+                supabasePool
+            ) {
 
                 try {
 
@@ -850,6 +931,7 @@ router.post(
                             [email]
                         );
 
+
                     if (
                         result.rows.length > 0
                     ) {
@@ -857,52 +939,15 @@ router.post(
                         user =
                             result.rows[0];
 
+                        authSource =
+                            "supabase";
+
                     }
 
                 } catch (error) {
 
                     console.error(
                         "Supabase login lookup error:",
-                        error
-                    );
-
-                }
-
-            }
-
-
-            // -------------------------------------------------
-            // SQLITE FALLBACK
-            //
-            // Keeps existing admin account compatible.
-            // -------------------------------------------------
-
-            if (!user) {
-
-                try {
-
-                    user =
-                        db.prepare(
-                            `
-                            SELECT
-                                id,
-                                name,
-                                email,
-                                phone,
-                                password_hash,
-                                role,
-                                created_at,
-                                updated_at
-                            FROM users
-                            WHERE LOWER(email) = LOWER(?)
-                            LIMIT 1
-                            `
-                        ).get(email);
-
-                } catch (error) {
-
-                    console.error(
-                        "SQLite login lookup error:",
                         error
                     );
 
@@ -956,14 +1001,22 @@ router.post(
 
             // -------------------------------------------------
             // CREATE SESSION
+            //
+            // IMPORTANT FIX:
+            // Save whether this user came from SQLite
+            // or Supabase.
             // -------------------------------------------------
 
             const session =
-                createSession(user);
+                createSession(
+                    user,
+                    authSource
+                );
 
 
             console.log(
-                `User logged in: ${user.email}`
+                `User logged in: ${user.email} ` +
+                `(${authSource})`
             );
 
 
@@ -1209,7 +1262,10 @@ router.post(
                 ) || "customer";
 
 
-            if (!name || !isValidEmail(email)) {
+            if (
+                !name ||
+                !isValidEmail(email)
+            ) {
 
                 return res.status(400).json({
 
@@ -1810,6 +1866,7 @@ router.post(
             ) {
 
                 if (
+                    session.source === "supabase" &&
                     Number(session.userId) ===
                     Number(reset.user_id)
                 ) {
@@ -1938,8 +1995,24 @@ router.post(
                 );
 
 
-            // Customer accounts in Supabase
+            // -------------------------------------------------
+            // GET SOURCE FROM CURRENT SESSION
+            // -------------------------------------------------
+
+            const token =
+                getTokenFromRequest(req);
+
+            const session =
+                getSession(token);
+
+
+            // -------------------------------------------------
+            // SUPABASE CUSTOMER
+            // -------------------------------------------------
+
             if (
+                session &&
+                session.source === "supabase" &&
                 supabasePool
             ) {
 
@@ -1967,12 +2040,13 @@ router.post(
                     for (
                         const [
                             sessionToken,
-                            session
+                            storedSession
                         ] of sessions.entries()
                     ) {
 
                         if (
-                            Number(session.userId) ===
+                            storedSession.source === "supabase" &&
+                            Number(storedSession.userId) ===
                             Number(req.user.id)
                         ) {
 
@@ -1999,7 +2073,10 @@ router.post(
             }
 
 
-            // Existing SQLite fallback
+            // -------------------------------------------------
+            // EXISTING SQLITE USER / ADMIN
+            // -------------------------------------------------
+
             const result =
                 db.prepare(
                     `
@@ -2034,12 +2111,13 @@ router.post(
             for (
                 const [
                     sessionToken,
-                    session
+                    storedSession
                 ] of sessions.entries()
             ) {
 
                 if (
-                    Number(session.userId) ===
+                    storedSession.source === "sqlite" &&
+                    Number(storedSession.userId) ===
                     Number(req.user.id)
                 ) {
 
@@ -2145,7 +2223,7 @@ if (supabasePool) {
 
 
 // =========================================================
-// EXPOR
+// EXPORT
 // =========================================================
 
 module.exports = router;
