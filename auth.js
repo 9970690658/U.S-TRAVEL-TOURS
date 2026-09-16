@@ -143,31 +143,25 @@ function isStrongPassword(password) {
 // =========================================================
 // SESSION FUNCTIONS
 // =========================================================
-
-function createSession(user) {
-
+function createSession(user, source) {
     const token =
         crypto.randomBytes(32).toString("hex");
 
     const expiresAt =
         Date.now() + SESSION_DURATION_MS;
 
-    sessions.set(
-        token,
-        {
-            userId: Number(user.id),
-            role: user.role,
-            expiresAt: expiresAt
-        }
-    );
+    sessions.set(token, {
+        userId: Number(user.id),
+        role: user.role,
+        source: source,
+        expiresAt: expiresAt
+    });
 
     return {
         token: token,
         expiresAt: expiresAt
     };
-
 }
-
 
 function getSession(token) {
 
@@ -234,32 +228,55 @@ function getTokenFromRequest(req) {
 // Existing SQLite fallback
 // =========================================================
 
-async function getUserById(userId) {
-
-    const numericId =
-        Number(userId);
+async function getUserById(userId, source) {
+    const numericId = Number(userId);
 
     if (
         !Number.isInteger(numericId) ||
         numericId <= 0
     ) {
-
         return null;
-
     }
 
-
-    // -------------------------------------------------------
-    // FIRST: SUPABASE
-    // -------------------------------------------------------
-
-    if (supabasePool) {
-
+    // =====================================================
+    // SQLITE USER
+    // =====================================================
+    if (source === "sqlite") {
         try {
+            const user = db.prepare(`
+                SELECT
+                    id,
+                    name,
+                    email,
+                    phone,
+                    password_hash,
+                    role,
+                    created_at,
+                    updated_at
+                FROM users
+                WHERE id = ?
+                LIMIT 1
+            `).get(numericId);
 
+            return user || null;
+
+        } catch (error) {
+            console.error(
+                "SQLite user lookup error:",
+                error
+            );
+
+            return null;
+        }
+    }
+
+    // =====================================================
+    // SUPABASE USER
+    // =====================================================
+    if (source === "supabase" && supabasePool) {
+        try {
             const result =
-                await supabasePool.query(
-                    `
+                await supabasePool.query(`
                     SELECT
                         id,
                         name,
@@ -272,28 +289,24 @@ async function getUserById(userId) {
                     FROM users
                     WHERE id = $1
                     LIMIT 1
-                    `,
-                    [numericId]
-                );
+                `, [numericId]);
 
-            if (
-                result.rows.length > 0
-            ) {
-
-                return result.rows[0];
-
-            }
+            return result.rows.length > 0
+                ? result.rows[0]
+                : null;
 
         } catch (error) {
-
             console.error(
                 "Supabase user lookup error:",
                 error
             );
 
+            return null;
         }
-
     }
+
+    return null;
+}
 
 
     // -------------------------------------------------------
@@ -333,7 +346,7 @@ async function getUserById(userId) {
 
     }
 
-}
+
 
 
 // =========================================================
