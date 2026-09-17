@@ -1,6 +1,7 @@
 // =========================================================
 // U.S TRAVEL & TOURS
 // CUSTOMER + ADMIN AUTHENTICATION SYSTEM
+// SUPABASE / POSTGRESQL VERSION
 // =========================================================
 
 const express = require("express");
@@ -8,9 +9,9 @@ const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
 const nodemailer = require("nodemailer");
 const { Pool } = require("pg");
-const { db } = require("./database");
 
 const router = express.Router();
+
 // =========================================================
 // SUPABASE / POSTGRESQL CONNECTION
 // =========================================================
@@ -56,71 +57,416 @@ if (process.env.DATABASE_URL) {
 
 } else {
 
-    console.warn(
-        "SUPABASE DATABASE: DATABASE_URL is not configured."
+    console.error(
+        "SUPABASE DATABASE ERROR: DATABASE_URL is not configured."
     );
 
 }
 
 // =========================================================
+// DATABASE CHECK
+// =========================================================
+
+function getPool() {
+
+    if (!supabasePool) {
+
+        throw new Error(
+            "Supabase PostgreSQL database is not configured. DATABASE_URL is missing."
+        );
+
+    }
+
+    return supabasePool;
+}
+
+
+// =========================================================
 // CONFIGURATION
 // =========================================================
 
+// Normal session duration
 const SESSION_DURATION_MS =
     1000 * 60 * 60 * 24 * 7;
 
+// Remember-me session duration
+const REMEMBER_SESSION_DURATION_MS =
+    1000 * 60 * 60 * 24 * 30;
+
+// Password reset duration
 const RESET_TOKEN_DURATION_MS =
-    1000 * 60 * 30; // 30 minutes
+    1000 * 60 * 30;
 
-const sessions = new Map();
 
 // =========================================================
-// PASSWORD RESET TABLE
+// AUTH INITIALIZATION
+// =========================================================
+//
+// This creates the bootstrap admin directly in Supabase
+// when BOOTSTRAP_ADMIN_* environment variables are present.
+//
+// server.js can continue running unchanged.
 // =========================================================
 
-db.exec(`
-    CREATE TABLE IF NOT EXISTS password_resets (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        token_hash TEXT NOT NULL UNIQUE,
-        expires_at INTEGER NOT NULL,
-        used_at INTEGER,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users(id)
-    );
+let authInitialization = null;
 
-    CREATE INDEX IF NOT EXISTS idx_password_resets_token
-    ON password_resets(token_hash);
 
-    CREATE INDEX IF NOT EXISTS idx_password_resets_user
-    ON password_resets(user_id);
-`);
+async function initializeAuthDatabase() {
+
+    const pool = getPool();
+
+    // -----------------------------------------------------
+    // Make sure required tables exist.
+    //
+    // These tables should normally already exist because
+    // they were created in Supabase SQL.
+    // -----------------------------------------------------
+
+    await pool.query(`
+
+        CREATE TABLE IF NOT EXISTS users (
+
+            id BIGSERIAL PRIMARY KEY,
+
+            name TEXT NOT NULL,
+
+            email TEXT NOT NULL UNIQUE,
+
+            phone TEXT,
+
+            password_hash TEXT NOT NULL,
+
+            role TEXT NOT NULL DEFAULT 'customer'
+                CHECK (
+                    role IN ('customer', 'admin')
+                ),
+
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_users_email
+        ON users(email);
+
+    `);
+
+
+    await pool.query(`
+
+        CREATE TABLE IF NOT EXISTS sessions (
+
+            id BIGSERIAL PRIMARY KEY,
+
+            token_hash TEXT UNIQUE NOT NULL,
+
+            user_id BIGINT NOT NULL
+                REFERENCES users(id)
+                ON DELETE CASCADE,
+
+            expires_at BIGINT NOT NULL,
+
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+
+            last_used_at TIMESTAMPTZ DEFAULT NOW()
+
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_sessions_token_hash
+        ON sessions(token_hash);
+
+        CREATE INDEX IF NOT EXISTS idx_sessions_user_id
+        ON sessions(user_id);
+
+        CREATE INDEX IF NOT EXISTS idx_sessions_expires_at
+        ON sessions(expires_at);
+
+    `);
+
+
+    await pool.query(`
+
+        CREATE TABLE IF NOT EXISTS password_resets (
+
+            id BIGSERIAL PRIMARY KEY,
+
+            user_id BIGINT NOT NULL
+                REFERENCES users(id)
+                ON DELETE CASCADE,
+
+            token_hash TEXT UNIQUE NOT NULL,
+
+            expires_at BIGINT NOT NULL,
+
+            used_at BIGINT,
+
+            created_at TIMESTAMPTZ DEFAULT NOW()
+
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_password_resets_token
+        ON password_resets(token_hash);
+
+        CREATE INDEX IF NOT EXISTS idx_password_resets_user
+        ON password_resets(user_id);
+
+    `);
+
+
+    // -----------------------------------------------------
+    // BOOTSTRAP ADMIN
+    // -----------------------------------------------------
+
+    const adminName =
+        String(
+            process.env.BOOTSTRAP_ADMIN_NAME || ""
+        ).trim();
+
+    const adminEmail =
+        String(
+            process.env.BOOTSTRAP_ADMIN_EMAIL || ""
+        )
+            .trim()
+            .toLowerCase();
+
+    const adminPassword =
+        String(
+            process.env.BOOTSTRAP_ADMIN_PASSWORD || ""
+        );
+
+
+    if (
+        adminName &&
+        adminEmail &&
+        adminPassword
+    ) {
+
+        if (
+            isValidEmail(adminEmail) &&
+            isStrongPassword(adminPassword)
+        ) {
+
+            const existingAdmin =
+                await pool.query(
+                    `
+                    SELECT
+                        id,
+                        role
+                    FROM users
+                    WHERE LOWER(TRIM(email)) = $1
+                    LIMIT 1
+                    `,
+                    [adminEmail]
+                );
+
+
+            if (
+                existingAdmin.rows.length === 0
+            ) {
+
+                const passwordHash =
+                    await bcrypt.hash(
+                        adminPassword,
+                        12
+                    );
+
+
+                await pool.query(
+                    `
+                    INSERT INTO users (
+                        name,
+                        email,
+                        phone,
+                        password_hash,
+                        role
+                    )
+                    VALUES ($1, $2, $3, $4, $5)
+                    `,
+                    [
+                        adminName,
+                        adminEmail,
+                        null,
+                        passwordHash,
+                        "admin"
+                    ]
+                );
+
+
+                console.log(
+                    "SUPABASE ADMIN: Bootstrap admin created."
+                );
+
+            } else {
+
+                const existingRole =
+                    String(
+                        existingAdmin.rows[0].role || ""
+                    )
+                        .trim()
+                        .toLowerCase();
+
+
+                if (
+                    existingRole !== "admin"
+                ) {
+
+                    await pool.query(
+                        `
+                        UPDATE users
+                        SET
+                            role = 'admin',
+                            updated_at = NOW()
+                        WHERE id = $1
+                        `,
+                        [
+                            existingAdmin.rows[0].id
+                        ]
+                    );
+
+
+                    console.log(
+                        "SUPABASE ADMIN: Existing bootstrap account promoted to admin."
+                    );
+
+                } else {
+
+                    console.log(
+                        "SUPABASE ADMIN: Bootstrap admin already exists."
+                    );
+
+                }
+
+            }
+
+        } else {
+
+            console.warn(
+                "SUPABASE ADMIN: Bootstrap admin credentials are invalid."
+            );
+
+        }
+
+    } else {
+
+        console.warn(
+            "SUPABASE ADMIN: BOOTSTRAP_ADMIN_NAME / EMAIL / PASSWORD not fully configured."
+        );
+
+    }
+
+}
+
+
+// ---------------------------------------------------------
+// Start initialization once.
+// ---------------------------------------------------------
+
+if (supabasePool) {
+
+    authInitialization =
+        initializeAuthDatabase()
+            .then(() => {
+
+                console.log(
+                    "SUPABASE AUTH: Database initialization completed."
+                );
+
+            })
+            .catch((error) => {
+
+                console.error(
+                    "SUPABASE AUTH INITIALIZATION ERROR:",
+                    error
+                );
+
+                throw error;
+
+            });
+
+} else {
+
+    authInitialization =
+        Promise.reject(
+            new Error(
+                "DATABASE_URL is missing."
+            )
+        );
+
+}
+
+
+// =========================================================
+// WAIT FOR AUTH DATABASE
+// =========================================================
+
+async function waitForAuthDatabase() {
+
+    if (!authInitialization) {
+
+        throw new Error(
+            "Authentication database initialization was not created."
+        );
+
+    }
+
+    await authInitialization;
+
+}
+
 
 // =========================================================
 // HELPERS
 // =========================================================
 
 function normalizeEmail(email) {
+
     return String(email || "")
         .trim()
         .toLowerCase();
+
 }
+
 
 function cleanText(value) {
-    return String(value || "").trim();
+
+    return String(value || "")
+        .trim();
+
 }
+
 
 function isValidEmail(email) {
+
     return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+
 }
 
+
 function isStrongPassword(password) {
+
     return (
         password.length >= 8 &&
         /[A-Za-z]/.test(password) &&
         /\d/.test(password)
     );
+
 }
+
+
+// =========================================================
+// TOKEN HASH
+// =========================================================
+
+function hashToken(token) {
+
+    return crypto
+        .createHash("sha256")
+        .update(token)
+        .digest("hex");
+
+}
+
 
 // =========================================================
 // EMAIL CONFIGURATION - BREVO SMTP
@@ -128,47 +474,97 @@ function isStrongPassword(password) {
 
 let mailTransporter = null;
 
+
 function getMailTransporter() {
 
     if (mailTransporter) {
+
         return mailTransporter;
+
     }
 
-    const smtpHost = process.env.SMTP_HOST;
-    const smtpPort = Number(process.env.SMTP_PORT || 587);
-    const smtpUser = process.env.SMTP_USER;
-    const smtpPass = process.env.SMTP_PASS;
 
-    if (!smtpHost || !smtpUser || !smtpPass) {
+    const smtpHost =
+        process.env.SMTP_HOST;
+
+    const smtpPort =
+        Number(
+            process.env.SMTP_PORT || 587
+        );
+
+    const smtpUser =
+        process.env.SMTP_USER;
+
+    const smtpPass =
+        process.env.SMTP_PASS;
+
+
+    if (
+        !smtpHost ||
+        !smtpUser ||
+        !smtpPass
+    ) {
 
         console.error(
             "SMTP CONFIG ERROR: SMTP_HOST / SMTP_USER / SMTP_PASS missing."
         );
 
         return null;
+
     }
 
-    console.log("Creating SMTP transporter...");
-    console.log("SMTP Host:", smtpHost);
-    console.log("SMTP Port:", smtpPort);
-    console.log("SMTP User:", smtpUser);
 
-    mailTransporter = nodemailer.createTransport({
-        host: smtpHost,
-        port: smtpPort,
-        secure:
-            String(
-                process.env.SMTP_SECURE || "false"
-            ).toLowerCase() === "true",
+    console.log(
+        "Creating SMTP transporter..."
+    );
 
-        auth: {
-            user: smtpUser,
-            pass: smtpPass
-        }
-    });
+    console.log(
+        "SMTP Host:",
+        smtpHost
+    );
+
+    console.log(
+        "SMTP Port:",
+        smtpPort
+    );
+
+    console.log(
+        "SMTP User:",
+        smtpUser
+    );
+
+
+    mailTransporter =
+        nodemailer.createTransport({
+
+            host:
+                smtpHost,
+
+            port:
+                smtpPort,
+
+            secure:
+                String(
+                    process.env.SMTP_SECURE || "false"
+                ).toLowerCase() === "true",
+
+            auth: {
+
+                user:
+                    smtpUser,
+
+                pass:
+                    smtpPass
+
+            }
+
+        });
+
 
     return mailTransporter;
+
 }
+
 
 // =========================================================
 // SEND PASSWORD RESET EMAIL
@@ -182,39 +578,64 @@ async function sendPasswordResetEmail(
     const transporter =
         getMailTransporter();
 
+
     if (!transporter) {
+
         throw new Error(
             "Email service is not configured."
         );
+
     }
+
 
     await transporter.verify();
 
-console.log("SMTP connection verified successfully.");
+
+    console.log(
+        "SMTP connection verified successfully."
+    );
+
 
     const baseUrl =
         String(
             process.env.APP_BASE_URL ||
             "http://localhost:3000"
-        ).replace(/\/+$/, "");
+        )
+            .replace(
+                /\/+$/,
+                ""
+            );
+
 
     const resetUrl =
         `${baseUrl}/reset-password.html?token=${encodeURIComponent(rawToken)}`;
+
 
     const mailFrom =
         process.env.MAIL_FROM ||
         process.env.SMTP_USER;
 
-    const mailResult = await transporter.sendMail({
 
-        from: mailFrom,
+    const safeName =
+        escapeHtml(
+            user.name ||
+            "Customer"
+        );
 
-        to: user.email,
 
-        subject:
-            "Reset your U.S TRAVEL & TOURS password",
+    const mailResult =
+        await transporter.sendMail({
 
-        text:
+            from:
+                mailFrom,
+
+            to:
+                user.email,
+
+            subject:
+                "Reset your U.S TRAVEL & TOURS password",
+
+            text:
 `Hello ${user.name || "Customer"},
 
 We received a request to reset your U.S TRAVEL & TOURS account password.
@@ -229,71 +650,122 @@ If you did not request a password reset, you can safely ignore this email.
 
 U.S TRAVEL & TOURS`,
 
-        html:
+            html:
 `
 <!DOCTYPE html>
 <html>
+
 <head>
+
 <meta charset="UTF-8">
+
 <title>Password Reset</title>
+
 </head>
 
-<body style="margin:0;padding:0;background:#f5f5f5;font-family:Arial,sans-serif;">
+<body
+style="
+margin:0;
+padding:0;
+background:#f5f5f5;
+font-family:Arial,sans-serif;
+">
 
-<div style="max-width:600px;margin:40px auto;background:#ffffff;padding:40px;border-radius:10px;">
+<div
+style="
+max-width:600px;
+margin:40px auto;
+background:#ffffff;
+padding:40px;
+border-radius:10px;
+">
 
-    <h2 style="margin-top:0;">
-        U.S TRAVEL & TOURS
-    </h2>
+<h2 style="margin-top:0;">
+U.S TRAVEL & TOURS
+</h2>
 
-    <p>
-        Hello ${escapeHtml(user.name || "Customer")},
-    </p>
+<p>
+Hello ${safeName},
+</p>
 
-    <p>
-        We received a request to reset your account password.
-    </p>
+<p>
+We received a request to reset your account password.
+</p>
 
-    <p>
-        Click the button below to create a new password.
-    </p>
+<p>
+Click the button below to create a new password.
+</p>
 
-    <p style="margin:30px 0;">
-        <a
-            href="${resetUrl}"
-            style="
-                display:inline-block;
-                padding:14px 24px;
-                background:#111111;
-                color:#ffffff;
-                text-decoration:none;
-                border-radius:6px;
-                font-weight:bold;
-            "
-        >
-            Reset Password
-        </a>
-    </p>
+<p style="margin:30px 0;">
 
-    <p style="font-size:14px;color:#666;">
-        This link expires in 30 minutes and can only be used once.
-    </p>
+<a
+href="${resetUrl}"
+style="
+display:inline-block;
+padding:14px 24px;
+background:#111111;
+color:#ffffff;
+text-decoration:none;
+border-radius:6px;
+font-weight:bold;
+"
+>
+Reset Password
+</a>
 
-    <p style="font-size:14px;color:#666;">
-        If you did not request this password reset, you can safely ignore this email.
-    </p>
+</p>
+
+<p
+style="
+font-size:14px;
+color:#666;
+">
+
+This link expires in 30 minutes and can only be used once.
+
+</p>
+
+<p
+style="
+font-size:14px;
+color:#666;
+">
+
+If you did not request this password reset, you can safely ignore this email.
+
+</p>
 
 </div>
 
 </body>
+
 </html>
 `
-    });
-     console.log("PASSWORD RESET EMAIL SENT");
-    console.log("Message ID:", mailResult.messageId);
-    console.log("Accepted:", mailResult.accepted);
-    console.log("Rejected:", mailResult.rejected);
+
+        });
+
+
+    console.log(
+        "PASSWORD RESET EMAIL SENT"
+    );
+
+    console.log(
+        "Message ID:",
+        mailResult.messageId
+    );
+
+    console.log(
+        "Accepted:",
+        mailResult.accepted
+    );
+
+    console.log(
+        "Rejected:",
+        mailResult.rejected
+    );
+
 }
+
 
 // =========================================================
 // HTML ESCAPE
@@ -302,67 +774,225 @@ U.S TRAVEL & TOURS`,
 function escapeHtml(value) {
 
     return String(value || "")
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#039;");
+        .replace(
+            /&/g,
+            "&amp;"
+        )
+        .replace(
+            /</g,
+            "&lt;"
+        )
+        .replace(
+            />/g,
+            "&gt;"
+        )
+        .replace(
+            /"/g,
+            "&quot;"
+        )
+        .replace(
+            /'/g,
+            "&#039;"
+        );
+
 }
 
+
 // =========================================================
-// SESSION
+// CREATE SESSION
 // =========================================================
 
-function createSession(user) {
+async function createSession(
+    user,
+    remember = false
+) {
+
+    await waitForAuthDatabase();
+
+
+    const pool =
+        getPool();
+
 
     const token =
-        crypto.randomBytes(32).toString("hex");
+        crypto
+            .randomBytes(32)
+            .toString("hex");
+
+
+    const tokenHash =
+        hashToken(token);
+
+
+    const duration =
+        remember
+            ? REMEMBER_SESSION_DURATION_MS
+            : SESSION_DURATION_MS;
+
 
     const expiresAt =
-        Date.now() + SESSION_DURATION_MS;
+        Date.now() +
+        duration;
 
-    sessions.set(token, {
-        userId: user.id,
-        role: user.role,
-        expiresAt
-    });
+
+    await pool.query(
+        `
+        INSERT INTO sessions (
+            token_hash,
+            user_id,
+            expires_at,
+            created_at,
+            last_used_at
+        )
+        VALUES (
+            $1,
+            $2,
+            $3,
+            NOW(),
+            NOW()
+        )
+        `,
+        [
+            tokenHash,
+            user.id,
+            expiresAt
+        ]
+    );
+
 
     return {
+
         token,
+
         expiresAt
+
     };
+
 }
+
 
 // =========================================================
 // GET SESSION
 // =========================================================
 
-function getSession(token) {
+async function getSession(token) {
 
     if (!token) {
+
         return null;
+
     }
+
+
+    await waitForAuthDatabase();
+
+
+    const pool =
+        getPool();
+
+
+    const tokenHash =
+        hashToken(token);
+
+
+    const result =
+        await pool.query(
+            `
+            SELECT
+                id,
+                token_hash,
+                user_id,
+                expires_at,
+                created_at,
+                last_used_at
+            FROM sessions
+            WHERE token_hash = $1
+            LIMIT 1
+            `,
+            [
+                tokenHash
+            ]
+        );
+
+
+    if (
+        result.rows.length === 0
+    ) {
+
+        return null;
+
+    }
+
 
     const session =
-        sessions.get(token);
+        result.rows[0];
 
-    if (!session) {
-        return null;
-    }
 
     if (
         Date.now() >
-        session.expiresAt
+        Number(
+            session.expires_at
+        )
     ) {
-        sessions.delete(token);
+
+        await pool.query(
+            `
+            DELETE FROM sessions
+            WHERE id = $1
+            `,
+            [
+                session.id
+            ]
+        );
+
+
         return null;
+
     }
 
-    return session;
+
+    // Update last activity.
+    await pool.query(
+        `
+        UPDATE sessions
+        SET
+            last_used_at = NOW()
+        WHERE id = $1
+        `,
+        [
+            session.id
+        ]
+    );
+
+
+    return {
+
+        id:
+            session.id,
+
+        userId:
+            Number(
+                session.user_id
+            ),
+
+        expiresAt:
+            Number(
+                session.expires_at
+            ),
+
+        createdAt:
+            session.created_at,
+
+        lastUsedAt:
+            session.last_used_at
+
+    };
+
 }
 
+
 // =========================================================
-// GET TOKEN
+// GET TOKEN FROM REQUEST
 // =========================================================
 
 function getTokenFromRequest(req) {
@@ -370,39 +1000,58 @@ function getTokenFromRequest(req) {
     const authHeader =
         req.headers.authorization || "";
 
+
     if (
         !authHeader.startsWith("Bearer ")
     ) {
+
         return null;
+
     }
+
 
     return authHeader
         .substring(7)
         .trim();
+
 }
+
 
 // =========================================================
 // GET AUTHENTICATED USER
 // =========================================================
 
-function getAuthenticatedUser(req) {
+async function getAuthenticatedUser(req) {
 
     const token =
         getTokenFromRequest(req);
 
+
     if (!token) {
+
         return null;
+
     }
+
 
     const session =
-        getSession(token);
+        await getSession(token);
+
 
     if (!session) {
+
         return null;
+
     }
 
-    const user =
-        db.prepare(`
+
+    const pool =
+        getPool();
+
+
+    const result =
+        await pool.query(
+            `
             SELECT
                 id,
                 name,
@@ -412,112 +1061,206 @@ function getAuthenticatedUser(req) {
                 created_at,
                 updated_at
             FROM users
-            WHERE id = ?
+            WHERE id = $1
             LIMIT 1
-        `).get(session.userId);
+            `,
+            [
+                session.userId
+            ]
+        );
 
-    if (!user) {
 
-        sessions.delete(token);
+    if (
+        result.rows.length === 0
+    ) {
+
+        await pool.query(
+            `
+            DELETE FROM sessions
+            WHERE token_hash = $1
+            `,
+            [
+                hashToken(token)
+            ]
+        );
+
 
         return null;
+
     }
 
+
+    const user =
+        result.rows[0];
+
+
     return {
+
         token,
+
         session,
+
         user
+
     };
+
 }
+
 
 // =========================================================
 // REQUIRE LOGIN
 // =========================================================
 
-function requireAuth(
+async function requireAuth(
     req,
     res,
     next
 ) {
 
-    const authenticated =
-        getAuthenticatedUser(req);
+    try {
 
-    if (!authenticated) {
+        const authenticated =
+            await getAuthenticatedUser(req);
 
-        return res.status(401).json({
+
+        if (!authenticated) {
+
+            return res.status(401).json({
+
+                success: false,
+
+                message:
+                    "Authentication required."
+
+            });
+
+        }
+
+
+        req.user =
+            authenticated.user;
+
+
+        req.authToken =
+            authenticated.token;
+
+
+        req.session =
+            authenticated.session;
+
+
+        next();
+
+
+    } catch (error) {
+
+        console.error(
+            "Authentication middleware error:",
+            error
+        );
+
+
+        return res.status(500).json({
 
             success: false,
 
             message:
-                "Authentication required."
+                "Unable to verify authentication."
 
         });
+
     }
 
-    req.user =
-        authenticated.user;
-
-    req.authToken =
-        authenticated.token;
-
-    req.session =
-        authenticated.session;
-
-    next();
 }
+
 
 // =========================================================
 // REQUIRE ADMIN
 // =========================================================
 
-function requireAdmin(
+async function requireAdmin(
     req,
     res,
     next
 ) {
 
-    const authenticated =
-        getAuthenticatedUser(req);
+    try {
 
-    if (!authenticated) {
+        const authenticated =
+            await getAuthenticatedUser(req);
 
-        return res.status(401).json({
+
+        if (!authenticated) {
+
+            return res.status(401).json({
+
+                success: false,
+
+                message:
+                    "Authentication required."
+
+            });
+
+        }
+
+
+        if (
+            String(
+                authenticated.user.role || ""
+            )
+                .trim()
+                .toLowerCase() !==
+            "admin"
+        ) {
+
+            return res.status(403).json({
+
+                success: false,
+
+                message:
+                    "Admin access required."
+
+            });
+
+        }
+
+
+        req.user =
+            authenticated.user;
+
+
+        req.authToken =
+            authenticated.token;
+
+
+        req.session =
+            authenticated.session;
+
+
+        next();
+
+
+    } catch (error) {
+
+        console.error(
+            "Admin authentication middleware error:",
+            error
+        );
+
+
+        return res.status(500).json({
 
             success: false,
 
             message:
-                "Authentication required."
+                "Unable to verify admin authentication."
 
         });
+
     }
 
-    if (
-        authenticated.user.role !==
-        "admin"
-    ) {
-
-        return res.status(403).json({
-
-            success: false,
-
-            message:
-                "Admin access required."
-
-        });
-    }
-
-    req.user =
-        authenticated.user;
-
-    req.authToken =
-        authenticated.token;
-
-    req.session =
-        authenticated.session;
-
-    next();
 }
+
 
 // =========================================================
 // CUSTOMER REGISTER
@@ -530,40 +1273,54 @@ router.post(
 
         try {
 
+            await waitForAuthDatabase();
+
+
+            const pool =
+                getPool();
+
+
             const name =
                 cleanText(
-                    req.body.name
+                    req.body?.name
                 );
+
 
             const email =
                 normalizeEmail(
-                    req.body.email
+                    req.body?.email
                 );
+
 
             const phone =
                 cleanText(
-                    req.body.phone
+                    req.body?.phone
                 );
+
 
             const country =
                 cleanText(
-                    req.body.country
+                    req.body?.country
                 );
+
 
             const city =
                 cleanText(
-                    req.body.city
+                    req.body?.city
                 );
 
+
             const password =
-                cleanText(
-                    req.body.password
+                String(
+                    req.body?.password || ""
                 );
+
 
             const consent =
                 Boolean(
-                    req.body.consent
+                    req.body?.consent
                 );
+
 
             // -------------------------------------------------
             // VALIDATION
@@ -583,9 +1340,13 @@ router.post(
                         "Full name, email and password are required."
 
                 });
+
             }
 
-            if (!isValidEmail(email)) {
+
+            if (
+                !isValidEmail(email)
+            ) {
 
                 return res.status(400).json({
 
@@ -595,9 +1356,13 @@ router.post(
                         "Please enter a valid email address."
 
                 });
+
             }
 
-            if (!isStrongPassword(password)) {
+
+            if (
+                !isStrongPassword(password)
+            ) {
 
                 return res.status(400).json({
 
@@ -607,7 +1372,9 @@ router.post(
                         "Password must contain at least 8 characters and include letters and numbers."
 
                 });
+
             }
+
 
             if (!consent) {
 
@@ -619,21 +1386,32 @@ router.post(
                         "You must agree to the Terms & Conditions and Privacy Policy."
 
                 });
+
             }
+
 
             // -------------------------------------------------
             // DUPLICATE EMAIL
             // -------------------------------------------------
 
             const existingUser =
-                db.prepare(`
-                    SELECT id
+                await pool.query(
+                    `
+                    SELECT
+                        id
                     FROM users
-                    WHERE email = ?
+                    WHERE LOWER(TRIM(email)) = $1
                     LIMIT 1
-                `).get(email);
+                    `,
+                    [
+                        email
+                    ]
+                );
 
-            if (existingUser) {
+
+            if (
+                existingUser.rows.length > 0
+            ) {
 
                 return res.status(409).json({
 
@@ -643,7 +1421,9 @@ router.post(
                         "An account with this email already exists. Please login instead."
 
                 });
+
             }
+
 
             // -------------------------------------------------
             // HASH PASSWORD
@@ -655,12 +1435,25 @@ router.post(
                     12
                 );
 
+
             // -------------------------------------------------
             // CREATE CUSTOMER
             // -------------------------------------------------
 
+            // country and city are accepted from the
+            // frontend for compatibility.
+            //
+            // Existing users table does not require them.
+            // They are intentionally not stored because the
+            // current database schema has no such columns.
+
+            void country;
+            void city;
+
+
             const result =
-                db.prepare(`
+                await pool.query(
+                    `
                     INSERT INTO users (
                         name,
                         email,
@@ -668,14 +1461,42 @@ router.post(
                         password_hash,
                         role
                     )
-                    VALUES (?, ?, ?, ?, ?)
-                `).run(
-                    name,
-                    email,
-                    phone || null,
-                    passwordHash,
-                    "customer"
+                    VALUES (
+                        $1,
+                        $2,
+                        $3,
+                        $4,
+                        $5
+                    )
+                    RETURNING
+                        id
+                    `,
+                    [
+                        name,
+                        email,
+                        phone || null,
+                        passwordHash,
+                        "customer"
+                    ]
                 );
+
+
+            const newUserId =
+                Number(
+                    result.rows[0].id
+                );
+
+
+            console.log(
+                "CUSTOMER REGISTERED:",
+                {
+                    userId:
+                        newUserId,
+
+                    email
+                }
+            );
+
 
             return res.status(201).json({
 
@@ -685,9 +1506,10 @@ router.post(
                     "Account created successfully. Please login.",
 
                 userId:
-                    result.lastInsertRowid
+                    newUserId
 
             });
+
 
         } catch (error) {
 
@@ -695,6 +1517,25 @@ router.post(
                 "Customer registration error:",
                 error
             );
+
+
+            // PostgreSQL duplicate unique email
+            if (
+                error &&
+                error.code === "23505"
+            ) {
+
+                return res.status(409).json({
+
+                    success: false,
+
+                    message:
+                        "An account with this email already exists. Please login instead."
+
+                });
+
+            }
+
 
             return res.status(500).json({
 
@@ -704,9 +1545,12 @@ router.post(
                     "Unable to create your account right now."
 
             });
+
         }
+
     }
 );
+
 
 // =========================================================
 // LOGIN
@@ -720,16 +1564,22 @@ router.post(
 
         try {
 
+            await waitForAuthDatabase();
+
+
+            const pool =
+                getPool();
+
+
             // -------------------------------------------------
             // NORMALIZE EMAIL
             // -------------------------------------------------
 
             const email =
-                String(
-                    req.body?.email || ""
-                )
-                    .trim()
-                    .toLowerCase();
+                normalizeEmail(
+                    req.body?.email
+                );
+
 
             // IMPORTANT:
             // Do NOT trim password.
@@ -740,10 +1590,12 @@ router.post(
                     req.body?.password || ""
                 );
 
+
             const remember =
                 Boolean(
                     req.body?.remember
                 );
+
 
             // -------------------------------------------------
             // BASIC VALIDATION
@@ -755,30 +1607,40 @@ router.post(
             ) {
 
                 return res.status(400).json({
+
                     success: false,
+
                     message:
                         "Email and password are required."
+
                 });
 
             }
 
-            if (!isValidEmail(email)) {
+
+            if (
+                !isValidEmail(email)
+            ) {
 
                 return res.status(400).json({
+
                     success: false,
+
                     message:
                         "Please enter a valid email address."
+
                 });
 
             }
+
 
             // -------------------------------------------------
             // FIND USER
-            // CASE + SPACE SAFE EMAIL MATCH
             // -------------------------------------------------
 
-            const user =
-                db.prepare(`
+            const result =
+                await pool.query(
+                    `
                     SELECT
                         id,
                         name,
@@ -787,28 +1649,40 @@ router.post(
                         password_hash,
                         role
                     FROM users
-                    WHERE LOWER(TRIM(email)) = ?
+                    WHERE LOWER(TRIM(email)) = $1
                     LIMIT 1
-                `).get(email);
+                    `,
+                    [
+                        email
+                    ]
+                );
 
-            // -------------------------------------------------
-            // USER NOT FOUND
-            // -------------------------------------------------
 
-            if (!user) {
+            if (
+                result.rows.length === 0
+            ) {
 
                 console.log(
                     "LOGIN FAILED - USER NOT FOUND:",
                     email
                 );
 
+
                 return res.status(401).json({
+
                     success: false,
+
                     message:
                         "Invalid email or password."
+
                 });
 
             }
+
+
+            const user =
+                result.rows[0];
+
 
             // -------------------------------------------------
             // PASSWORD CHECK
@@ -821,18 +1695,26 @@ router.post(
                 console.error(
                     "LOGIN ERROR - PASSWORD HASH MISSING:",
                     {
-                        userId: user.id,
-                        email: user.email
+                        userId:
+                            user.id,
+
+                        email:
+                            user.email
                     }
                 );
 
+
                 return res.status(401).json({
+
                     success: false,
+
                     message:
                         "Invalid email or password."
+
                 });
 
             }
+
 
             const passwordMatches =
                 await bcrypt.compare(
@@ -840,9 +1722,6 @@ router.post(
                     user.password_hash
                 );
 
-            // -------------------------------------------------
-            // WRONG PASSWORD
-            // -------------------------------------------------
 
             if (!passwordMatches) {
 
@@ -851,13 +1730,18 @@ router.post(
                     email
                 );
 
+
                 return res.status(401).json({
+
                     success: false,
+
                     message:
                         "Invalid email or password."
+
                 });
 
             }
+
 
             // -------------------------------------------------
             // NORMALIZE ROLE
@@ -870,15 +1754,21 @@ router.post(
                     .trim()
                     .toLowerCase();
 
+
             // -------------------------------------------------
-            // CREATE SESSION
+            // CREATE PERSISTENT DATABASE SESSION
             // -------------------------------------------------
 
             const session =
-                createSession({
-                    ...user,
-                    role: normalizedRole
-                });
+                await createSession(
+                    {
+                        ...user,
+                        role:
+                            normalizedRole
+                    },
+                    remember
+                );
+
 
             // -------------------------------------------------
             // RESPONSE USER
@@ -886,35 +1776,44 @@ router.post(
 
             const responseUser = {
 
-                id: user.id,
+                id:
+                    Number(
+                        user.id
+                    ),
 
-                name: user.name,
+                name:
+                    user.name,
 
                 email:
-                    String(
-                        user.email || ""
-                    )
-                        .trim()
-                        .toLowerCase(),
+                    normalizeEmail(
+                        user.email
+                    ),
 
-                phone: user.phone,
+                phone:
+                    user.phone,
 
-                role: normalizedRole
+                role:
+                    normalizedRole
 
             };
 
-            // -------------------------------------------------
-            // SUCCESS
-            // -------------------------------------------------
 
             console.log(
                 "LOGIN SUCCESS:",
                 {
-                    userId: user.id,
-                    email: responseUser.email,
-                    role: normalizedRole
+                    userId:
+                        user.id,
+
+                    email:
+                        responseUser.email,
+
+                    role:
+                        normalizedRole,
+
+                    remember
                 }
             );
+
 
             return res.status(200).json({
 
@@ -936,12 +1835,14 @@ router.post(
 
             });
 
+
         } catch (error) {
 
             console.error(
                 "Login error:",
                 error
             );
+
 
             return res.status(500).json({
 
@@ -957,32 +1858,75 @@ router.post(
     }
 );
 
+
 // =========================================================
 // LOGOUT
+// POST /api/auth/logout
 // =========================================================
 
 router.post(
     "/logout",
     requireAuth,
-    (req, res) => {
+    async (req, res) => {
 
-        sessions.delete(
-            req.authToken
-        );
+        try {
 
-        return res.status(200).json({
+            await waitForAuthDatabase();
 
-            success: true,
 
-            message:
-                "Logout successful."
+            const pool =
+                getPool();
 
-        });
+
+            const tokenHash =
+                hashToken(
+                    req.authToken
+                );
+
+
+            await pool.query(
+                `
+                DELETE FROM sessions
+                WHERE token_hash = $1
+                `,
+                [
+                    tokenHash
+                ]
+            );
+
+
+            return res.status(200).json({
+
+                success: true,
+
+                message:
+                    "Logout successful."
+
+            });
+
+
+        } catch (error) {
+
+            console.error(
+                "Logout error:",
+                error
+            );
+
+
+            return res.status(500).json({
+
+                success: false,
+
+                message:
+                    "Unable to logout right now."
+
+            });
+
+        }
+
     }
 );
 
-console.log("AUTH DEBUG requireAuth:", typeof requireAuth);
-console.log("AUTH DEBUG requireAdmin:", typeof requireAdmin);
 
 // =========================================================
 // CURRENT USER
@@ -1002,11 +1946,14 @@ router.get(
                 req.user
 
         });
+
     }
 );
 
+
 // =========================================================
 // ADMIN CHECK
+// GET /api/auth/admin-check
 // =========================================================
 
 router.get(
@@ -1025,11 +1972,14 @@ router.get(
                 req.user
 
         });
+
     }
 );
 
+
 // =========================================================
 // ADMIN CREATE USER
+// POST /api/auth/create-user
 // =========================================================
 
 router.post(
@@ -1039,31 +1989,44 @@ router.post(
 
         try {
 
+            await waitForAuthDatabase();
+
+
+            const pool =
+                getPool();
+
+
             const name =
                 cleanText(
-                    req.body.name
+                    req.body?.name
                 );
+
 
             const email =
                 normalizeEmail(
-                    req.body.email
+                    req.body?.email
                 );
+
 
             const phone =
                 cleanText(
-                    req.body.phone
+                    req.body?.phone
                 );
 
+
             const password =
-                cleanText(
-                    req.body.password
+                String(
+                    req.body?.password || ""
                 );
+
 
             const role =
                 cleanText(
-                    req.body.role ||
+                    req.body?.role ||
                     "customer"
-                );
+                )
+                    .toLowerCase();
+
 
             if (
                 !name ||
@@ -1079,9 +2042,13 @@ router.post(
                         "Name, email and password are required."
 
                 });
+
             }
 
-            if (!isValidEmail(email)) {
+
+            if (
+                !isValidEmail(email)
+            ) {
 
                 return res.status(400).json({
 
@@ -1091,9 +2058,13 @@ router.post(
                         "Please enter a valid email address."
 
                 });
+
             }
 
-            if (!isStrongPassword(password)) {
+
+            if (
+                !isStrongPassword(password)
+            ) {
 
                 return res.status(400).json({
 
@@ -1103,11 +2074,15 @@ router.post(
                         "Password must contain at least 8 characters and include letters and numbers."
 
                 });
+
             }
 
+
             if (
-                !["customer", "admin"]
-                    .includes(role)
+                ![
+                    "customer",
+                    "admin"
+                ].includes(role)
             ) {
 
                 return res.status(400).json({
@@ -1118,17 +2093,28 @@ router.post(
                         "Invalid account role."
 
                 });
+
             }
 
-            const existingUser =
-                db.prepare(`
-                    SELECT id
-                    FROM users
-                    WHERE email = ?
-                    LIMIT 1
-                `).get(email);
 
-            if (existingUser) {
+            const existingUser =
+                await pool.query(
+                    `
+                    SELECT
+                        id
+                    FROM users
+                    WHERE LOWER(TRIM(email)) = $1
+                    LIMIT 1
+                    `,
+                    [
+                        email
+                    ]
+                );
+
+
+            if (
+                existingUser.rows.length > 0
+            ) {
 
                 return res.status(409).json({
 
@@ -1138,7 +2124,9 @@ router.post(
                         "An account with this email already exists."
 
                 });
+
             }
+
 
             const passwordHash =
                 await bcrypt.hash(
@@ -1146,8 +2134,10 @@ router.post(
                     12
                 );
 
+
             const result =
-                db.prepare(`
+                await pool.query(
+                    `
                     INSERT INTO users (
                         name,
                         email,
@@ -1155,14 +2145,31 @@ router.post(
                         password_hash,
                         role
                     )
-                    VALUES (?, ?, ?, ?, ?)
-                `).run(
-                    name,
-                    email,
-                    phone || null,
-                    passwordHash,
-                    role
+                    VALUES (
+                        $1,
+                        $2,
+                        $3,
+                        $4,
+                        $5
+                    )
+                    RETURNING
+                        id
+                    `,
+                    [
+                        name,
+                        email,
+                        phone || null,
+                        passwordHash,
+                        role
+                    ]
                 );
+
+
+            const userId =
+                Number(
+                    result.rows[0].id
+                );
+
 
             return res.status(201).json({
 
@@ -1171,10 +2178,10 @@ router.post(
                 message:
                     "User account created successfully.",
 
-                userId:
-                    result.lastInsertRowid
+                userId
 
             });
+
 
         } catch (error) {
 
@@ -1182,6 +2189,24 @@ router.post(
                 "Create user error:",
                 error
             );
+
+
+            if (
+                error &&
+                error.code === "23505"
+            ) {
+
+                return res.status(409).json({
+
+                    success: false,
+
+                    message:
+                        "An account with this email already exists."
+
+                });
+
+            }
+
 
             return res.status(500).json({
 
@@ -1191,9 +2216,12 @@ router.post(
                     "Unable to create user account."
 
             });
+
         }
+
     }
 );
+
 
 // =========================================================
 // FORGOT PASSWORD
@@ -1206,16 +2234,25 @@ router.post(
 
         try {
 
+            await waitForAuthDatabase();
+
+
+            const pool =
+                getPool();
+
+
             const email =
                 normalizeEmail(
-                    req.body.email
+                    req.body?.email
                 );
 
-            // Always return the same message.
+
+            // Always return same message.
             // This prevents account enumeration.
 
             const genericMessage =
                 "If an account exists for this email, a password reset link has been sent.";
+
 
             if (
                 !email ||
@@ -1230,20 +2267,30 @@ router.post(
                         genericMessage
 
                 });
+
             }
 
-            const user =
-                db.prepare(`
+
+            const result =
+                await pool.query(
+                    `
                     SELECT
                         id,
                         name,
                         email
                     FROM users
-                    WHERE email = ?
+                    WHERE LOWER(TRIM(email)) = $1
                     LIMIT 1
-                `).get(email);
+                    `,
+                    [
+                        email
+                    ]
+                );
 
-            if (!user) {
+
+            if (
+                result.rows.length === 0
+            ) {
 
                 return res.status(200).json({
 
@@ -1253,16 +2300,28 @@ router.post(
                         genericMessage
 
                 });
+
             }
+
+
+            const user =
+                result.rows[0];
+
 
             // -------------------------------------------------
             // REMOVE OLD RESET TOKENS
             // -------------------------------------------------
 
-            db.prepare(`
+            await pool.query(
+                `
                 DELETE FROM password_resets
-                WHERE user_id = ?
-            `).run(user.id);
+                WHERE user_id = $1
+                `,
+                [
+                    user.id
+                ]
+            );
+
 
             // -------------------------------------------------
             // GENERATE SECURE TOKEN
@@ -1273,28 +2332,38 @@ router.post(
                     .randomBytes(32)
                     .toString("hex");
 
+
             const tokenHash =
-                crypto
-                    .createHash("sha256")
-                    .update(rawToken)
-                    .digest("hex");
+                hashToken(
+                    rawToken
+                );
+
 
             const expiresAt =
                 Date.now() +
                 RESET_TOKEN_DURATION_MS;
 
-            db.prepare(`
+
+            await pool.query(
+                `
                 INSERT INTO password_resets (
                     user_id,
                     token_hash,
                     expires_at
                 )
-                VALUES (?, ?, ?)
-            `).run(
-                user.id,
-                tokenHash,
-                expiresAt
+                VALUES (
+                    $1,
+                    $2,
+                    $3
+                )
+                `,
+                [
+                    user.id,
+                    tokenHash,
+                    expiresAt
+                ]
             );
+
 
             // -------------------------------------------------
             // SEND EMAIL
@@ -1307,6 +2376,7 @@ router.post(
                     rawToken
                 );
 
+
             } catch (mailError) {
 
                 console.error(
@@ -1314,11 +2384,17 @@ router.post(
                     mailError
                 );
 
-                // Delete unusable token
-                db.prepare(`
+
+                await pool.query(
+                    `
                     DELETE FROM password_resets
-                    WHERE token_hash = ?
-                `).run(tokenHash);
+                    WHERE token_hash = $1
+                    `,
+                    [
+                        tokenHash
+                    ]
+                );
+
 
                 return res.status(200).json({
 
@@ -1328,7 +2404,9 @@ router.post(
                         genericMessage
 
                 });
+
             }
+
 
             return res.status(200).json({
 
@@ -1339,12 +2417,14 @@ router.post(
 
             });
 
+
         } catch (error) {
 
             console.error(
                 "Forgot password error:",
                 error
             );
+
 
             return res.status(500).json({
 
@@ -1354,9 +2434,12 @@ router.post(
                     "Unable to process your password reset request right now."
 
             });
+
         }
+
     }
 );
+
 
 // =========================================================
 // RESET PASSWORD
@@ -1369,20 +2452,30 @@ router.post(
 
         try {
 
+            await waitForAuthDatabase();
+
+
+            const pool =
+                getPool();
+
+
             const token =
                 cleanText(
-                    req.body.token
+                    req.body?.token
                 );
+
 
             const newPassword =
-                cleanText(
-                    req.body.newPassword
+                String(
+                    req.body?.newPassword || ""
                 );
 
+
             const confirmPassword =
-                cleanText(
-                    req.body.confirmPassword
+                String(
+                    req.body?.confirmPassword || ""
                 );
+
 
             if (
                 !token ||
@@ -1398,7 +2491,9 @@ router.post(
                         "Reset token and password are required."
 
                 });
+
             }
+
 
             if (
                 newPassword !==
@@ -1413,7 +2508,9 @@ router.post(
                         "Passwords do not match."
 
                 });
+
             }
+
 
             if (
                 !isStrongPassword(
@@ -1429,27 +2526,37 @@ router.post(
                         "Password must contain at least 8 characters and include letters and numbers."
 
                 });
+
             }
 
-            const tokenHash =
-                crypto
-                    .createHash("sha256")
-                    .update(token)
-                    .digest("hex");
 
-            const resetRecord =
-                db.prepare(`
+            const tokenHash =
+                hashToken(
+                    token
+                );
+
+
+            const result =
+                await pool.query(
+                    `
                     SELECT
                         id,
                         user_id,
                         expires_at,
                         used_at
                     FROM password_resets
-                    WHERE token_hash = ?
+                    WHERE token_hash = $1
                     LIMIT 1
-                `).get(tokenHash);
+                    `,
+                    [
+                        tokenHash
+                    ]
+                );
 
-            if (!resetRecord) {
+
+            if (
+                result.rows.length === 0
+            ) {
 
                 return res.status(400).json({
 
@@ -1459,9 +2566,17 @@ router.post(
                         "This password reset link is invalid or has expired."
 
                 });
+
             }
 
-            if (resetRecord.used_at) {
+
+            const resetRecord =
+                result.rows[0];
+
+
+            if (
+                resetRecord.used_at
+            ) {
 
                 return res.status(400).json({
 
@@ -1471,7 +2586,9 @@ router.post(
                         "This password reset link has already been used."
 
                 });
+
             }
+
 
             if (
                 Date.now() >
@@ -1480,10 +2597,16 @@ router.post(
                 )
             ) {
 
-                db.prepare(`
+                await pool.query(
+                    `
                     DELETE FROM password_resets
-                    WHERE id = ?
-                `).run(resetRecord.id);
+                    WHERE id = $1
+                    `,
+                    [
+                        resetRecord.id
+                    ]
+                );
+
 
                 return res.status(400).json({
 
@@ -1493,7 +2616,9 @@ router.post(
                         "This password reset link has expired. Please request a new one."
 
                 });
+
             }
+
 
             const passwordHash =
                 await bcrypt.hash(
@@ -1501,57 +2626,83 @@ router.post(
                     12
                 );
 
+
             // -------------------------------------------------
             // UPDATE PASSWORD
             // -------------------------------------------------
 
-            const transaction =
-                db.transaction(() => {
+            const client =
+                await pool.connect();
 
-                    db.prepare(`
-                        UPDATE users
-                        SET
-                            password_hash = ?,
-                            updated_at = CURRENT_TIMESTAMP
-                        WHERE id = ?
-                    `).run(
+
+            try {
+
+                await client.query(
+                    "BEGIN"
+                );
+
+
+                await client.query(
+                    `
+                    UPDATE users
+                    SET
+                        password_hash = $1,
+                        updated_at = NOW()
+                    WHERE id = $2
+                    `,
+                    [
                         passwordHash,
                         resetRecord.user_id
-                    );
+                    ]
+                );
 
-                    db.prepare(`
-                        UPDATE password_resets
-                        SET used_at = ?
-                        WHERE id = ?
-                    `).run(
+
+                await client.query(
+                    `
+                    UPDATE password_resets
+                    SET
+                        used_at = $1
+                    WHERE id = $2
+                    `,
+                    [
                         Date.now(),
                         resetRecord.id
-                    );
-                });
+                    ]
+                );
 
-            transaction();
 
-            // -------------------------------------------------
-            // INVALIDATE ALL EXISTING SESSIONS
-            // -------------------------------------------------
+                // Invalidate ALL existing sessions.
+                await client.query(
+                    `
+                    DELETE FROM sessions
+                    WHERE user_id = $1
+                    `,
+                    [
+                        resetRecord.user_id
+                    ]
+                );
 
-            for (
-                const [
-                    sessionToken,
-                    session
-                ] of sessions.entries()
-            ) {
 
-                if (
-                    session.userId ===
-                    resetRecord.user_id
-                ) {
+                await client.query(
+                    "COMMIT"
+                );
 
-                    sessions.delete(
-                        sessionToken
-                    );
-                }
+
+            } catch (transactionError) {
+
+                await client.query(
+                    "ROLLBACK"
+                );
+
+                throw transactionError;
+
+
+            } finally {
+
+                client.release();
+
             }
+
 
             return res.status(200).json({
 
@@ -1562,12 +2713,14 @@ router.post(
 
             });
 
+
         } catch (error) {
 
             console.error(
                 "Reset password error:",
                 error
             );
+
 
             return res.status(500).json({
 
@@ -1577,12 +2730,16 @@ router.post(
                     "Unable to reset your password right now."
 
             });
+
         }
+
     }
 );
 
+
 // =========================================================
 // CHANGE PASSWORD
+// POST /api/auth/change-password
 // =========================================================
 
 router.post(
@@ -1592,15 +2749,24 @@ router.post(
 
         try {
 
+            await waitForAuthDatabase();
+
+
+            const pool =
+                getPool();
+
+
             const currentPassword =
-                cleanText(
-                    req.body.currentPassword
+                String(
+                    req.body?.currentPassword || ""
                 );
 
+
             const newPassword =
-                cleanText(
-                    req.body.newPassword
+                String(
+                    req.body?.newPassword || ""
                 );
+
 
             if (
                 !currentPassword ||
@@ -1615,7 +2781,9 @@ router.post(
                         "Current password and new password are required."
 
                 });
+
             }
+
 
             if (
                 !isStrongPassword(
@@ -1631,19 +2799,29 @@ router.post(
                         "New password must contain at least 8 characters and include letters and numbers."
 
                 });
+
             }
 
-            const user =
-                db.prepare(`
+
+            const result =
+                await pool.query(
+                    `
                     SELECT
                         id,
                         password_hash
                     FROM users
-                    WHERE id = ?
+                    WHERE id = $1
                     LIMIT 1
-                `).get(req.user.id);
+                    `,
+                    [
+                        req.user.id
+                    ]
+                );
 
-            if (!user) {
+
+            if (
+                result.rows.length === 0
+            ) {
 
                 return res.status(404).json({
 
@@ -1653,13 +2831,20 @@ router.post(
                         "User account not found."
 
                 });
+
             }
+
+
+            const user =
+                result.rows[0];
+
 
             const currentMatches =
                 await bcrypt.compare(
                     currentPassword,
                     user.password_hash
                 );
+
 
             if (!currentMatches) {
 
@@ -1671,7 +2856,9 @@ router.post(
                         "Current password is incorrect."
 
                 });
+
             }
+
 
             const newPasswordHash =
                 await bcrypt.hash(
@@ -1679,32 +2866,68 @@ router.post(
                     12
                 );
 
-            db.prepare(`
-                UPDATE users
-                SET
-                    password_hash = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-            `).run(
-                newPasswordHash,
-                req.user.id
-            );
 
-            for (
-                const [
-                    token,
-                    session
-                ] of sessions.entries()
-            ) {
+            // -------------------------------------------------
+            // UPDATE PASSWORD + INVALIDATE SESSIONS
+            // -------------------------------------------------
 
-                if (
-                    session.userId ===
-                    req.user.id
-                ) {
+            const client =
+                await pool.connect();
 
-                    sessions.delete(token);
-                }
+
+            try {
+
+                await client.query(
+                    "BEGIN"
+                );
+
+
+                await client.query(
+                    `
+                    UPDATE users
+                    SET
+                        password_hash = $1,
+                        updated_at = NOW()
+                    WHERE id = $2
+                    `,
+                    [
+                        newPasswordHash,
+                        req.user.id
+                    ]
+                );
+
+
+                await client.query(
+                    `
+                    DELETE FROM sessions
+                    WHERE user_id = $1
+                    `,
+                    [
+                        req.user.id
+                    ]
+                );
+
+
+                await client.query(
+                    "COMMIT"
+                );
+
+
+            } catch (transactionError) {
+
+                await client.query(
+                    "ROLLBACK"
+                );
+
+                throw transactionError;
+
+
+            } finally {
+
+                client.release();
+
             }
+
 
             return res.status(200).json({
 
@@ -1715,12 +2938,14 @@ router.post(
 
             });
 
+
         } catch (error) {
 
             console.error(
                 "Change password error:",
                 error
             );
+
 
             return res.status(500).json({
 
@@ -1730,42 +2955,84 @@ router.post(
                     "Unable to change password right now."
 
             });
+
         }
+
     }
 );
+
 
 // =========================================================
 // CLEAN EXPIRED SESSIONS / RESET TOKENS
 // =========================================================
 
-setInterval(() => {
+setInterval(
+    async () => {
 
-    const now =
-        Date.now();
+        try {
 
-    for (
-        const [
-            token,
-            session
-        ] of sessions.entries()
-    ) {
+            if (!supabasePool) {
 
-        if (
-            now >
-            session.expiresAt
-        ) {
+                return;
 
-            sessions.delete(token);
+            }
+
+
+            await waitForAuthDatabase();
+
+
+            const pool =
+                getPool();
+
+
+            const now =
+                Date.now();
+
+
+            // -------------------------------------------------
+            // EXPIRED SESSIONS
+            // -------------------------------------------------
+
+            await pool.query(
+                `
+                DELETE FROM sessions
+                WHERE expires_at < $1
+                `,
+                [
+                    now
+                ]
+            );
+
+
+            // -------------------------------------------------
+            // EXPIRED / USED PASSWORD RESET TOKENS
+            // -------------------------------------------------
+
+            await pool.query(
+                `
+                DELETE FROM password_resets
+                WHERE expires_at < $1
+                OR used_at IS NOT NULL
+                `,
+                [
+                    now
+                ]
+            );
+
+
+        } catch (error) {
+
+            console.error(
+                "Auth cleanup error:",
+                error
+            );
+
         }
-    }
 
-    db.prepare(`
-        DELETE FROM password_resets
-        WHERE expires_at < ?
-        OR used_at IS NOT NULL
-    `).run(now);
+    },
+    1000 * 60 * 30
+);
 
-}, 1000 * 60 * 30);
 
 // =========================================================
 // EXPORT
@@ -1773,12 +3040,19 @@ setInterval(() => {
 
 module.exports = router;
 
+
 module.exports.requireAuth =
     requireAuth;
+
 
 module.exports.requireAdmin =
     requireAdmin;
 
+
 console.log(
     "U.S TRAVEL & TOURS authentication system initialized."
+);
+
+console.log(
+    "AUTH MODE: SUPABASE / POSTGRESQL"
 );
