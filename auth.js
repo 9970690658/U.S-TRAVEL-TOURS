@@ -11,6 +11,56 @@ const nodemailer = require("nodemailer");
 const { db } = require("./database");
 
 const router = express.Router();
+// =========================================================
+// SUPABASE / POSTGRESQL CONNECTION
+// =========================================================
+
+let supabasePool = null;
+
+if (process.env.DATABASE_URL) {
+
+    supabasePool = new Pool({
+
+        connectionString:
+            process.env.DATABASE_URL,
+
+        ssl: {
+            rejectUnauthorized: false
+        },
+
+        max: 5,
+
+        idleTimeoutMillis:
+            30000,
+
+        connectionTimeoutMillis:
+            10000
+
+    });
+
+    supabasePool.on(
+        "error",
+        (error) => {
+
+            console.error(
+                "Supabase PostgreSQL pool error:",
+                error
+            );
+
+        }
+    );
+
+    console.log(
+        "SUPABASE DATABASE: PostgreSQL connection configured."
+    );
+
+} else {
+
+    console.warn(
+        "SUPABASE DATABASE: DATABASE_URL is not configured."
+    );
+
+}
 
 // =========================================================
 // CONFIGURATION
@@ -724,169 +774,26 @@ router.post(
 
             // -------------------------------------------------
             // FIND USER
-            //
-            // ADMIN:
-            // SQLite
-            //
-            // CUSTOMER:
-            // Supabase PostgreSQL
-            //
-            // IMPORTANT:
-            // We do NOT use SQLite customer accounts here.
-            // This prevents an old SQLite customer record
-            // from blocking the permanent Supabase account.
+            // CASE + SPACE SAFE EMAIL MATCH
             // -------------------------------------------------
 
-            let user = null;
-            let authSource = null;
+            const user =
+                db.prepare(`
+                    SELECT
+                        id,
+                        name,
+                        email,
+                        phone,
+                        password_hash,
+                        role
+                    FROM users
+                    WHERE LOWER(TRIM(email)) = ?
+                    LIMIT 1
+                `).get(email);
 
-            // =================================================
-            // 1. ADMIN LOGIN - SQLITE
-            // =================================================
-
-            try {
-
-                const sqliteUser =
-                    db.prepare(`
-                        SELECT
-                            id,
-                            name,
-                            email,
-                            phone,
-                            password_hash,
-                            role
-                        FROM users
-                        WHERE LOWER(TRIM(email)) = ?
-                        LIMIT 1
-                    `).get(email);
-
-                if (
-                    sqliteUser &&
-                    String(
-                        sqliteUser.role || ""
-                    )
-                        .trim()
-                        .toLowerCase() === "admin"
-                ) {
-
-                    user = sqliteUser;
-                    authSource = "sqlite";
-
-                }
-
-            } catch (error) {
-
-                console.error(
-                    "SQLite admin login lookup error:",
-                    error
-                );
-
-            }
-
-            // =================================================
-            // 2. CUSTOMER LOGIN - SUPABASE
-            // =================================================
-
-            if (
-                !user &&
-                supabasePool
-            ) {
-
-                try {
-
-                    const result =
-                        await supabasePool.query(`
-                            SELECT
-                                id,
-                                name,
-                                email,
-                                phone,
-                                password_hash,
-                                role
-                            FROM users
-                            WHERE LOWER(TRIM(email)) = LOWER(TRIM($1))
-                            LIMIT 1
-                        `, [
-                            email
-                        ]);
-
-                    if (
-                        result.rows &&
-                        result.rows.length > 0
-                    ) {
-
-                        const supabaseUser =
-                            result.rows[0];
-
-                        const normalizedSupabaseRole =
-                            String(
-                                supabaseUser.role || ""
-                            )
-                                .trim()
-                                .toLowerCase();
-
-                        // Only customer accounts
-                        // are taken from Supabase.
-
-                        if (
-                            normalizedSupabaseRole ===
-                            "customer"
-                        ) {
-
-                            user = {
-                                ...supabaseUser,
-                                role:
-                                    normalizedSupabaseRole
-                            };
-
-                            authSource =
-                                "supabase";
-
-                        }
-
-                    }
-
-                } catch (error) {
-
-                    console.error(
-                        "Supabase customer login lookup error:",
-                        error
-                    );
-
-                    return res.status(500).json({
-                        success: false,
-                        message:
-                            "Unable to connect to customer account database."
-                    });
-
-                }
-
-            }
-
-            // =================================================
-            // DATABASE NOT CONFIGURED
-            // =================================================
-
-            if (
-                !user &&
-                !supabasePool
-            ) {
-
-                console.error(
-                    "LOGIN ERROR: Supabase DATABASE_URL is not configured."
-                );
-
-                return res.status(500).json({
-                    success: false,
-                    message:
-                        "Customer login database is not configured."
-                });
-
-            }
-
-            // =================================================
+            // -------------------------------------------------
             // USER NOT FOUND
-            // =================================================
+            // -------------------------------------------------
 
             if (!user) {
 
@@ -903,9 +810,9 @@ router.post(
 
             }
 
-            // =================================================
-            // PASSWORD HASH CHECK
-            // =================================================
+            // -------------------------------------------------
+            // PASSWORD CHECK
+            // -------------------------------------------------
 
             if (
                 !user.password_hash
@@ -915,8 +822,7 @@ router.post(
                     "LOGIN ERROR - PASSWORD HASH MISSING:",
                     {
                         userId: user.id,
-                        email: user.email,
-                        source: authSource
+                        email: user.email
                     }
                 );
 
@@ -928,19 +834,15 @@ router.post(
 
             }
 
-            // =================================================
-            // PASSWORD CHECK
-            // =================================================
-
             const passwordMatches =
                 await bcrypt.compare(
                     password,
                     user.password_hash
                 );
 
-            // =================================================
+            // -------------------------------------------------
             // WRONG PASSWORD
-            // =================================================
+            // -------------------------------------------------
 
             if (!passwordMatches) {
 
@@ -957,9 +859,9 @@ router.post(
 
             }
 
-            // =================================================
+            // -------------------------------------------------
             // NORMALIZE ROLE
-            // =================================================
+            // -------------------------------------------------
 
             const normalizedRole =
                 String(
@@ -968,35 +870,25 @@ router.post(
                     .trim()
                     .toLowerCase();
 
-            // =================================================
+            // -------------------------------------------------
             // CREATE SESSION
-            //
-            // IMPORTANT:
-            // Keep the source so existing authentication
-            // middleware can know where this user came from.
-            // =================================================
+            // -------------------------------------------------
 
             const session =
-                createSession(
-                    {
-                        ...user,
-                        role:
-                            normalizedRole
-                    },
-                    authSource
-                );
+                createSession({
+                    ...user,
+                    role: normalizedRole
+                });
 
-            // =================================================
+            // -------------------------------------------------
             // RESPONSE USER
-            // =================================================
+            // -------------------------------------------------
 
             const responseUser = {
 
-                id:
-                    user.id,
+                id: user.id,
 
-                name:
-                    user.name,
+                name: user.name,
 
                 email:
                     String(
@@ -1005,32 +897,22 @@ router.post(
                         .trim()
                         .toLowerCase(),
 
-                phone:
-                    user.phone,
+                phone: user.phone,
 
-                role:
-                    normalizedRole
+                role: normalizedRole
 
             };
 
-            // =================================================
+            // -------------------------------------------------
             // SUCCESS
-            // =================================================
+            // -------------------------------------------------
 
             console.log(
                 "LOGIN SUCCESS:",
                 {
-                    userId:
-                        user.id,
-
-                    email:
-                        responseUser.email,
-
-                    role:
-                        normalizedRole,
-
-                    source:
-                        authSource
+                    userId: user.id,
+                    email: responseUser.email,
+                    role: normalizedRole
                 }
             );
 
