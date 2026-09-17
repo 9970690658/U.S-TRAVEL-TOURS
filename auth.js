@@ -7,7 +7,7 @@ const express = require("express");
 const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
 const nodemailer = require("nodemailer");
-
+const { Pool } = require("pg");
 const { db } = require("./database");
 
 const router = express.Router();
