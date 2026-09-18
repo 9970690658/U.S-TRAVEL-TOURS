@@ -1,7 +1,8 @@
-// =========================================================
-// U.S TRAVEL & TOURS
-// JOB APPLICATION BACKEND
-// =========================================================
+/* =========================================================
+   U.S TRAVEL & TOURS
+   JOB APPLICATION MODULE
+   PostgreSQL Version
+   ========================================================= */
 
 const express = require("express");
 const path = require("path");
@@ -10,16 +11,25 @@ const crypto = require("crypto");
 const multer = require("multer");
 const nodemailer = require("nodemailer");
 
-const { db } = require("./database");
-const { requireAuth, requireAdmin } = require("./auth");
+const {
+    pool,
+    initializeDatabase
+} = require("./database");
+
+const {
+    requireAuth,
+    requireAdmin
+} = require("./auth");
 
 const router = express.Router();
 
-// =========================================================
-// CONFIG
-// =========================================================
+
+/* =========================================================
+   CONFIGURATION
+========================================================= */
 
 const OWNER_EMAIL =
+    process.env.JOBS_OWNER_EMAIL ||
     process.env.OWNER_EMAIL ||
     "ellisgeorge690@gmail.com";
 
@@ -36,18 +46,15 @@ const RESUME_DIR =
         "job-resumes"
     );
 
-if (!fs.existsSync(RESUME_DIR)) {
-    fs.mkdirSync(
-        RESUME_DIR,
-        {
-            recursive: true
-        }
-    );
-}
+const JOBS_BASE_URL =
+    process.env.APP_BASE_URL ||
+    process.env.FRONTEND_URL ||
+    "http://localhost:3000";
 
-// =========================================================
-// JOB LIST
-// =========================================================
+
+/* =========================================================
+   JOB DIRECTORY
+========================================================= */
 
 const JOBS = {
 
@@ -86,13 +93,15 @@ const JOBS = {
     "retail-worker": {
         title: "Retail Worker"
     }
+
 };
 
-// =========================================================
-// STATUS LABELS
-// =========================================================
 
-const JOB_STATUS_LABELS = {
+/* =========================================================
+   STATUS LABELS
+========================================================= */
+
+const STATUS_LABELS = {
 
     new: "Submitted",
 
@@ -106,224 +115,164 @@ const JOB_STATUS_LABELS = {
 
 };
 
-function getJobStatusLabel(status) {
 
-    return (
-        JOB_STATUS_LABELS[status] ||
-        "Submitted"
+/* =========================================================
+   CREATE RESUME DIRECTORY
+========================================================= */
+
+if (!fs.existsSync(RESUME_DIR)) {
+
+    fs.mkdirSync(
+        RESUME_DIR,
+        {
+            recursive: true
+        }
     );
 
 }
 
-// =========================================================
-// DATABASE MIGRATION
-// =========================================================
-//
-// Adds the fields required for customer-specific
-// job application history without destroying existing data.
-//
 
-try {
+/* =========================================================
+   DATABASE INITIALIZATION
+========================================================= */
 
-    const columns =
-        db.prepare(
-            "PRAGMA table_info(job_applications)"
-        ).all();
+let databaseReady = null;
 
-    const columnNames =
-        columns.map(
-            column => column.name
-        );
+async function ensureDatabase() {
 
-    if (!columnNames.includes("user_id")) {
-
-        db.exec(
-            `
-            ALTER TABLE job_applications
-            ADD COLUMN user_id INTEGER
-            `
-        );
-
-        console.log(
-            "Job applications: user_id column added."
-        );
-
+    if (!databaseReady) {
+        databaseReady =
+            initializeDatabase();
     }
 
-    if (!columnNames.includes("date_of_birth")) {
-
-        db.exec(
-            `
-            ALTER TABLE job_applications
-            ADD COLUMN date_of_birth TEXT
-            `
-        );
-
-    }
-
-    if (!columnNames.includes("country")) {
-
-        db.exec(
-            `
-            ALTER TABLE job_applications
-            ADD COLUMN country TEXT
-            `
-        );
-
-    }
-
-    if (!columnNames.includes("city")) {
-
-        db.exec(
-            `
-            ALTER TABLE job_applications
-            ADD COLUMN city TEXT
-            `
-        );
-
-    }
-
-    if (!columnNames.includes("experience")) {
-
-        db.exec(
-            `
-            ALTER TABLE job_applications
-            ADD COLUMN experience TEXT
-            `
-        );
-
-    }
-
-    if (!columnNames.includes("education")) {
-
-        db.exec(
-            `
-            ALTER TABLE job_applications
-            ADD COLUMN education TEXT
-            `
-        );
-
-    }
-
-    db.exec(
-        `
-        CREATE INDEX IF NOT EXISTS
-        idx_job_applications_user_id
-        ON job_applications(user_id)
-        `
-    );
-
-    console.log(
-        "Job application database migration completed."
-    );
-
-} catch (migrationError) {
-
-    console.error(
-        "Job application database migration error:",
-        migrationError
-    );
-
+    return databaseReady;
 }
 
-// =========================================================
-// EMAIL TRANSPORTER
-// =========================================================
+
+/* =========================================================
+   SMTP CONFIGURATION
+========================================================= */
+
+const SMTP_HOST =
+    process.env.SMTP_HOST ||
+    "smtp-relay.brevo.com";
+
+const SMTP_PORT =
+    Number(
+        process.env.SMTP_PORT || 587
+    );
+
+const SMTP_SECURE =
+    String(
+        process.env.SMTP_SECURE || "false"
+    ).toLowerCase() === "true";
+
+const SMTP_USER =
+    process.env.SMTP_USER ||
+    "";
+
+const SMTP_PASS =
+    process.env.SMTP_PASS ||
+    "";
+
+const MAIL_FROM =
+    process.env.MAIL_FROM ||
+    SMTP_USER ||
+    "noreply@us-travel-tours.com";
+
 
 let transporter = null;
 
-try {
+if (SMTP_USER && SMTP_PASS) {
 
     transporter =
         nodemailer.createTransport({
 
-            host:
-                process.env.SMTP_HOST ||
-                "smtp-relay.brevo.com",
+            host: SMTP_HOST,
 
-            port:
-                Number(
-                    process.env.SMTP_PORT ||
-                    587
-                ),
+            port: SMTP_PORT,
 
-            secure:
-                String(
-                    process.env.SMTP_SECURE ||
-                    "false"
-                ).toLowerCase() === "true",
+            secure: SMTP_SECURE,
 
             auth: {
-
-                user:
-                    process.env.SMTP_USER,
-
-                pass:
-                    process.env.SMTP_PASS
-
+                user: SMTP_USER,
+                pass: SMTP_PASS
             }
 
         });
 
-} catch (error) {
 
-    console.error(
-        "Job email transporter error:",
-        error
+    transporter.verify()
+        .then(() => {
+
+            console.log(
+                "JOBS SMTP READY"
+            );
+
+        })
+        .catch((error) => {
+
+            console.error(
+                "JOBS SMTP VERIFY ERROR:",
+                error.message
+            );
+
+        });
+
+} else {
+
+    console.warn(
+        "JOBS SMTP NOT CONFIGURED - job emails will be skipped."
     );
 
 }
 
-// =========================================================
-// MULTER STORAGE
-// =========================================================
+
+/* =========================================================
+   MULTER
+========================================================= */
 
 const storage =
     multer.diskStorage({
 
-        destination:
-            function (
-                req,
-                file,
-                callback
-            ) {
+        destination: function (
+            req,
+            file,
+            cb
+        ) {
 
-                callback(
-                    null,
-                    RESUME_DIR
-                );
+            cb(
+                null,
+                RESUME_DIR
+            );
 
-            },
+        },
 
-        filename:
-            function (
-                req,
-                file,
-                callback
-            ) {
+        filename: function (
+            req,
+            file,
+            cb
+        ) {
 
-                const randomName =
-                    crypto
-                        .randomBytes(16)
-                        .toString("hex");
+            const extension =
+                path.extname(
+                    file.originalname
+                ).toLowerCase();
 
-                const extension =
-                    path.extname(
-                        file.originalname
-                    ).toLowerCase();
+            const randomName =
+                crypto
+                    .randomBytes(16)
+                    .toString("hex");
 
-                callback(
-                    null,
-                    `${Date.now()}-${randomName}${extension}`
-                );
+            cb(
+                null,
+                `${Date.now()}-${randomName}${extension}`
+            );
 
-            }
+        }
 
     });
 
-// =========================================================
-// MULTER UPLOAD
-// =========================================================
 
 const upload =
     multer({
@@ -331,17 +280,15 @@ const upload =
         storage,
 
         limits: {
-
             fileSize:
                 MAX_RESUME_SIZE
-
         },
 
         fileFilter:
             function (
                 req,
                 file,
-                callback
+                cb
             ) {
 
                 const extension =
@@ -349,21 +296,20 @@ const upload =
                         file.originalname
                     ).toLowerCase();
 
-                const allowedExtensions = [
-
+                const allowed = [
                     ".pdf",
                     ".doc",
                     ".docx"
-
                 ];
 
+
                 if (
-                    !allowedExtensions.includes(
+                    !allowed.includes(
                         extension
                     )
                 ) {
 
-                    return callback(
+                    return cb(
                         new Error(
                             "Only PDF, DOC and DOCX resume files are allowed."
                         )
@@ -371,7 +317,8 @@ const upload =
 
                 }
 
-                callback(
+
+                cb(
                     null,
                     true
                 );
@@ -380,129 +327,134 @@ const upload =
 
     });
 
-// =========================================================
-// HELPERS
-// =========================================================
+
+/* =========================================================
+   HELPERS
+========================================================= */
 
 function cleanText(
     value,
-    maxLength = 500
+    maxLength = 1000
 ) {
 
-    return String(
-        value ?? ""
-    )
+    if (
+        value === undefined ||
+        value === null
+    ) {
+        return "";
+    }
+
+    return String(value)
         .trim()
-        .slice(
-            0,
-            maxLength
-        );
+        .slice(0, maxLength);
 
 }
+
 
 function isValidEmail(email) {
 
-   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-
-}
-
-function cleanHeader(value) {
-
-    return String(
-        value ?? ""
-    )
-        .replace(
-            /[\r\n]/g,
-            ""
-        )
-        .trim();
-
-}
-
-function getUserId(req) {
-
-    return Number(
-        req.user?.id
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(
+        String(email || "").trim()
     );
 
 }
 
-function safeResumePath(filename) {
 
-    if (!filename) {
+function cleanHeader(value) {
+
+    return String(value || "")
+        .replace(/[\r\n]+/g, " ")
+        .trim()
+        .slice(0, 200);
+
+}
+
+
+function getUserId(req) {
+
+    if (
+        req.user &&
+        req.user.id
+    ) {
+        return Number(req.user.id);
+    }
+
+    if (
+        req.user &&
+        req.user.userId
+    ) {
+        return Number(req.user.userId);
+    }
+
+    if (
+        req.user &&
+        req.user.user_id
+    ) {
+        return Number(req.user.user_id);
+    }
+
+    return null;
+
+}
+
+
+function safeResumePath(
+    resumePath
+) {
+
+    if (!resumePath) {
         return null;
     }
 
-    const resumeRoot =
+    const resolved =
+        path.resolve(
+            resumePath
+        );
+
+    const base =
         path.resolve(
             RESUME_DIR
         );
 
-    const safeFilename =
-        path.basename(
-            filename
-        );
-
-    const resumePath =
-        path.resolve(
-            RESUME_DIR,
-            safeFilename
-        );
-
     if (
-        !resumePath.startsWith(
-            resumeRoot +
-            path.sep
+        resolved !== base &&
+        !resolved.startsWith(
+            base + path.sep
         )
     ) {
-
         return null;
-
     }
 
-    return resumePath;
+    return resolved;
 
 }
 
-// =========================================================
-// EMAIL HELPER
-// =========================================================
 
-async function sendEmail(options) {
+/* =========================================================
+   SEND EMAIL
+========================================================= */
 
-    if (
-        !transporter ||
-        !process.env.SMTP_USER ||
-        !process.env.SMTP_PASS
-    ) {
+async function sendEmail(
+    options
+) {
 
-        console.warn(
-            "Email skipped: SMTP configuration is missing."
-        );
-
+    if (!transporter) {
         return false;
-
     }
 
     try {
 
-        await transporter.sendMail({
-
-            from:
-                process.env.MAIL_FROM ||
-                process.env.SMTP_USER,
-
-            ...options
-
-        });
+        await transporter.sendMail(
+            options
+        );
 
         return true;
 
     } catch (error) {
 
         console.error(
-            "Job email sending error:",
-            error
+            "JOB EMAIL ERROR:",
+            error.message
         );
 
         return false;
@@ -511,75 +463,263 @@ async function sendEmail(options) {
 
 }
 
-// =========================================================
-// CREATE JOB APPLICATION
-//
-// POST /api/job-applications
-// POST /api/jobs/
-// =========================================================
+
+/* =========================================================
+   CUSTOMER JOB CONFIRMATION EMAIL
+========================================================= */
+
+async function sendApplicantConfirmation(
+    application
+) {
+
+    if (!transporter) {
+        return false;
+    }
+
+    return sendEmail({
+
+        from: MAIL_FROM,
+
+        to: application.email,
+
+        subject:
+            "Job Application Received - U.S TRAVEL & TOURS",
+
+        html: `
+            <div style="
+                font-family:Arial,sans-serif;
+                line-height:1.6;
+                color:#222;
+            ">
+
+                <h2>
+                    U.S TRAVEL & TOURS
+                </h2>
+
+                <p>
+                    Dear ${escapeHtml(application.full_name)},
+                </p>
+
+                <p>
+                    Your job application has been successfully received.
+                </p>
+
+                <div style="
+                    background:#f5f5f5;
+                    padding:18px;
+                    border-radius:8px;
+                    margin:20px 0;
+                ">
+
+                    <p>
+                        <strong>Application ID:</strong>
+                        ${application.id}
+                    </p>
+
+                    <p>
+                        <strong>Position:</strong>
+                        ${escapeHtml(application.job_title)}
+                    </p>
+
+                    <p>
+                        <strong>Status:</strong>
+                        Submitted
+                    </p>
+
+                </div>
+
+                <p>
+                    Our team will review your application.
+                </p>
+
+                <p>
+                    Regards,<br>
+                    <strong>U.S TRAVEL & TOURS</strong>
+                </p>
+
+            </div>
+        `
+
+    });
+
+}
+
+
+/* =========================================================
+   OWNER JOB EMAIL
+========================================================= */
+
+async function sendOwnerApplicationEmail(
+    application,
+    resumePath
+) {
+
+    if (!transporter) {
+        return false;
+    }
+
+
+    const mailOptions = {
+
+        from: MAIL_FROM,
+
+        to: OWNER_EMAIL,
+
+        replyTo: application.email,
+
+        subject:
+            `New Job Application - ${application.job_title}`,
+
+        html: `
+            <div style="
+                font-family:Arial,sans-serif;
+                line-height:1.6;
+                color:#222;
+            ">
+
+                <h2>
+                    New Job Application
+                </h2>
+
+                <p>
+                    <strong>Application ID:</strong>
+                    ${application.id}
+                </p>
+
+                <p>
+                    <strong>Position:</strong>
+                    ${escapeHtml(application.job_title)}
+                </p>
+
+                <p>
+                    <strong>Name:</strong>
+                    ${escapeHtml(application.full_name)}
+                </p>
+
+                <p>
+                    <strong>Email:</strong>
+                    ${escapeHtml(application.email)}
+                </p>
+
+                <p>
+                    <strong>Phone:</strong>
+                    ${escapeHtml(application.phone)}
+                </p>
+
+                <p>
+                    <strong>Country:</strong>
+                    ${escapeHtml(application.country)}
+                </p>
+
+                <p>
+                    <strong>City:</strong>
+                    ${escapeHtml(application.city)}
+                </p>
+
+                <p>
+                    <strong>Experience:</strong>
+                    ${escapeHtml(application.experience || "Not provided")}
+                </p>
+
+                <p>
+                    <strong>Education:</strong>
+                    ${escapeHtml(application.education || "Not provided")}
+                </p>
+
+                <p>
+                    <strong>Date of Birth:</strong>
+                    ${escapeHtml(application.date_of_birth || "Not provided")}
+                </p>
+
+                <p>
+                    <strong>Status:</strong>
+                    Submitted
+                </p>
+
+            </div>
+        `
+
+    };
+
+
+    const safePath =
+        safeResumePath(
+            resumePath
+        );
+
+
+    if (safePath && fs.existsSync(safePath)) {
+
+        mailOptions.attachments = [
+            {
+                filename:
+                    path.basename(
+                        safePath
+                    ),
+
+                path:
+                    safePath
+            }
+        ];
+
+    }
+
+
+    return sendEmail(
+        mailOptions
+    );
+
+}
+
+
+/* =========================================================
+   HTML ESCAPE
+========================================================= */
+
+function escapeHtml(value) {
+
+    return String(value || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+
+}
+
+
+/* =========================================================
+   CUSTOMER
+   SUBMIT JOB APPLICATION
+========================================================= */
 
 router.post(
     "/",
     requireAuth,
     upload.single("resume"),
-    async function (
-        req,
-        res
-    ) {
-
-        let savedResumePath = null;
+    async (req, res) => {
 
         try {
 
-            // -------------------------------------------------
-            // CUSTOMER ONLY
-            // -------------------------------------------------
+            await ensureDatabase();
 
-            if (
-                !req.user ||
-                req.user.role !== "customer"
-            ) {
-
-                if (req.file) {
-
-                    try {
-
-                        fs.unlinkSync(
-                            req.file.path
-                        );
-
-                    } catch {}
-
-                }
-
-                return res.status(403).json({
-
-                    success: false,
-
-                    message:
-                        "Only customer accounts can submit job applications."
-
-                });
-
-            }
 
             const userId =
                 getUserId(req);
 
+
             if (
-                !Number.isInteger(userId) ||
-                userId <= 0
+                !userId ||
+                !Number.isInteger(userId)
             ) {
 
                 if (req.file) {
 
                     try {
-
                         fs.unlinkSync(
                             req.file.path
                         );
-
-                    } catch {}
+                    } catch (_) {}
 
                 }
 
@@ -588,52 +728,36 @@ router.post(
                     success: false,
 
                     message:
-                        "Authentication is invalid."
+                        "Authentication required."
 
                 });
 
             }
 
-            // -------------------------------------------------
-            // JOB
-            // -------------------------------------------------
 
-            const jobSlug =
+            const jobPosition =
                 cleanText(
-                    req.body.jobPosition,
+                    req.body.jobPosition ||
+                    req.body.job_position ||
+                    req.body.jobSlug,
                     100
                 );
 
-            const job =
-                JOBS[jobSlug];
-
-            if (!job) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Please select a valid job position."
-
-                });
-
-            }
-
-            // -------------------------------------------------
-            // FORM DATA
-            // -------------------------------------------------
 
             const fullName =
                 cleanText(
-                    req.body.fullName,
+                    req.body.fullName ||
+                    req.body.full_name,
                     150
                 );
 
+
             const email =
-                cleanHeader(
-                    req.body.email
-                );
+                cleanText(
+                    req.body.email,
+                    255
+                ).toLowerCase();
+
 
             const phone =
                 cleanText(
@@ -641,11 +765,14 @@ router.post(
                     50
                 );
 
+
             const dateOfBirth =
                 cleanText(
-                    req.body.dateOfBirth,
-                    30
+                    req.body.dateOfBirth ||
+                    req.body.date_of_birth,
+                    50
                 );
+
 
             const country =
                 cleanText(
@@ -653,405 +780,337 @@ router.post(
                     100
                 );
 
+
             const city =
                 cleanText(
                     req.body.city,
                     100
                 );
 
+
             const experience =
                 cleanText(
                     req.body.experience,
-                    100
+                    1000
                 );
+
 
             const education =
                 cleanText(
                     req.body.education,
-                    100
+                    1000
                 );
 
-            const coverLetter =
-                cleanText(
-                    req.body.message,
-                    3000
+
+            const consent =
+                req.body.consent === true ||
+                req.body.consent === "true" ||
+                req.body.consent === 1 ||
+                req.body.consent === "1" ||
+                req.body.consent === "on";
+
+
+            /* -------------------------------------------------
+               VALIDATION
+            ------------------------------------------------- */
+
+            if (
+                !jobPosition ||
+                !JOBS[jobPosition]
+            ) {
+
+                return cleanupAndRespond(
+                    req,
+                    res,
+                    400,
+                    {
+                        success: false,
+                        message:
+                            "Please select a valid job position."
+                    }
                 );
 
-            // -------------------------------------------------
-            // REQUIRED VALIDATION
-            // -------------------------------------------------
+            }
+
 
             if (!fullName) {
 
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Full name is required."
-
-                });
+                return cleanupAndRespond(
+                    req,
+                    res,
+                    400,
+                    {
+                        success: false,
+                        message:
+                            "Please enter your full name."
+                    }
+                );
 
             }
+
 
             if (
                 !email ||
                 !isValidEmail(email)
             ) {
 
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Please enter a valid email address."
-
-                });
+                return cleanupAndRespond(
+                    req,
+                    res,
+                    400,
+                    {
+                        success: false,
+                        message:
+                            "Please enter a valid email address."
+                    }
+                );
 
             }
+
 
             if (!phone) {
 
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Phone number is required."
-
-                });
+                return cleanupAndRespond(
+                    req,
+                    res,
+                    400,
+                    {
+                        success: false,
+                        message:
+                            "Please enter your phone number."
+                    }
+                );
 
             }
+
 
             if (!country) {
 
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Country is required."
-
-                });
+                return cleanupAndRespond(
+                    req,
+                    res,
+                    400,
+                    {
+                        success: false,
+                        message:
+                            "Please enter your country."
+                    }
+                );
 
             }
+
 
             if (!city) {
 
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "City is required."
-
-                });
-
-            }
-
-            if (
-                req.body.applicationConsent !==
-                "on"
-            ) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Please confirm the application consent."
-
-                });
+                return cleanupAndRespond(
+                    req,
+                    res,
+                    400,
+                    {
+                        success: false,
+                        message:
+                            "Please enter your city."
+                    }
+                );
 
             }
 
-            // -------------------------------------------------
-            // RESUME
-            // -------------------------------------------------
+
+            if (!consent) {
+
+                return cleanupAndRespond(
+                    req,
+                    res,
+                    400,
+                    {
+                        success: false,
+                        message:
+                            "Please accept the consent before submitting."
+                    }
+                );
+
+            }
+
 
             if (!req.file) {
 
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Please upload your resume."
-
-                });
+                return cleanupAndRespond(
+                    req,
+                    res,
+                    400,
+                    {
+                        success: false,
+                        message:
+                            "Please upload your resume."
+                    }
+                );
 
             }
 
-            savedResumePath =
-                req.file.path;
 
-            // -------------------------------------------------
-            // USER
-            // -------------------------------------------------
+            /* -------------------------------------------------
+               CHECK USER
+            ------------------------------------------------- */
 
-            const user =
-                db.prepare(
+            const userResult =
+                await pool.query(
                     `
                     SELECT
                         id,
                         name,
                         email,
-                        phone
+                        role
                     FROM users
-                    WHERE id = ?
+                    WHERE id = $1
                     LIMIT 1
-                    `
-                ).get(userId);
+                    `,
+                    [userId]
+                );
 
-            if (!user) {
 
-                if (
-                    savedResumePath &&
-                    fs.existsSync(
-                        savedResumePath
-                    )
-                ) {
+            if (
+                userResult.rows.length === 0
+            ) {
 
-                    fs.unlinkSync(
-                        savedResumePath
-                    );
-
-                }
-
-                return res.status(401).json({
-
-                    success: false,
-
-                    message:
-                        "Customer account not found."
-
-                });
+                return cleanupAndRespond(
+                    req,
+                    res,
+                    404,
+                    {
+                        success: false,
+                        message:
+                            "Your account could not be found."
+                    }
+                );
 
             }
 
-            // -------------------------------------------------
-            // SAVE APPLICATION
-            // -------------------------------------------------
 
-            const insert =
-                db.prepare(
+            /* -------------------------------------------------
+               SAVE APPLICATION
+            ------------------------------------------------- */
+
+            const jobTitle =
+                JOBS[jobPosition].title;
+
+
+            const result =
+                await pool.query(
                     `
-                    INSERT INTO job_applications (
+                    INSERT INTO job_applications
+                    (
                         user_id,
+                        job_slug,
                         job_title,
-                        name,
+                        full_name,
                         email,
                         phone,
-                        resume_file,
-                        cover_letter,
-                        status,
                         date_of_birth,
                         country,
                         city,
                         experience,
-                        education
+                        education,
+                        resume_path,
+                        consent,
+                        status,
+                        created_at,
+                        updated_at
                     )
-                    VALUES (
-                        ?,
-                        ?,
-                        ?,
-                        ?,
-                        ?,
-                        ?,
-                        ?,
+                    VALUES
+                    (
+                        $1,
+                        $2,
+                        $3,
+                        $4,
+                        $5,
+                        $6,
+                        $7,
+                        $8,
+                        $9,
+                        $10,
+                        $11,
+                        $12,
+                        $13,
                         'new',
-                        ?,
-                        ?,
-                        ?,
-                        ?,
-                        ?
+                        CURRENT_TIMESTAMP,
+                        CURRENT_TIMESTAMP
                     )
-                    `
+                    RETURNING *
+                    `,
+                    [
+                        userId,
+                        jobPosition,
+                        jobTitle,
+                        fullName,
+                        email,
+                        phone,
+                        dateOfBirth || null,
+                        country,
+                        city,
+                        experience || null,
+                        education || null,
+                        req.file.path,
+                        consent
+                    ]
                 );
 
-            const result =
-                insert.run(
 
-                    userId,
+            const application =
+                result.rows[0];
 
-                    job.title,
 
-                    fullName,
-
-                    email,
-
-                    phone,
-
-                    path.basename(
-                        savedResumePath
-                    ),
-
-                    coverLetter,
-
-                    dateOfBirth,
-
-                    country,
-
-                    city,
-
-                    experience,
-
-                    education
-
-                );
-
-            const applicationId =
-                Number(
-                    result.lastInsertRowid
-                );
-
-            // -------------------------------------------------
-            // OWNER EMAIL
-            // -------------------------------------------------
-
-            const ownerEmailBody = `
-
-New Job Application
-
-Application ID: #${applicationId}
-
-Job Position:
-${job.title}
-
-Applicant Name:
-${fullName}
-
-Email:
-${email}
-
-Phone:
-${phone}
-
-Date of Birth:
-${dateOfBirth || "Not provided"}
-
-Country:
-${country}
-
-City:
-${city}
-
-Work Experience:
-${experience || "Not provided"}
-
-Education:
-${education || "Not provided"}
-
-Additional Message:
-${coverLetter || "No additional message"}
-
-Application Status:
-Submitted
-
-Submitted:
-${new Date().toLocaleString("en-US")}
-
-`;
+            /* -------------------------------------------------
+               OWNER EMAIL
+            ------------------------------------------------- */
 
             const ownerEmailSent =
-                await sendEmail({
+                await sendOwnerApplicationEmail(
+                    application,
+                    req.file.path
+                );
 
-                    to:
-                        OWNER_EMAIL,
 
-                    replyTo:
-                        email,
+            /* -------------------------------------------------
+               APPLICANT EMAIL
+            ------------------------------------------------- */
 
-                    subject:
-                        `New Job Application #${applicationId} - ${job.title}`,
+            const applicantEmailSent =
+                await sendApplicantConfirmation(
+                    application
+                );
 
-                    text:
-                        ownerEmailBody,
-
-                    attachments: [
-
-                        {
-
-                            filename:
-                                cleanHeader(
-                                    req.file.originalname
-                                ),
-
-                            path:
-                                savedResumePath
-
-                        }
-
-                    ]
-
-                });
-
-            // -------------------------------------------------
-            // APPLICANT CONFIRMATION EMAIL
-            // -------------------------------------------------
-
-            await sendEmail({
-
-                to:
-                    email,
-
-                subject:
-                    `Job Application Received #${applicationId} - U.S TRAVEL & TOURS`,
-
-                text: `
-
-Hello ${fullName},
-
-Your job application has been successfully submitted.
-
-Application ID: #${applicationId}
-
-Job Position:
-${job.title}
-
-Current Status:
-Submitted
-
-Our team will review your application.
-
-You can check your application status from the "My Job Applications" section of your account.
-
-U.S TRAVEL & TOURS
-
-`
-
-            });
-
-            // -------------------------------------------------
-            // RESPONSE
-            // -------------------------------------------------
 
             return res.status(201).json({
 
                 success: true,
 
                 message:
-                    "Job application submitted successfully.",
+                    "Your job application has been submitted successfully.",
 
                 application: {
 
                     id:
-                        applicationId,
+                        application.id,
 
                     jobSlug:
-                        jobSlug,
+                        application.job_slug,
 
                     jobTitle:
-                        job.title,
+                        application.job_title,
 
                     status:
-                        "new",
+                        application.status,
 
                     statusLabel:
-                        "Submitted",
+                        STATUS_LABELS[
+                            application.status
+                        ] ||
+                        application.status,
 
                     emailSent:
-                        ownerEmailSent
+                        applicantEmailSent,
+
+                    ownerEmailSent
 
                 }
 
@@ -1060,112 +1119,131 @@ U.S TRAVEL & TOURS
         } catch (error) {
 
             console.error(
-                "Job application submission error:",
+                "JOB APPLICATION ERROR:",
                 error
             );
 
-            if (
-                savedResumePath &&
-                fs.existsSync(
-                    savedResumePath
-                )
-            ) {
+
+            if (req.file) {
 
                 try {
 
-                    fs.unlinkSync(
-                        savedResumePath
-                    );
+                    if (
+                        fs.existsSync(
+                            req.file.path
+                        )
+                    ) {
 
-                } catch {}
+                        fs.unlinkSync(
+                            req.file.path
+                        );
 
-            }
+                    }
 
-            if (
-                error instanceof
-                multer.MulterError
-            ) {
-
-                if (
-                    error.code ===
-                    "LIMIT_FILE_SIZE"
-                ) {
-
-                    return res.status(400).json({
-
-                        success: false,
-
-                        message:
-                            "Resume file must be 5 MB or smaller."
-
-                    });
-
-                }
+                } catch (_) {}
 
             }
+
 
             return res.status(500).json({
 
                 success: false,
 
                 message:
-                    error?.message ||
-                    "Unable to submit job application."
+                    "Unable to submit your job application right now."
 
             });
 
         }
 
     }
-);  
+);
 
-// =========================================================
-// MY JOB APPLICATIONS
-//
-// GET /api/job-applications/my
-// GET /api/jobs/my
-// =========================================================
 
-router.get( 
-    "/my",
-    requireAuth,
-    function (
-        req,
-        res
-    ) {
+/* =========================================================
+   CLEANUP FILE + RESPONSE
+========================================================= */
+
+function cleanupAndRespond(
+    req,
+    res,
+    statusCode,
+    payload
+) {
+
+    if (req.file) {
 
         try {
 
             if (
-                req.user?.role !==
-                "customer"
+                fs.existsSync(
+                    req.file.path
+                )
             ) {
 
-                return res.status(403).json({
+                fs.unlinkSync(
+                    req.file.path
+                );
+
+            }
+
+        } catch (_) {}
+
+    }
+
+
+    return res
+        .status(statusCode)
+        .json(payload);
+
+}
+
+
+/* =========================================================
+   CUSTOMER
+   MY JOB APPLICATIONS
+========================================================= */
+
+router.get(
+    "/my",
+    requireAuth,
+    async (req, res) => {
+
+        try {
+
+            await ensureDatabase();
+
+            const userId =
+                getUserId(req);
+
+
+            if (
+                !userId ||
+                !Number.isInteger(userId)
+            ) {
+
+                return res.status(401).json({
 
                     success: false,
 
                     message:
-                        "Customer access required."
+                        "Authentication required."
 
                 });
 
             }
 
-            const userId =
-                getUserId(req);
 
-            const applications =
-                db.prepare(
+            const result =
+                await pool.query(
                     `
                     SELECT
                         id,
+                        job_slug,
                         job_title,
-                        name,
+                        full_name,
                         email,
                         phone,
-                        resume_file,
-                        cover_letter,
                         date_of_birth,
                         country,
                         city,
@@ -1175,38 +1253,43 @@ router.get(
                         created_at,
                         updated_at
                     FROM job_applications
-                    WHERE user_id = ?
-                    ORDER BY id DESC
-                    `
-                ).all(userId);
+                    WHERE user_id = $1
+                    ORDER BY
+                        created_at DESC,
+                        id DESC
+                    `,
+                    [userId]
+                );
 
-            const formattedApplications =
-                applications.map(
-                    application => ({
+
+            const applications =
+                result.rows.map(
+                    (application) => ({
 
                         ...application,
 
                         statusLabel:
-                            getJobStatusLabel(
+                            STATUS_LABELS[
                                 application.status
-                            )
+                            ] ||
+                            application.status
 
                     })
                 );
+
 
             return res.json({
 
                 success: true,
 
-                applications:
-                    formattedApplications
+                applications
 
             });
 
         } catch (error) {
 
             console.error(
-                "My job applications error:",
+                "MY JOB APPLICATIONS ERROR:",
                 error
             );
 
@@ -1224,74 +1307,69 @@ router.get(
     }
 );
 
-// =========================================================
-// ADMIN — ALL JOB APPLICATIONS
-//
-// GET /api/jobs/applications
-// =========================================================
+
+/* =========================================================
+   ADMIN
+   GET ALL JOB APPLICATIONS
+========================================================= */
 
 router.get(
     "/applications",
     requireAdmin,
-    function (
-        req,
-        res
-    ) {
+    async (req, res) => {
 
         try {
 
-            const applications =
-                db.prepare(
+            await ensureDatabase();
+
+            const result =
+                await pool.query(
                     `
                     SELECT
-                        id,
-                        user_id,
-                        job_title,
-                        name,
-                        email,
-                        phone,
-                        resume_file,
-                        cover_letter,
-                        date_of_birth,
-                        country,
-                        city,
-                        experience,
-                        education,
-                        status,
-                        created_at,
-                        updated_at
-                    FROM job_applications
-                    ORDER BY id DESC
-                    `
-                ).all();
+                        ja.*,
+                        u.email AS account_email,
+                        u.name AS account_name
 
-            const formattedApplications =
-                applications.map(
-                    application => ({
+                    FROM job_applications ja
+
+                    LEFT JOIN users u
+                        ON u.id = ja.user_id
+
+                    ORDER BY
+                        ja.created_at DESC,
+                        ja.id DESC
+                    `
+                );
+
+
+            const applications =
+                result.rows.map(
+                    (application) => ({
 
                         ...application,
 
                         statusLabel:
-                            getJobStatusLabel(
+                            STATUS_LABELS[
                                 application.status
-                            )
+                            ] ||
+                            application.status
 
                     })
                 );
+
 
             return res.json({
 
                 success: true,
 
-                applications:
-                    formattedApplications
+                applications
 
             });
 
         } catch (error) {
 
             console.error(
-                "Admin job applications error:",
+                "ADMIN JOB APPLICATIONS ERROR:",
                 error
             );
 
@@ -1309,32 +1387,28 @@ router.get(
     }
 );
 
-// =========================================================
-// GET SINGLE JOB APPLICATION
-//
-// GET /api/jobs/applications/:id
-// =========================================================
+
+/* =========================================================
+   AUTH USER / ADMIN
+   GET SINGLE APPLICATION
+========================================================= */
 
 router.get(
     "/applications/:id",
     requireAuth,
-    function (
-        req,
-        res
-    ) {
+    async (req, res) => {
 
         try {
 
-            const applicationId =
-                Number(
-                    req.params.id
-                );
+            await ensureDatabase();
+
+            const id =
+                Number(req.params.id);
+
 
             if (
-                !Number.isInteger(
-                    applicationId
-                ) ||
-                applicationId <= 0
+                !Number.isInteger(id) ||
+                id <= 0
             ) {
 
                 return res.status(400).json({
@@ -1348,33 +1422,31 @@ router.get(
 
             }
 
-            const application =
-                db.prepare(
+
+            const result =
+                await pool.query(
                     `
                     SELECT
-                        id,
-                        user_id,
-                        job_title,
-                        name,
-                        email,
-                        phone,
-                        resume_file,
-                        cover_letter,
-                        date_of_birth,
-                        country,
-                        city,
-                        experience,
-                        education,
-                        status,
-                        created_at,
-                        updated_at
-                    FROM job_applications
-                    WHERE id = ?
-                    LIMIT 1
-                    `
-                ).get(applicationId);
+                        ja.*,
+                        u.email AS account_email,
+                        u.name AS account_name
 
-            if (!application) {
+                    FROM job_applications ja
+
+                    LEFT JOIN users u
+                        ON u.id = ja.user_id
+
+                    WHERE ja.id = $1
+
+                    LIMIT 1
+                    `,
+                    [id]
+                );
+
+
+            if (
+                result.rows.length === 0
+            ) {
 
                 return res.status(404).json({
 
@@ -1387,21 +1459,24 @@ router.get(
 
             }
 
-            const isAdmin =
-                req.user?.role ===
-                "admin";
 
-            const isOwner =
-                Number(
-                    application.user_id
-                ) ===
-                Number(
-                    req.user?.id
-                );
+            const application =
+                result.rows[0];
+
+
+            const userId =
+                getUserId(req);
+
+
+            const isAdmin =
+                req.user &&
+                req.user.role === "admin";
+
 
             if (
                 !isAdmin &&
-                !isOwner
+                Number(application.user_id) !==
+                    Number(userId)
             ) {
 
                 return res.status(403).json({
@@ -1409,11 +1484,12 @@ router.get(
                     success: false,
 
                     message:
-                        "You are not authorized to view this application."
+                        "You are not allowed to view this application."
 
                 });
 
             }
+
 
             return res.json({
 
@@ -1424,9 +1500,10 @@ router.get(
                     ...application,
 
                     statusLabel:
-                        getJobStatusLabel(
+                        STATUS_LABELS[
                             application.status
-                        )
+                        ] ||
+                        application.status
 
                 }
 
@@ -1435,7 +1512,7 @@ router.get(
         } catch (error) {
 
             console.error(
-                "Single job application error:",
+                "GET JOB APPLICATION ERROR:",
                 error
             );
 
@@ -1453,35 +1530,27 @@ router.get(
     }
 );
 
-// =========================================================
-// SECURE RESUME
-//
-// GET /api/jobs/applications/:id/resume
-//
-// Admin can access any resume.
-// Customer can access only their own resume.
-// =========================================================
+
+/* =========================================================
+   RESUME DOWNLOAD
+========================================================= */
 
 router.get(
     "/applications/:id/resume",
     requireAuth,
-    function (
-        req,
-        res
-    ) {
+    async (req, res) => {
 
         try {
 
-            const applicationId =
-                Number(
-                    req.params.id
-                );
+            await ensureDatabase();
+
+            const id =
+                Number(req.params.id);
+
 
             if (
-                !Number.isInteger(
-                    applicationId
-                ) ||
-                applicationId <= 0
+                !Number.isInteger(id) ||
+                id <= 0
             ) {
 
                 return res.status(400).json({
@@ -1495,21 +1564,26 @@ router.get(
 
             }
 
-            const application =
-                db.prepare(
+
+            const result =
+                await pool.query(
                     `
                     SELECT
                         id,
                         user_id,
-                        name,
-                        resume_file
+                        full_name,
+                        resume_path
                     FROM job_applications
-                    WHERE id = ?
+                    WHERE id = $1
                     LIMIT 1
-                    `
-                ).get(applicationId);
+                    `,
+                    [id]
+                );
 
-            if (!application) {
+
+            if (
+                result.rows.length === 0
+            ) {
 
                 return res.status(404).json({
 
@@ -1522,21 +1596,24 @@ router.get(
 
             }
 
-            const isAdmin =
-                req.user?.role ===
-                "admin";
 
-            const isOwner =
-                Number(
-                    application.user_id
-                ) ===
-                Number(
-                    req.user?.id
-                );
+            const application =
+                result.rows[0];
+
+
+            const userId =
+                getUserId(req);
+
+
+            const isAdmin =
+                req.user &&
+                req.user.role === "admin";
+
 
             if (
                 !isAdmin &&
-                !isOwner
+                Number(application.user_id) !==
+                    Number(userId)
             ) {
 
                 return res.status(403).json({
@@ -1544,47 +1621,22 @@ router.get(
                     success: false,
 
                     message:
-                        "You are not authorized to access this resume."
+                        "You are not allowed to access this resume."
 
                 });
 
             }
 
-            if (!application.resume_file) {
 
-                return res.status(404).json({
-
-                    success: false,
-
-                    message:
-                        "Resume not available."
-
-                });
-
-            }
-
-            const resumePath =
+            const safePath =
                 safeResumePath(
-                    application.resume_file
+                    application.resume_path
                 );
 
-            if (!resumePath) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Invalid resume path."
-
-                });
-
-            }
 
             if (
-                !fs.existsSync(
-                    resumePath
-                )
+                !safePath ||
+                !fs.existsSync(safePath)
             ) {
 
                 return res.status(404).json({
@@ -1598,47 +1650,18 @@ router.get(
 
             }
 
+
             return res.download(
-
-                resumePath,
-
+                safePath,
                 path.basename(
-                    application.resume_file
-                ),
-
-                function (
-                    downloadError
-                ) {
-
-                    if (
-                        downloadError &&
-                        !res.headersSent
-                    ) {
-
-                        console.error(
-                            "Resume download callback error:",
-                            downloadError
-                        );
-
-                        return res.status(500).json({
-
-                            success: false,
-
-                            message:
-                                "Unable to download resume."
-
-                        });
-
-                    }
-
-                }
-
+                    safePath
+                )
             );
 
         } catch (error) {
 
             console.error(
-                "Resume download error:",
+                "RESUME DOWNLOAD ERROR:",
                 error
             );
 
@@ -1656,32 +1679,34 @@ router.get(
     }
 );
 
-// =========================================================
-// ADMIN — UPDATE STATUS
-//
-// PATCH /api/jobs/applications/:id/status
-// =========================================================
+
+/* =========================================================
+   ADMIN
+   UPDATE APPLICATION STATUS
+========================================================= */
 
 router.patch(
     "/applications/:id/status",
     requireAdmin,
-    async function (
-        req,
-        res
-    ) {
+    async (req, res) => {
 
         try {
 
-            const applicationId =
-                Number(
-                    req.params.id
+            await ensureDatabase();
+
+            const id =
+                Number(req.params.id);
+
+            const status =
+                cleanText(
+                    req.body.status,
+                    50
                 );
 
+
             if (
-                !Number.isInteger(
-                    applicationId
-                ) ||
-                applicationId <= 0
+                !Number.isInteger(id) ||
+                id <= 0
             ) {
 
                 return res.status(400).json({
@@ -1695,25 +1720,19 @@ router.patch(
 
             }
 
-            const newStatus =
-                cleanText(
-                    req.body.status,
-                    50
-                ).toLowerCase();
 
             const allowedStatuses = [
-
                 "new",
                 "reviewing",
                 "shortlisted",
                 "hired",
                 "rejected"
-
             ];
+
 
             if (
                 !allowedStatuses.includes(
-                    newStatus
+                    status
                 )
             ) {
 
@@ -1728,23 +1747,23 @@ router.patch(
 
             }
 
-            const existing =
-                db.prepare(
+
+            const existingResult =
+                await pool.query(
                     `
                     SELECT
-                        id,
-                        user_id,
-                        name,
-                        email,
-                        job_title,
-                        status
+                        *
                     FROM job_applications
-                    WHERE id = ?
+                    WHERE id = $1
                     LIMIT 1
-                    `
-                ).get(applicationId);
+                    `,
+                    [id]
+                );
 
-            if (!existing) {
+
+            if (
+                existingResult.rows.length === 0
+            ) {
 
                 return res.status(404).json({
 
@@ -1757,98 +1776,148 @@ router.patch(
 
             }
 
-            const oldStatus =
-                existing.status;
 
-            // -------------------------------------------------
-            // UPDATE DATABASE
-            // -------------------------------------------------
+            const existing =
+                existingResult.rows[0];
 
-            db.prepare(
-                `
-                UPDATE job_applications
-                SET
-                    status = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                `
-            ).run(
 
-                newStatus,
+            const updateResult =
+                await pool.query(
+                    `
+                    UPDATE job_applications
 
-                applicationId
+                    SET
+                        status = $1,
+                        updated_at = CURRENT_TIMESTAMP
 
-            );
+                    WHERE id = $2
 
-            const statusLabel =
-                getJobStatusLabel(
-                    newStatus
+                    RETURNING *
+                    `,
+                    [
+                        status,
+                        id
+                    ]
                 );
 
-            // -------------------------------------------------
-            // STATUS EMAIL TO APPLICANT
-            // -------------------------------------------------
+
+            const application =
+                updateResult.rows[0];
+
+
+            /* -------------------------------------------------
+               SEND STATUS EMAIL
+            ------------------------------------------------- */
+
+            let emailSent = false;
+
 
             if (
+                existing.status !== status &&
                 existing.email &&
-                newStatus !== oldStatus
+                transporter
             ) {
 
-                await sendEmail({
+                emailSent =
+                    await sendEmail({
 
-                    to:
-                        existing.email,
+                        from: MAIL_FROM,
 
-                    subject:
-                        `Job Application Update #${applicationId} - ${statusLabel}`,
+                        to: existing.email,
 
-                    text: `
+                        subject:
+                            `Job Application Status Update - ${existing.job_title}`,
 
-Hello ${existing.name},
+                        html: `
+                            <div style="
+                                font-family:Arial,sans-serif;
+                                line-height:1.6;
+                                color:#222;
+                            ">
 
-There is an update to your job application.
+                                <h2>
+                                    U.S TRAVEL & TOURS
+                                </h2>
 
-Application ID:
-#${applicationId}
+                                <p>
+                                    Dear ${escapeHtml(existing.full_name)},
+                                </p>
 
-Job Position:
-${existing.job_title}
+                                <p>
+                                    Your job application status has been updated.
+                                </p>
 
-Previous Status:
-${getJobStatusLabel(oldStatus)}
+                                <div style="
+                                    background:#f5f5f5;
+                                    padding:18px;
+                                    border-radius:8px;
+                                    margin:20px 0;
+                                ">
 
-Current Status:
-${statusLabel}
+                                    <p>
+                                        <strong>Application ID:</strong>
+                                        ${existing.id}
+                                    </p>
 
-Please log in to your U.S TRAVEL & TOURS account to view your latest application status.
+                                    <p>
+                                        <strong>Position:</strong>
+                                        ${escapeHtml(existing.job_title)}
+                                    </p>
 
-U.S TRAVEL & TOURS
+                                    <p>
+                                        <strong>New Status:</strong>
+                                        ${escapeHtml(
+                                            STATUS_LABELS[status] ||
+                                            status
+                                        )}
+                                    </p>
 
-`
+                                </div>
 
-                });
+                                <p>
+                                    Thank you for your interest in U.S TRAVEL & TOURS.
+                                </p>
+
+                                <p>
+                                    Regards,<br>
+                                    <strong>U.S TRAVEL & TOURS</strong>
+                                </p>
+
+                            </div>
+                        `
+
+                    });
 
             }
+
 
             return res.json({
 
                 success: true,
 
                 message:
-                    `Job application status updated to ${statusLabel}.`,
+                    "Job application status updated successfully.",
 
-                status:
-                    newStatus,
+                application: {
 
-                statusLabel:
-                    statusLabel
+                    ...application,
+
+                    statusLabel:
+                        STATUS_LABELS[
+                            application.status
+                        ] ||
+                        application.status,
+
+                    emailSent
+
+                }
 
             });
 
         } catch (error) {
 
             console.error(
-                "Job application status error:",
+                "UPDATE JOB STATUS ERROR:",
                 error
             );
 
@@ -1866,32 +1935,28 @@ U.S TRAVEL & TOURS
     }
 );
 
-// =========================================================
-// ADMIN — DELETE APPLICATION
-//
-// DELETE /api/jobs/applications/:id
-// =========================================================
+
+/* =========================================================
+   ADMIN
+   DELETE APPLICATION
+========================================================= */
 
 router.delete(
     "/applications/:id",
     requireAdmin,
-    function (
-        req,
-        res
-    ) {
+    async (req, res) => {
 
         try {
 
-            const applicationId =
-                Number(
-                    req.params.id
-                );
+            await ensureDatabase();
+
+            const id =
+                Number(req.params.id);
+
 
             if (
-                !Number.isInteger(
-                    applicationId
-                ) ||
-                applicationId <= 0
+                !Number.isInteger(id) ||
+                id <= 0
             ) {
 
                 return res.status(400).json({
@@ -1905,18 +1970,23 @@ router.delete(
 
             }
 
-            const application =
-                db.prepare(
-                    `
-                    SELECT
-                        resume_file
-                    FROM job_applications
-                    WHERE id = ?
-                    LIMIT 1
-                    `
-                ).get(applicationId);
 
-            if (!application) {
+            const result =
+                await pool.query(
+                    `
+                    DELETE FROM job_applications
+                    WHERE id = $1
+                    RETURNING
+                        id,
+                        resume_path
+                    `,
+                    [id]
+                );
+
+
+            if (
+                result.rows.length === 0
+            ) {
 
                 return res.status(404).json({
 
@@ -1929,63 +1999,56 @@ router.delete(
 
             }
 
-            db.prepare(
-                `
-                DELETE FROM job_applications
-                WHERE id = ?
-                `
-            ).run(applicationId);
+
+            const deleted =
+                result.rows[0];
+
+
+            const safePath =
+                safeResumePath(
+                    deleted.resume_path
+                );
+
 
             if (
-                application.resume_file
+                safePath &&
+                fs.existsSync(safePath)
             ) {
 
-                const resumePath =
-                    safeResumePath(
-                        application.resume_file
+                try {
+
+                    fs.unlinkSync(
+                        safePath
                     );
 
-                if (
-                    resumePath &&
-                    fs.existsSync(
-                        resumePath
-                    )
-                ) {
+                } catch (fileError) {
 
-                    try {
-
-                        fs.unlinkSync(
-                            resumePath
-                        );
-
-                    } catch (
-                        deleteError
-                    ) {
-
-                        console.error(
-                            "Resume delete error:",
-                            deleteError
-                        );
-
-                    }
+                    console.error(
+                        "RESUME DELETE ERROR:",
+                        fileError.message
+                    );
 
                 }
 
             }
+
 
             return res.json({
 
                 success: true,
 
                 message:
-                    "Job application deleted successfully."
+                    "Job application deleted successfully.",
+
+                applicationId:
+                    deleted.id
 
             });
 
         } catch (error) {
 
             console.error(
-                "Delete job application error:",
+                "DELETE JOB APPLICATION ERROR:",
                 error
             );
 
@@ -2003,9 +2066,10 @@ router.delete(
     }
 );
 
-// =========================================================
-// MULTER ERROR HANDLER
-// =========================================================
+
+/* =========================================================
+   MULTER ERROR HANDLER
+========================================================= */
 
 router.use(
     function (
@@ -2016,8 +2080,7 @@ router.use(
     ) {
 
         if (
-            error instanceof
-            multer.MulterError
+            error instanceof multer.MulterError
         ) {
 
             if (
@@ -2030,31 +2093,50 @@ router.use(
                     success: false,
 
                     message:
-                        "Resume file must be 5 MB or smaller."
+                        "Resume file is too large. Maximum size is 5 MB."
 
                 });
 
             }
 
-        }
-
-        if (error) {
 
             return res.status(400).json({
 
                 success: false,
 
                 message:
-                    error.message ||
-                    "Unable to process uploaded resume."
+                    error.message
 
             });
 
         }
 
-        next();
+
+        if (
+            error &&
+            error.message
+        ) {
+
+            return res.status(400).json({
+
+                success: false,
+
+                message:
+                    error.message
+
+            });
+
+        }
+
+
+        next(error);
 
     }
 );
+
+
+/* =========================================================
+   EXPORT
+========================================================= */
 
 module.exports = router;
