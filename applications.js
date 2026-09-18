@@ -1,112 +1,68 @@
-const express = require("express");
-const router = express.Router();
+// =========================================================
+// U.S TRAVEL & TOURS
+// APPLICATION BACKEND
+// MongoDB Version
+// =========================================================
 
-const { db } = require("./database");
+const express = require("express");
+
+const {
+    getDatabase,
+    getNextSequence
+} = require("./database");
 
 const {
     requireAuth,
     requireAdmin
 } = require("./auth");
 
+const router = express.Router();
 
 // =========================================================
-// U.S TRAVEL & TOURS
-// APPLICATIONS BACKEND
-//
-// CUSTOMER:
-// 1. Create application
-// 2. View own application
-//
-// ADMIN:
-// 1. View all applications
-// 2. View any application
-// 3. Update application status
-// 4. Delete application
-//
-// Application flow:
-//
-// application submitted
-//        ↓
-// payment_pending
-//        ↓
-// payment_submitted
-//        ↓
-// under_review
-//        ↓
-// approved / rejected / completed
+// HELPERS
 // =========================================================
 
+function getValue(
+    object,
+    paths
+) {
 
-// =========================================================
-// DATABASE COMPATIBILITY
-// =========================================================
-//
-// Older database versions may not have user_id in
-// applications table.
-//
-// This automatically adds user_id if missing.
-//
-// This allows existing database.db to continue working.
-// =========================================================
+    if (!object) {
 
-try {
+        return "";
 
-    const columns = db.prepare(
-        `PRAGMA table_info(applications)`
-    ).all();
-
-    const hasUserId = columns.some(
-        column => column.name === "user_id"
-    );
-
-    if (!hasUserId) {
-
-        db.prepare(`
-            ALTER TABLE applications
-            ADD COLUMN user_id INTEGER
-        `).run();
-
-        console.log(
-            "Applications table updated: user_id column added."
-        );
     }
 
-} catch (error) {
+    for (
+        const path of paths
+    ) {
 
-    console.error(
-        "Applications database migration error:",
-        error
-    );
+        const parts =
+            String(path)
+                .split(".");
 
-}
+        let value =
+            object;
 
-
-// =========================================================
-// HELPER FUNCTIONS
-// =========================================================
-
-function getValue(data, paths = []) {
-
-    for (const path of paths) {
-
-        const parts = path.split(".");
-
-        let value = data;
-
-        for (const part of parts) {
+        for (
+            const part of parts
+        ) {
 
             if (
-                value === undefined ||
                 value === null ||
-                typeof value !== "object"
+                value === undefined
             ) {
 
-                value = undefined;
+                value =
+                    undefined;
 
                 break;
+
             }
 
-            value = value[part];
+            value =
+                value[part];
+
         }
 
         if (
@@ -116,52 +72,133 @@ function getValue(data, paths = []) {
         ) {
 
             return value;
+
         }
+
     }
 
-    return null;
+    return "";
+
 }
 
+function cleanString(
+    value,
+    maxLength = 500
+) {
 
-// =========================================================
-// CLEAN STRING
-// =========================================================
+    return String(
+        value ?? ""
+    )
+        .trim()
+        .slice(
+            0,
+            maxLength
+        );
 
-function cleanString(value) {
+}
+
+function parseApplicationData(
+    application
+) {
+
+    if (!application) {
+
+        return null;
+
+    }
+
+    let data =
+        application.application_data;
 
     if (
-        value === undefined ||
-        value === null
+        typeof data ===
+        "string"
     ) {
 
-        return "";
+        try {
+
+            data =
+                JSON.parse(
+                    data
+                );
+
+        } catch {
+
+            data = {};
+
+        }
+
     }
 
-    return String(value).trim();
+    if (
+        !data ||
+        typeof data !==
+            "object"
+    ) {
+
+        data = {};
+
+    }
+
+    return data;
+
 }
 
+function formatApplication(
+    application
+) {
+
+    const data =
+        parseApplicationData(
+            application
+        );
+
+    return {
+
+        id:
+            Number(
+                application.id
+            ),
+
+        data:
+            data,
+
+        status:
+            application.status,
+
+        createdAt:
+            application.created_at,
+
+        updatedAt:
+            application.updated_at
+
+    };
+
+}
 
 // =========================================================
 // CREATE APPLICATION
-// POST /api/applications
 //
-// CUSTOMER ONLY
+// POST /api/applications
 // =========================================================
 
 router.post(
     "/",
     requireAuth,
-    (req, res) => {
+    async function (
+        req,
+        res
+    ) {
 
         try {
 
             // -------------------------------------------------
-            // CUSTOMER ROLE CHECK
+            // CUSTOMER ONLY
             // -------------------------------------------------
 
             if (
-                !req.user ||
-                req.user.role !== "customer"
+                req.user?.role !==
+                "customer"
             ) {
 
                 return res.status(403).json({
@@ -175,176 +212,231 @@ router.post(
 
             }
 
-
-            // -------------------------------------------------
-            // REQUEST DATA
-            // -------------------------------------------------
-
-            const applicationData = req.body;
-
-
-            // -------------------------------------------------
-            // BASIC REQUEST VALIDATION
-            // -------------------------------------------------
+            const userId =
+                Number(
+                    req.user.id
+                );
 
             if (
-                !applicationData ||
-                typeof applicationData !== "object" ||
-                Array.isArray(applicationData)
+                !Number.isInteger(
+                    userId
+                ) ||
+                userId <= 0
             ) {
+
+                return res.status(401).json({
+
+                    success: false,
+
+                    message:
+                        "Authentication is invalid."
+
+                });
+
+            }
+
+            // -------------------------------------------------
+            // APPLICATION DATA
+            // -------------------------------------------------
+
+            let applicationData =
+                req.body;
+
+            if (
+                applicationData &&
+                typeof applicationData ===
+                    "object" &&
+                !Array.isArray(
+                    applicationData
+                )
+            ) {
+
+                applicationData =
+                    {
+                        ...applicationData
+                    };
+
+            } else {
+
+                applicationData =
+                    {};
+
+            }
+
+            // -------------------------------------------------
+            // VALIDATION
+            // -------------------------------------------------
+
+            const passportNumber =
+                cleanString(
+                    getValue(
+                        applicationData,
+                        [
+                            "passportNumber",
+                            "passport_number",
+                            "passport.number",
+                            "passportNo"
+                        ]
+                    ),
+                    100
+                );
+
+            const surname =
+                cleanString(
+                    getValue(
+                        applicationData,
+                        [
+                            "surname",
+                            "lastName",
+                            "last_name",
+                            "familyName"
+                        ]
+                    ),
+                    150
+                );
+
+            const firstMiddleName =
+                cleanString(
+                    getValue(
+                        applicationData,
+                        [
+                            "firstMiddleName",
+                            "firstMiddle",
+                            "firstName",
+                            "first_name",
+                            "givenName"
+                        ]
+                    ),
+                    200
+                );
+
+            const dateOfBirth =
+                cleanString(
+                    getValue(
+                        applicationData,
+                        [
+                            "dateOfBirth",
+                            "date_of_birth",
+                            "dob"
+                        ]
+                    ),
+                    50
+                );
+
+            const nationality =
+                cleanString(
+                    getValue(
+                        applicationData,
+                        [
+                            "nationality",
+                            "country",
+                            "citizenship"
+                        ]
+                    ),
+                    100
+                );
+
+            if (!passportNumber) {
 
                 return res.status(400).json({
 
                     success: false,
 
                     message:
-                        "Application data is required."
+                        "Passport number is required."
 
                 });
 
             }
 
+            if (!surname) {
 
-            // -------------------------------------------------
-            // SUPPORT BOTH FORMATS
-            // -------------------------------------------------
+                return res.status(400).json({
 
-            const passportNumber = cleanString(
+                    success: false,
 
-                getValue(
-                    applicationData,
-                    [
-                        "passportNumber",
-                        "passportInformation.passportNumber"
-                    ]
-                )
+                    message:
+                        "Surname is required."
 
-            );
+                });
 
-
-            const surname = cleanString(
-
-                getValue(
-                    applicationData,
-                    [
-                        "surname",
-                        "nameInformation.surname"
-                    ]
-                )
-
-            );
-
-
-            const firstMiddleName = cleanString(
-
-                getValue(
-                    applicationData,
-                    [
-                        "firstMiddleName",
-                        "nameInformation.firstMiddleName"
-                    ]
-                )
-
-            );
-
-
-            const dateOfBirth = cleanString(
-
-                getValue(
-                    applicationData,
-                    [
-                        "dateOfBirth",
-                        "personalInformation.dateOfBirth"
-                    ]
-                )
-
-            );
-
-
-            const nationality = cleanString(
-
-                getValue(
-                    applicationData,
-                    [
-                        "nationality",
-                        "personalInformation.nationality"
-                    ]
-                )
-
-            );
-
-
-            // -------------------------------------------------
-            // REQUIRED FIELD VALIDATION
-            // -------------------------------------------------
-
-            const requiredFields = [
-
-                {
-                    name: "passportNumber",
-                    value: passportNumber
-                },
-
-                {
-                    name: "surname",
-                    value: surname
-                },
-
-                {
-                    name: "firstMiddleName",
-                    value: firstMiddleName
-                },
-
-                {
-                    name: "dateOfBirth",
-                    value: dateOfBirth
-                },
-
-                {
-                    name: "nationality",
-                    value: nationality
-                }
-
-            ];
-
-
-            for (
-                const field of requiredFields
-            ) {
-
-                if (!field.value) {
-
-                    return res.status(400).json({
-
-                        success: false,
-
-                        message:
-                            `Please provide ${field.name}.`
-
-                    });
-
-                }
             }
 
+            if (!firstMiddleName) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "First and middle name is required."
+
+                });
+
+            }
+
+            if (!dateOfBirth) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "Date of birth is required."
+
+                });
+
+            }
+
+            if (!nationality) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "Nationality is required."
+
+                });
+
+            }
 
             // -------------------------------------------------
-            // REQUEST SIZE PROTECTION
+            // SIZE PROTECTION
             // -------------------------------------------------
 
-            const applicationJSON =
-                JSON.stringify(
-                    applicationData
-                );
+            let serializedData;
 
+            try {
+
+                serializedData =
+                    JSON.stringify(
+                        applicationData
+                    );
+
+            } catch {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "Invalid application data."
+
+                });
+
+            }
 
             if (
                 Buffer.byteLength(
-                    applicationJSON,
+                    serializedData,
                     "utf8"
-                ) > 1024 * 1024
+                ) >
+                1024 *
+                1024
             ) {
 
-                return res.status(413).json({
+                return res.status(400).json({
 
                     success: false,
 
@@ -355,78 +447,75 @@ router.post(
 
             }
 
-
             // -------------------------------------------------
-            // LOGGED-IN CUSTOMER ID
+            // VERIFY USER EXISTS
             // -------------------------------------------------
 
-            const userId =
-                Number(req.user.id);
+            const db =
+                getDatabase();
 
+            const user =
+                await db
+                    .collection("users")
+                    .findOne({
 
-            if (
-                !Number.isInteger(userId) ||
-                userId <= 0
-            ) {
+                        id:
+                            userId
+
+                    });
+
+            if (!user) {
 
                 return res.status(401).json({
 
                     success: false,
 
                     message:
-                        "Invalid customer authentication."
+                        "Customer account not found."
 
                 });
 
             }
 
+            // -------------------------------------------------
+            // CREATE NUMERIC APPLICATION ID
+            // -------------------------------------------------
+
+            const applicationId =
+                await getNextSequence(
+                    "applications"
+                );
+
+            const now =
+                new Date();
 
             // -------------------------------------------------
             // SAVE APPLICATION
-            //
-            // Application starts as payment_pending.
-            //
-            // It is linked to the logged-in customer.
             // -------------------------------------------------
 
-            const insert = db.prepare(`
+            await db
+                .collection("applications")
+                .insertOne({
 
-                INSERT INTO applications (
-                    user_id,
-                    application_data,
-                    status
-                )
+                    id:
+                        applicationId,
 
-                VALUES (?, ?, ?)
+                    user_id:
+                        userId,
 
-            `);
+                    application_data:
+                        serializedData,
 
+                    status:
+                        "payment_pending",
 
-            const result = insert.run(
+                    created_at:
+                        now,
 
-                userId,
+                    updated_at:
+                        now
 
-                applicationJSON,
-
-                "payment_pending"
-
-            );
-
-
-            const applicationId =
-                Number(
-                    result.lastInsertRowid
-                );
-
-
-            console.log(
-
-                `New application received. ` +
-                `Application ID: ${applicationId}. ` +
-                `Customer ID: ${userId}`
-
-            );
-
+                });
 
             // -------------------------------------------------
             // RESPONSE
@@ -437,7 +526,7 @@ router.post(
                 success: true,
 
                 message:
-                    "Application submitted successfully. Please proceed with payment.",
+                    "Application submitted successfully.",
 
                 applicationId:
                     applicationId,
@@ -447,7 +536,6 @@ router.post(
 
             });
 
-
         } catch (error) {
 
             console.error(
@@ -455,13 +543,12 @@ router.post(
                 error
             );
 
-
             return res.status(500).json({
 
                 success: false,
 
                 message:
-                    "Unable to save application. Please try again."
+                    "Unable to submit application."
 
             });
 
@@ -470,22 +557,19 @@ router.post(
     }
 );
 
-
 // =========================================================
 // GET SINGLE APPLICATION
+//
 // GET /api/applications/:id
-//
-// CUSTOMER:
-// Own application only
-//
-// ADMIN:
-// Any application
 // =========================================================
 
 router.get(
     "/:id",
     requireAuth,
-    (req, res) => {
+    async function (
+        req,
+        res
+    ) {
 
         try {
 
@@ -494,13 +578,10 @@ router.get(
                     req.params.id
                 );
 
-
-            // -------------------------------------------------
-            // VALIDATE ID
-            // -------------------------------------------------
-
             if (
-                !Number.isInteger(applicationId) ||
+                !Number.isInteger(
+                    applicationId
+                ) ||
                 applicationId <= 0
             ) {
 
@@ -515,34 +596,18 @@ router.get(
 
             }
 
-
-            // -------------------------------------------------
-            // GET APPLICATION
-            // -------------------------------------------------
+            const db =
+                getDatabase();
 
             const application =
-                db.prepare(`
+                await db
+                    .collection("applications")
+                    .findOne({
 
-                    SELECT
-                        id,
-                        user_id,
-                        application_data,
-                        status,
-                        created_at,
-                        updated_at
+                        id:
+                            applicationId
 
-                    FROM applications
-
-                    WHERE id = ?
-
-                `).get(
-                    applicationId
-                );
-
-
-            // -------------------------------------------------
-            // NOT FOUND
-            // -------------------------------------------------
+                    });
 
             if (!application) {
 
@@ -557,28 +622,25 @@ router.get(
 
             }
 
-
             // -------------------------------------------------
-            // CUSTOMER OWNERSHIP CHECK
+            // CUSTOMER OWNERSHIP
             // -------------------------------------------------
 
             if (
-                req.user.role !== "admin"
+                req.user.role !==
+                "admin"
             ) {
 
-                const loggedInUserId =
-                    Number(req.user.id);
-
-                const applicationUserId =
-                    Number(application.user_id);
-
+                const userId =
+                    Number(
+                        req.user.id
+                    );
 
                 if (
-                    !Number.isInteger(
-                        loggedInUserId
-                    ) ||
-                    loggedInUserId !==
-                        applicationUserId
+                    Number(
+                        application.user_id
+                    ) !==
+                    userId
                 ) {
 
                     return res.status(403).json({
@@ -594,66 +656,16 @@ router.get(
 
             }
 
-
-            // -------------------------------------------------
-            // PARSE APPLICATION DATA
-            // -------------------------------------------------
-
-            let parsedData = {};
-
-
-            try {
-
-                parsedData =
-                    JSON.parse(
-                        application.application_data
-                    );
-
-            } catch (error) {
-
-                console.error(
-
-                    `Application JSON parse error ` +
-                    `for application ${application.id}:`,
-
-                    error
-
-                );
-
-                parsedData = {};
-
-            }
-
-
-            // -------------------------------------------------
-            // RESPONSE
-            // -------------------------------------------------
-
             return res.json({
 
                 success: true,
 
-                application: {
-
-                    id:
-                        application.id,
-
-                    data:
-                        parsedData,
-
-                    status:
-                        application.status,
-
-                    createdAt:
-                        application.created_at,
-
-                    updatedAt:
-                        application.updated_at
-
-                }
+                application:
+                    formatApplication(
+                        application
+                    )
 
             });
-
 
         } catch (error) {
 
@@ -662,13 +674,12 @@ router.get(
                 error
             );
 
-
             return res.status(500).json({
 
                 success: false,
 
                 message:
-                    "Unable to retrieve application."
+                    "Unable to load application."
 
             });
 
@@ -677,122 +688,59 @@ router.get(
     }
 );
 
-
 // =========================================================
 // GET ALL APPLICATIONS
-// GET /api/applications
 //
+// GET /api/applications
 // ADMIN ONLY
 // =========================================================
 
 router.get(
     "/",
     requireAdmin,
-    (req, res) => {
+    async function (
+        req,
+        res
+    ) {
 
         try {
 
+            const db =
+                getDatabase();
+
             const applications =
-                db.prepare(`
-
-                    SELECT
-                        id,
-                        user_id,
-                        application_data,
-                        status,
-                        created_at,
-                        updated_at
-
-                    FROM applications
-
-                    ORDER BY created_at DESC
-
-                `).all();
-
-
-            const formattedApplications =
-                applications.map(
-                    (application) => {
-
-                        let parsedData = {};
-
-
-                        try {
-
-                            parsedData =
-                                JSON.parse(
-                                    application.application_data
-                                );
-
-                        } catch (error) {
-
-                            console.error(
-
-                                `Unable to parse application ` +
-                                `${application.id}:`,
-
-                                error
-
-                            );
-
-                            parsedData = {};
-
-                        }
-
-
-                        return {
-
-                            id:
-                                application.id,
-
-                            userId:
-                                application.user_id,
-
-                            data:
-                                parsedData,
-
-                            status:
-                                application.status,
-
-                            createdAt:
-                                application.created_at,
-
-                            updatedAt:
-                                application.updated_at
-
-                        };
-
-                    }
-                );
-
+                await db
+                    .collection("applications")
+                    .find({})
+                    .sort({
+                        id: -1
+                    })
+                    .toArray();
 
             return res.json({
 
                 success: true,
 
-                count:
-                    formattedApplications.length,
-
                 applications:
-                    formattedApplications
+                    applications.map(
+                        formatApplication
+                    )
 
             });
-
 
         } catch (error) {
 
             console.error(
-                "Get applications error:",
+                "Admin applications error:",
                 error
             );
-
 
             return res.status(500).json({
 
                 success: false,
 
                 message:
-                    "Unable to retrieve applications."
+                    "Unable to load applications."
 
             });
 
@@ -801,18 +749,20 @@ router.get(
     }
 );
 
-
 // =========================================================
 // UPDATE APPLICATION STATUS
-// PATCH /api/applications/:id/status
 //
+// PATCH /api/applications/:id/status
 // ADMIN ONLY
 // =========================================================
 
 router.patch(
     "/:id/status",
     requireAdmin,
-    (req, res) => {
+    async function (
+        req,
+        res
+    ) {
 
         try {
 
@@ -821,16 +771,29 @@ router.patch(
                     req.params.id
                 );
 
+            if (
+                !Number.isInteger(
+                    applicationId
+                ) ||
+                applicationId <= 0
+            ) {
 
-            const status =
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "Invalid application ID."
+
+                });
+
+            }
+
+            const newStatus =
                 cleanString(
-                    req.body?.status
-                );
-
-
-            // -------------------------------------------------
-            // ALLOWED STATUSES
-            // -------------------------------------------------
+                    req.body.status,
+                    50
+                ).toLowerCase();
 
             const allowedStatuses = [
 
@@ -850,37 +813,9 @@ router.patch(
 
             ];
 
-
-            // -------------------------------------------------
-            // VALIDATE ID
-            // -------------------------------------------------
-
-            if (
-                !Number.isInteger(
-                    applicationId
-                ) ||
-                applicationId <= 0
-            ) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Invalid application ID."
-
-                });
-
-            }
-
-
-            // -------------------------------------------------
-            // VALIDATE STATUS
-            // -------------------------------------------------
-
             if (
                 !allowedStatuses.includes(
-                    status
+                    newStatus
                 )
             ) {
 
@@ -895,28 +830,20 @@ router.patch(
 
             }
 
+            const db =
+                getDatabase();
 
-            // -------------------------------------------------
-            // CHECK APPLICATION
-            // -------------------------------------------------
+            const existing =
+                await db
+                    .collection("applications")
+                    .findOne({
 
-            const existingApplication =
-                db.prepare(`
+                        id:
+                            applicationId
 
-                    SELECT
-                        id,
-                        status
+                    });
 
-                    FROM applications
-
-                    WHERE id = ?
-
-                `).get(
-                    applicationId
-                );
-
-
-            if (!existingApplication) {
+            if (!existing) {
 
                 return res.status(404).json({
 
@@ -929,84 +856,54 @@ router.patch(
 
             }
 
+            const updatedAt =
+                new Date();
 
-            // -------------------------------------------------
-            // UPDATE
-            // -------------------------------------------------
+            await db
+                .collection("applications")
+                .updateOne(
 
-            const result =
-                db.prepare(`
+                    {
+                        id:
+                            applicationId
+                    },
 
-                    UPDATE applications
+                    {
+                        $set: {
 
-                    SET
-                        status = ?,
-                        updated_at = CURRENT_TIMESTAMP
+                            status:
+                                newStatus,
 
-                    WHERE id = ?
+                            updated_at:
+                                updatedAt
 
-                `).run(
+                        }
 
-                    status,
-
-                    applicationId
+                    }
 
                 );
-
-
-            if (
-                result.changes === 0
-            ) {
-
-                return res.status(404).json({
-
-                    success: false,
-
-                    message:
-                        "Application not found."
-
-                });
-
-            }
-
-
-            console.log(
-
-                `Application ${applicationId} ` +
-                `status changed from ` +
-                `${existingApplication.status} ` +
-                `to ${status}`
-
-            );
-
-
-            // -------------------------------------------------
-            // RESPONSE
-            // -------------------------------------------------
 
             return res.json({
 
                 success: true,
 
                 message:
-                    "Application status updated.",
+                    `Application status updated to ${newStatus}.`,
 
                 applicationId:
                     applicationId,
 
                 status:
-                    status
+                    newStatus
 
             });
-
 
         } catch (error) {
 
             console.error(
-                "Update application status error:",
+                "Application status error:",
                 error
             );
-
 
             return res.status(500).json({
 
@@ -1022,18 +919,20 @@ router.patch(
     }
 );
 
-
 // =========================================================
 // DELETE APPLICATION
-// DELETE /api/applications/:id
 //
+// DELETE /api/applications/:id
 // ADMIN ONLY
 // =========================================================
 
 router.delete(
     "/:id",
     requireAdmin,
-    (req, res) => {
+    async function (
+        req,
+        res
+    ) {
 
         try {
 
@@ -1041,11 +940,6 @@ router.delete(
                 Number(
                     req.params.id
                 );
-
-
-            // -------------------------------------------------
-            // VALIDATE ID
-            // -------------------------------------------------
 
             if (
                 !Number.isInteger(
@@ -1065,27 +959,20 @@ router.delete(
 
             }
 
+            const db =
+                getDatabase();
 
-            // -------------------------------------------------
-            // CHECK APPLICATION
-            // -------------------------------------------------
+            const existing =
+                await db
+                    .collection("applications")
+                    .findOne({
 
-            const existingApplication =
-                db.prepare(`
+                        id:
+                            applicationId
 
-                    SELECT
-                        id
+                    });
 
-                    FROM applications
-
-                    WHERE id = ?
-
-                `).get(
-                    applicationId
-                );
-
-
-            if (!existingApplication) {
+            if (!existing) {
 
                 return res.status(404).json({
 
@@ -1097,101 +984,41 @@ router.delete(
                 });
 
             }
-
 
             // -------------------------------------------------
             // DELETE RELATED PAYMENTS FIRST
             // -------------------------------------------------
 
-            const deletePayments =
-                db.prepare(`
+            await db
+                .collection("payments")
+                .deleteMany({
 
-                    DELETE FROM payments
+                    application_id:
+                        applicationId
 
-                    WHERE application_id = ?
-
-                `);
-
+                });
 
             // -------------------------------------------------
             // DELETE APPLICATION
             // -------------------------------------------------
 
-            const deleteApplication =
-                db.prepare(`
+            await db
+                .collection("applications")
+                .deleteOne({
 
-                    DELETE FROM applications
-
-                    WHERE id = ?
-
-                `);
-
-
-            // -------------------------------------------------
-            // TRANSACTION
-            // -------------------------------------------------
-
-            const deleteTransaction =
-                db.transaction(() => {
-
-                    deletePayments.run(
+                    id:
                         applicationId
-                    );
-
-                    return deleteApplication.run(
-                        applicationId
-                    );
 
                 });
-
-
-            const result =
-                deleteTransaction();
-
-
-            // -------------------------------------------------
-            // DELETE FAILED
-            // -------------------------------------------------
-
-            if (
-                result.changes === 0
-            ) {
-
-                return res.status(404).json({
-
-                    success: false,
-
-                    message:
-                        "Application not found."
-
-                });
-
-            }
-
-
-            console.log(
-
-                `Application ${applicationId} deleted.`
-
-            );
-
-
-            // -------------------------------------------------
-            // RESPONSE
-            // -------------------------------------------------
 
             return res.json({
 
                 success: true,
 
                 message:
-                    "Application deleted successfully.",
-
-                applicationId:
-                    applicationId
+                    "Application deleted successfully."
 
             });
-
 
         } catch (error) {
 
@@ -1199,7 +1026,6 @@ router.delete(
                 "Delete application error:",
                 error
             );
-
 
             return res.status(500).json({
 
@@ -1215,9 +1041,8 @@ router.delete(
     }
 );
 
-
 // =========================================================
-// EXPORT ROUTER
+// EXPORT
 // =========================================================
 
 module.exports = router;
