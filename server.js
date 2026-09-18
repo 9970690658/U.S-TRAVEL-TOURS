@@ -475,34 +475,57 @@ async function bootstrapAdmin() {
 
 async function loadRoutes() {
 
-    /* -----------------------------------------------------
-       AUTH
-    ----------------------------------------------------- */
+   /* -----------------------------------------------------
+   AUTH
+----------------------------------------------------- */
 
-    try {
+try {
 
-        const authRoutes =
-            require("./auth");
+    const authModule =
+        require("./auth");
 
-        app.use(
-            "/api/auth",
-            authRoutes
+    /*
+     * auth.js exports an object containing:
+     * router
+     * requireAuth
+     * requireAdmin
+     * and other authentication helpers.
+     *
+     * Express needs the actual Router function here.
+     */
+
+    const authRoutes =
+        authModule.router || authModule;
+
+    if (
+        typeof authRoutes !== "function"
+    ) {
+
+        throw new TypeError(
+            "AUTH ROUTES ERROR: ./auth must export an Express Router."
         );
-
-        console.log(
-            "AUTH ROUTES LOADED"
-        );
-
-    } catch (error) {
-
-        console.error(
-            "AUTH ROUTES ERROR:",
-            error
-        );
-
-        throw error;
 
     }
+
+    app.use(
+        "/api/auth",
+        authRoutes
+    );
+
+    console.log(
+        "AUTH ROUTES LOADED"
+    );
+
+} catch (error) {
+
+    console.error(
+        "AUTH ROUTES ERROR:",
+        error
+    );
+
+    throw error;
+
+}
 
 
     /* -----------------------------------------------------
