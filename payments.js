@@ -1,1095 +1,837 @@
+const PAYMENT_ENDPOINT =
+    "https://u-s-travel-tours-1.onrender.com/api/application-payment";
 const express = require("express");
+const router = express.Router();
+const multer = require("multer");
+const path = require("path");
+const fs = require("fs");
 
-const {
-    pool,
-    initializeDatabase
-} = require("./database");
-
+const { db } = require("./database");
 const {
     requireAuth,
     requireAdmin
 } = require("./auth");
 
-const router = express.Router();
-
-
 // =========================================================
-// DATABASE READY
-// =========================================================
-
-const databaseReady =
-    initializeDatabase();
-
-
-// =========================================================
-// HELPERS
+// U.S TRAVEL & TOURS
+// PAYMENT BACKEND
+// Bitcoin + PayPal
 // =========================================================
 
-function cleanText(
-    value,
-    maxLength = 500
-) {
+// ---------------------------------------------------------
+// PAYMENT PROOF UPLOAD DIRECTORY
+// ---------------------------------------------------------
 
-    return String(value || "")
-        .trim()
-        .slice(0, maxLength);
+const ROOT_DIR = path.join(__dirname, "..");
+const DATA_DIR = path.join(ROOT_DIR, "data");
+const UPLOAD_DIR = path.join(DATA_DIR, "payment-proofs");
 
+if (!fs.existsSync(UPLOAD_DIR)) {
+    fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 }
 
+// ---------------------------------------------------------
+// MULTER STORAGE
+// ---------------------------------------------------------
 
-function isValidEmail(email) {
+const storage = multer.diskStorage({
+    destination: function (req, file, cb) {
+        cb(null, UPLOAD_DIR);
+    },
 
-    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/
-        .test(email);
+    filename: function (req, file, cb) {
+        const extension = path.extname(file.originalname).toLowerCase();
 
-}
+        const uniqueName =
+            `payment-${Date.now()}-${Math.round(Math.random() * 1e9)}${extension}`;
 
-
-function parseApplicationData(
-    value
-) {
-
-    if (
-        value &&
-        typeof value === "object"
-    ) {
-
-        return value;
-
+        cb(null, uniqueName);
     }
+});
 
-    try {
+// ---------------------------------------------------------
+// FILE VALIDATION
+// ---------------------------------------------------------
 
-        return JSON.parse(
-            String(value || "{}")
-        );
+const upload = multer({
+    storage: storage,
 
-    } catch (error) {
+    limits: {
+        fileSize: 5 * 1024 * 1024
+    },
 
-        return {};
+    fileFilter: function (req, file, cb) {
+        const allowedExtensions = [
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".pdf"
+        ];
 
+        const extension =
+            path.extname(file.originalname).toLowerCase();
+
+        if (!allowedExtensions.includes(extension)) {
+            return cb(
+                new Error(
+                    "Only JPG, JPEG, PNG and PDF files are allowed."
+                )
+            );
+        }
+
+        cb(null, true);
     }
-
-}
-
+});
 
 // =========================================================
-// CREATE APPLICATION
-// POST /
+// SAVE PAYMENT
+// POST /api/application-payment
 // =========================================================
 
 router.post(
     "/",
     requireAuth,
-    async (req, res) => {
+    upload.single("paymentProof"),
+    (req, res) => {
 
         try {
 
-            await databaseReady;
+            const {
+                application,
+                paymentMethod,
+                paymentReference,
+                message
+            } = req.body;
 
             // -------------------------------------------------
-            // ONLY CUSTOMERS CAN SUBMIT APPLICATIONS
+            // APPLICATION VALIDATION
             // -------------------------------------------------
 
-            if (
-                req.user.role !== "customer"
-            ) {
+            if (!application) {
 
-                return res.status(403).json({
-
-                    success: false,
-
-                    message:
-                        "Only customer accounts can submit applications."
-
-                });
-
-            }
-
-
-            // -------------------------------------------------
-            // REQUEST DATA
-            // -------------------------------------------------
-
-            const body =
-                req.body || {};
-
-
-            const passportNumber =
-                cleanText(
-                    body.passportNumber,
-                    50
-                );
-
-
-            const surname =
-                cleanText(
-                    body.surname,
-                    100
-                );
-
-
-            const firstMiddleName =
-                cleanText(
-                    body.firstMiddleName,
-                    150
-                );
-
-
-            const dateOfBirth =
-                cleanText(
-                    body.dateOfBirth,
-                    30
-                );
-
-
-            const nationality =
-                cleanText(
-                    body.nationality,
-                    100
-                );
-
-
-            // -------------------------------------------------
-            // BASIC VALIDATION
-            // -------------------------------------------------
-
-            if (!passportNumber) {
+                if (req.file) {
+                    fs.unlinkSync(req.file.path);
+                }
 
                 return res.status(400).json({
-
                     success: false,
-
                     message:
-                        "Passport number is required."
-
+                        "Application information is required."
                 });
-
             }
-
-
-            if (!surname) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Surname is required."
-
-                });
-
-            }
-
-
-            if (!firstMiddleName) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "First and middle name is required."
-
-                });
-
-            }
-
-
-            if (!dateOfBirth) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Date of birth is required."
-
-                });
-
-            }
-
-
-            if (!nationality) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Nationality is required."
-
-                });
-
-            }
-
-
-            // -------------------------------------------------
-            // REQUEST SIZE SAFETY
-            // -------------------------------------------------
 
             let applicationData;
 
             try {
 
-                applicationData = {
-                    ...body,
-
-                    passportNumber,
-
-                    surname,
-
-                    firstMiddleName,
-
-                    dateOfBirth,
-
-                    nationality,
-
-                    userId:
-                        Number(req.user.id),
-
-                    userEmail:
-                        req.user.email
-                };
-
-                const serialized =
-                    JSON.stringify(
-                        applicationData
-                    );
-
-
-                if (
-                    Buffer.byteLength(
-                        serialized,
-                        "utf8"
-                    ) > 1024 * 1024
-                ) {
-
-                    return res.status(413).json({
-
-                        success: false,
-
-                        message:
-                            "Application data is too large."
-
-                    });
-
-                }
+                applicationData =
+                    typeof application === "string"
+                        ? JSON.parse(application)
+                        : application;
 
             } catch (error) {
 
+                if (req.file) {
+                    fs.unlinkSync(req.file.path);
+                }
+
                 return res.status(400).json({
-
                     success: false,
-
                     message:
-                        "Invalid application data."
-
+                        "Invalid application information."
                 });
-
             }
 
+            // -------------------------------------------------
+            // PAYMENT METHOD
+            // -------------------------------------------------
+
+            const allowedMethods = [
+                "bitcoin",
+                "paypal"
+            ];
+
+            if (!allowedMethods.includes(paymentMethod)) {
+
+                if (req.file) {
+                    fs.unlinkSync(req.file.path);
+                }
+
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        "Invalid payment method. Use Bitcoin or PayPal."
+                });
+            }
 
             // -------------------------------------------------
-            // SAVE APPLICATION
+            // PAYMENT REFERENCE
             // -------------------------------------------------
 
-            const result =
-                await pool.query(
-                    `
-                    INSERT INTO applications (
-                        user_id,
-                        application_data,
-                        status,
-                        created_at,
-                        updated_at
+            if (
+                !paymentReference ||
+                String(paymentReference).trim() === ""
+            ) {
+
+                if (req.file) {
+                    fs.unlinkSync(req.file.path);
+                }
+
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        "Payment reference is required."
+                });
+            }
+
+            const cleanReference =
+                String(paymentReference).trim();
+
+            // -------------------------------------------------
+            // FIND APPLICATION
+            // -------------------------------------------------
+
+            let applicationId = null;
+
+            // Frontend may send applicationId
+            if (applicationData.applicationId) {
+
+                const possibleId =
+                    Number(applicationData.applicationId);
+
+                if (
+                    Number.isInteger(possibleId) &&
+                    possibleId > 0
+                ) {
+                    applicationId = possibleId;
+                }
+            }
+
+            // -------------------------------------------------
+            // IF NO ID, MATCH USING PASSPORT NUMBER
+            // -------------------------------------------------
+
+            if (!applicationId) {
+
+                const submittedPassport =
+                    String(
+                        applicationData.passportNumber || ""
                     )
+                    .trim()
+                    .toLowerCase();
 
-                    VALUES (
-                        $1,
-                        $2,
-                        'payment_pending',
-                        CURRENT_TIMESTAMP,
-                        CURRENT_TIMESTAMP
+                if (submittedPassport) {
+
+                    const applications = db.prepare(`
+                        SELECT
+                            id,
+                            application_data
+                        FROM applications
+                        ORDER BY id DESC
+                    `).all();
+
+                    for (const item of applications) {
+
+                        try {
+
+                            const savedData =
+                                JSON.parse(
+                                    item.application_data
+                                );
+
+                            const savedPassport =
+                                String(
+                                    savedData.passportNumber || ""
+                                )
+                                .trim()
+                                .toLowerCase();
+
+                            if (
+                                savedPassport &&
+                                savedPassport ===
+                                submittedPassport
+                            ) {
+
+                                applicationId = item.id;
+                                break;
+                            }
+
+                        } catch (error) {
+                            // Ignore invalid application JSON
+                        }
+                    }
+                }
+            }
+
+            // -------------------------------------------------
+            // APPLICATION MUST EXIST
+            // -------------------------------------------------
+
+            if (!applicationId) {
+
+                if (req.file) {
+                    fs.unlinkSync(req.file.path);
+                }
+
+                return res.status(404).json({
+                    success: false,
+                    message:
+                        "Application was not found. Please submit the application again."
+                });
+            }
+
+            const existingApplication = db.prepare(`
+    SELECT
+        id,
+        user_id
+    FROM applications
+    WHERE id = ?
+`).get(applicationId);
+
+if (!existingApplication) {
+
+    if (req.file) {
+        fs.unlinkSync(req.file.path);
+    }
+
+    return res.status(404).json({
+        success: false,
+        message: "Application not found."
+    });
+}
+
+if (
+    req.user.role !== "admin" &&
+    Number(existingApplication.user_id) !== Number(req.user.id)
+) {
+
+    if (req.file) {
+        fs.unlinkSync(req.file.path);
+    }
+
+    return res.status(403).json({
+        success: false,
+        message:
+            "You are not authorized to submit payment for this application."
+    });
+}
+
+            if (!existingApplication) {
+
+                if (req.file) {
+                    fs.unlinkSync(req.file.path);
+                }
+
+                return res.status(404).json({
+                    success: false,
+                    message:
+                        "Application not found."
+                });
+            }
+
+            // -------------------------------------------------
+            // DUPLICATE PAYMENT REFERENCE CHECK
+            // -------------------------------------------------
+
+            const duplicatePayment = db.prepare(`
+                SELECT
+                    id
+                FROM payments
+                WHERE payment_reference = ?
+            `).get(cleanReference);
+
+            if (duplicatePayment) {
+
+                if (req.file) {
+                    fs.unlinkSync(req.file.path);
+                }
+
+                return res.status(409).json({
+                    success: false,
+                    message:
+                        "This payment reference has already been submitted."
+                });
+            }
+
+            // -------------------------------------------------
+            // PAYMENT PROOF FILE
+            // -------------------------------------------------
+
+            let proofFile = null;
+
+            if (req.file) {
+                proofFile = req.file.filename;
+            }
+
+            // -------------------------------------------------
+            // DATABASE TRANSACTION
+            // -------------------------------------------------
+
+            const savePayment = db.transaction(() => {
+
+                const insertPayment = db.prepare(`
+                    INSERT INTO payments (
+                        application_id,
+                        payment_method,
+                        payment_reference,
+                        message,
+                        proof_file,
+                        status
                     )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                `);
 
-                    RETURNING
-                        id,
-                        status,
-                        created_at,
-                        updated_at
-                    `,
-                    [
-                        Number(req.user.id),
+                const paymentResult =
+                    insertPayment.run(
+                        applicationId,
+                        paymentMethod,
+                        cleanReference,
+                        message
+                            ? String(message).trim()
+                            : null,
+                        proofFile,
+                        "pending"
+                    );
 
-                        JSON.stringify(
-                            applicationData
-                        )
-                    ]
+                const paymentId =
+                    paymentResult.lastInsertRowid;
+
+                db.prepare(`
+                    UPDATE applications
+                    SET
+                        status = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                `).run(
+                    "payment_submitted",
+                    applicationId
                 );
 
+                return paymentId;
+            });
 
-            const savedApplication =
-                result.rows[0];
-
+            const paymentId = savePayment();
 
             // -------------------------------------------------
-            // APPLICATION ID
+            // SUCCESS LOG
             // -------------------------------------------------
-
-            const applicationId =
-                Number(
-                    savedApplication.id
-                );
-
 
             console.log(
-                `Application created: ${applicationId} by user ${req.user.id}`
+                "----------------------------------------------"
             );
 
+            console.log(
+                `Payment submitted successfully.`
+            );
+
+            console.log(
+                `Payment ID: ${paymentId}`
+            );
+
+            console.log(
+                `Application ID: ${applicationId}`
+            );
+
+            console.log(
+                `Payment Method: ${paymentMethod}`
+            );
+
+            console.log(
+                "----------------------------------------------"
+            );
+
+            // -------------------------------------------------
+            // RESPONSE
+            // -------------------------------------------------
 
             return res.status(201).json({
 
                 success: true,
 
                 message:
-                    "Application submitted successfully.",
+    "Payment details submitted successfully. Your payment is pending verification.",
 
-                applicationId,
+                paymentId: paymentId,
 
-                status:
-                    savedApplication.status,
+                applicationId: applicationId,
 
-                application: {
+                paymentMethod: paymentMethod,
 
-                    id:
-                        applicationId,
-
-                    status:
-                        savedApplication.status,
-
-                    createdAt:
-                        savedApplication.created_at,
-
-                    updatedAt:
-                        savedApplication.updated_at
-
-                }
-
+                status: "pending"
             });
 
         } catch (error) {
 
             console.error(
-                "Create application error:",
+                "Payment submission error:",
                 error
             );
 
+            // Remove uploaded file if database operation fails
+            if (req.file) {
+
+                try {
+                    if (fs.existsSync(req.file.path)) {
+                        fs.unlinkSync(req.file.path);
+                    }
+                } catch (fileError) {
+                    console.error(
+                        "Unable to remove uploaded payment proof:",
+                        fileError
+                    );
+                }
+            }
 
             return res.status(500).json({
-
                 success: false,
-
                 message:
-                    "Unable to submit application."
-
+                    "Unable to submit payment details. Please try again."
             });
-
         }
-
     }
 );
 
+// =========================================================
+// GET PAYMENT BY ID
+// GET /api/payments/:id
+// =========================================================
+
+router.get("/:id", requireAuth, (req, res) => {
+
+    try {
+
+        const paymentId =
+            Number(req.params.id);
+
+        if (
+            !Number.isInteger(paymentId) ||
+            paymentId <= 0
+        ) {
+
+            return res.status(400).json({
+                success: false,
+                message:
+                    "Invalid payment ID."
+            });
+        }
+
+        const payment = db.prepare(`
+            SELECT
+                id,
+                application_id,
+                payment_method,
+                payment_reference,
+                message,
+                proof_file,
+                status,
+                created_at,
+                updated_at
+            FROM payments
+            WHERE id = ?
+        `).get(paymentId);
+
+        if (!payment) {
+
+            return res.status(404).json({
+                success: false,
+                message:
+                    "Payment not found."
+            });
+        }
+
+        return res.json({
+            success: true,
+            payment: payment
+        });
+
+    } catch (error) {
+
+        console.error(
+            "Get payment error:",
+            error
+        );
+
+        return res.status(500).json({
+            success: false,
+            message:
+                "Unable to retrieve payment."
+        });
+    }
+});
 
 // =========================================================
-// GET SINGLE APPLICATION
-// GET /:id
+// GET PAYMENTS FOR APPLICATION
+// GET /api/payments/application/:applicationId
 // =========================================================
 
 router.get(
-    "/:id",
+    "/application/:applicationId",
     requireAuth,
-    async (req, res) => {
+    (req, res) => {
 
         try {
 
-            await databaseReady;
-
-
             const applicationId =
-                Number(
-                    req.params.id
-                );
-
+                Number(req.params.applicationId);
 
             if (
-                !Number.isInteger(
-                    applicationId
-                ) ||
+                !Number.isInteger(applicationId) ||
                 applicationId <= 0
             ) {
 
                 return res.status(400).json({
-
                     success: false,
-
                     message:
-                        "Invalid Application ID."
-
+                        "Invalid application ID."
                 });
-
             }
 
-
-            const result =
-                await pool.query(
-                    `
-                    SELECT
-                        id,
-                        user_id,
-                        application_data,
-                        status,
-                        created_at,
-                        updated_at
-
-                    FROM applications
-
-                    WHERE id = $1
-
-                    LIMIT 1
-                    `,
-                    [applicationId]
-                );
-
-
-            if (
-                result.rows.length === 0
-            ) {
-
-                return res.status(404).json({
-
-                    success: false,
-
-                    message:
-                        "Application not found."
-
-                });
-
-            }
-
-
-            const application =
-                result.rows[0];
-
-
-            // -------------------------------------------------
-            // CUSTOMER OWNERSHIP
-            // -------------------------------------------------
-
-            if (
-                req.user.role !== "admin" &&
-                Number(application.user_id) !==
-                    Number(req.user.id)
-            ) {
-
-                return res.status(403).json({
-
-                    success: false,
-
-                    message:
-                        "You are not authorized to view this application."
-
-                });
-
-            }
-
-
-            const data =
-                parseApplicationData(
-                    application.application_data
-                );
-
+            const payments = db.prepare(`
+                SELECT
+                    id,
+                    application_id,
+                    payment_method,
+                    payment_reference,
+                    message,
+                    proof_file,
+                    status,
+                    created_at,
+                    updated_at
+                FROM payments
+                WHERE application_id = ?
+                ORDER BY created_at DESC
+            `).all(applicationId);
 
             return res.json({
-
                 success: true,
-
-                application: {
-
-                    id:
-                        Number(
-                            application.id
-                        ),
-
-                    userId:
-                        application.user_id
-                            ? Number(
-                                application.user_id
-                            )
-                            : null,
-
-                    data,
-
-                    status:
-                        application.status,
-
-                    createdAt:
-                        application.created_at,
-
-                    updatedAt:
-                        application.updated_at
-
-                }
-
+                count: payments.length,
+                payments: payments
             });
 
         } catch (error) {
 
             console.error(
-                "Get application error:",
+                "Get application payments error:",
                 error
             );
 
-
             return res.status(500).json({
-
                 success: false,
-
                 message:
-                    "Unable to load application."
-
+                    "Unable to retrieve application payments."
             });
-
         }
-
     }
 );
 
-
 // =========================================================
-// GET ALL APPLICATIONS
-// ADMIN ONLY
-// GET /
-// =========================================================
-
-router.get(
-    "/",
-    requireAdmin,
-    async (req, res) => {
-
-        try {
-
-            await databaseReady;
-
-
-            const result =
-                await pool.query(
-                    `
-                    SELECT
-                        a.id,
-                        a.user_id,
-                        a.application_data,
-                        a.status,
-                        a.created_at,
-                        a.updated_at,
-
-                        u.name AS user_name,
-                        u.email AS user_email,
-                        u.phone AS user_phone
-
-                    FROM applications a
-
-                    LEFT JOIN users u
-                        ON u.id = a.user_id
-
-                    ORDER BY
-                        a.created_at DESC,
-                        a.id DESC
-                    `
-                );
-
-
-            const applications =
-                result.rows.map(
-                    (application) => {
-
-                        const data =
-                            parseApplicationData(
-                                application.application_data
-                            );
-
-
-                        return {
-
-                            id:
-                                Number(
-                                    application.id
-                                ),
-
-                            userId:
-                                application.user_id
-                                    ? Number(
-                                        application.user_id
-                                    )
-                                    : null,
-
-                            user: {
-
-                                id:
-                                    application.user_id
-                                        ? Number(
-                                            application.user_id
-                                        )
-                                        : null,
-
-                                name:
-                                    application.user_name ||
-                                    "",
-
-                                email:
-                                    application.user_email ||
-                                    "",
-
-                                phone:
-                                    application.user_phone ||
-                                    ""
-
-                            },
-
-                            data,
-
-                            status:
-                                application.status,
-
-                            createdAt:
-                                application.created_at,
-
-                            updatedAt:
-                                application.updated_at
-
-                        };
-
-                    }
-                );
-
-
-            return res.json({
-
-                success: true,
-
-                applications,
-
-                count:
-                    applications.length
-
-            });
-
-        } catch (error) {
-
-            console.error(
-                "Get all applications error:",
-                error
-            );
-
-
-            return res.status(500).json({
-
-                success: false,
-
-                message:
-                    "Unable to load applications."
-
-            });
-
-        }
-
-    }
-);
-
-
-// =========================================================
-// UPDATE APPLICATION STATUS
-// ADMIN ONLY
-// PATCH /:id/status
+// UPDATE PAYMENT STATUS
+// PATCH /api/payments/:id/status
 // =========================================================
 
 router.patch(
     "/:id/status",
     requireAdmin,
-    async (req, res) => {
+    (req, res) => {
 
         try {
 
-            await databaseReady;
+            const paymentId =
+                Number(req.params.id);
 
-
-            const applicationId =
-                Number(
-                    req.params.id
-                );
-
-
-            if (
-                !Number.isInteger(
-                    applicationId
-                ) ||
-                applicationId <= 0
-            ) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Invalid Application ID."
-
-                });
-
-            }
-
-
-            const status =
-                String(
-                    req.body.status || ""
-                )
-                    .trim()
-                    .toLowerCase();
-
+            const { status } = req.body;
 
             const allowedStatuses = [
-
                 "pending",
-
-                "payment_pending",
-
-                "payment_submitted",
-
-                "under_review",
-
-                "approved",
-
-                "rejected",
-
-                "completed"
-
+                "verified",
+                "rejected"
             ];
 
-
             if (
-                !allowedStatuses.includes(
-                    status
-                )
+                !Number.isInteger(paymentId) ||
+                paymentId <= 0
             ) {
 
                 return res.status(400).json({
-
                     success: false,
-
                     message:
-                        "Invalid application status."
-
+                        "Invalid payment ID."
                 });
-
             }
 
+            if (!allowedStatuses.includes(status)) {
 
-            const result =
-                await pool.query(
-                    `
-                    UPDATE applications
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        "Invalid payment status."
+                });
+            }
 
-                    SET
-                        status = $1,
-                        updated_at = CURRENT_TIMESTAMP
+            const payment = db.prepare(`
+                SELECT
+                    application_id
+                FROM payments
+                WHERE id = ?
+            `).get(paymentId);
 
-                    WHERE id = $2
-
-                    RETURNING
-                        id,
-                        user_id,
-                        status,
-                        created_at,
-                        updated_at
-                    `,
-                    [
-                        status,
-                        applicationId
-                    ]
-                );
-
-
-            if (
-                result.rows.length === 0
-            ) {
+            if (!payment) {
 
                 return res.status(404).json({
-
                     success: false,
-
                     message:
-                        "Application not found."
-
+                        "Payment not found."
                 });
-
             }
 
+            let applicationStatus =
+                "payment_submitted";
 
-            const application =
-                result.rows[0];
+            if (status === "verified") {
+                applicationStatus =
+                    "under_review";
+            }
 
+            if (status === "rejected") {
+                applicationStatus =
+                    "payment_pending";
+            }
 
-            console.log(
-                `Application ${applicationId} status changed to ${status}`
-            );
+            const updatePayment =
+                db.transaction(() => {
 
+                    db.prepare(`
+                        UPDATE payments
+                        SET
+                            status = ?,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                    `).run(
+                        status,
+                        paymentId
+                    );
+
+                    db.prepare(`
+                        UPDATE applications
+                        SET
+                            status = ?,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                    `).run(
+                        applicationStatus,
+                        payment.application_id
+                    );
+                });
+
+            updatePayment();
 
             return res.json({
-
                 success: true,
-
                 message:
-                    "Application status updated successfully.",
-
-                application: {
-
-                    id:
-                        Number(
-                            application.id
-                        ),
-
-                    userId:
-                        application.user_id
-                            ? Number(
-                                application.user_id
-                            )
-                            : null,
-
-                    status:
-                        application.status,
-
-                    createdAt:
-                        application.created_at,
-
-                    updatedAt:
-                        application.updated_at
-
-                }
-
+                    "Payment status updated successfully.",
+                paymentId: paymentId,
+                status: status,
+                applicationStatus:
+                    applicationStatus
             });
 
         } catch (error) {
 
             console.error(
-                "Update application status error:",
+                "Update payment status error:",
                 error
             );
 
-
             return res.status(500).json({
-
                 success: false,
-
                 message:
-                    "Unable to update application status."
-
+                    "Unable to update payment status."
             });
-
         }
-
     }
 );
 
-
 // =========================================================
-// DELETE APPLICATION
-// ADMIN ONLY
-// DELETE /:id
+// GET ALL PAYMENTS
+// GET /api/payments
 // =========================================================
 
-router.delete(
-    "/:id",
-    requireAdmin,
-    async (req, res) => {
+router.get("/", requireAdmin, (req, res) => {
 
-        const client =
-            await pool.connect();
+    try {
 
+        const payments = db.prepare(`
+            SELECT
+                p.id,
+                p.application_id,
+                p.payment_method,
+                p.payment_reference,
+                p.message,
+                p.proof_file,
+                p.status,
+                p.created_at,
+                p.updated_at
+            FROM payments p
+            ORDER BY p.created_at DESC
+        `).all();
 
-        try {
+        return res.json({
+            success: true,
+            count: payments.length,
+            payments: payments
+        });
 
-            await databaseReady;
+    } catch (error) {
 
+        console.error(
+            "Get payments error:",
+            error
+        );
 
-            const applicationId =
-                Number(
-                    req.params.id
-                );
+        return res.status(500).json({
+            success: false,
+            message:
+                "Unable to retrieve payments."
+        });
+    }
+});
 
+// =========================================================
+// MULTER ERROR HANDLER
+// =========================================================
 
-            if (
-                !Number.isInteger(
-                    applicationId
-                ) ||
-                applicationId <= 0
-            ) {
+router.use((error, req, res, next) => {
 
-                return res.status(400).json({
+    if (error instanceof multer.MulterError) {
 
-                    success: false,
+        if (error.code === "LIMIT_FILE_SIZE") {
 
-                    message:
-                        "Invalid Application ID."
-
-                });
-
-            }
-
-
-            // -------------------------------------------------
-            // SAME CLIENT FOR TRANSACTION
-            // -------------------------------------------------
-
-            await client.query(
-                "BEGIN"
-            );
-
-
-            const existing =
-                await client.query(
-                    `
-                    SELECT
-                        id
-
-                    FROM applications
-
-                    WHERE id = $1
-
-                    LIMIT 1
-
-                    FOR UPDATE
-                    `,
-                    [applicationId]
-                );
-
-
-            if (
-                existing.rows.length === 0
-            ) {
-
-                await client.query(
-                    "ROLLBACK"
-                );
-
-
-                return res.status(404).json({
-
-                    success: false,
-
-                    message:
-                        "Application not found."
-
-                });
-
-            }
-
-
-            // -------------------------------------------------
-            // DELETE PAYMENTS FIRST
-            // -------------------------------------------------
-
-            await client.query(
-                `
-                DELETE FROM payments
-
-                WHERE application_id = $1
-                `,
-                [applicationId]
-            );
-
-
-            // -------------------------------------------------
-            // DELETE APPLICATION
-            // -------------------------------------------------
-
-            const deleted =
-                await client.query(
-                    `
-                    DELETE FROM applications
-
-                    WHERE id = $1
-
-                    RETURNING id
-                    `,
-                    [applicationId]
-                );
-
-
-            await client.query(
-                "COMMIT"
-            );
-
-
-            console.log(
-                `Application ${applicationId} deleted by admin.`
-            );
-
-
-            return res.json({
-
-                success: true,
-
-                message:
-                    "Application deleted successfully.",
-
-                applicationId:
-                    Number(
-                        deleted.rows[0].id
-                    )
-
-            });
-
-        } catch (error) {
-
-            try {
-
-                await client.query(
-                    "ROLLBACK"
-                );
-
-            } catch (rollbackError) {
-
-                console.error(
-                    "Application rollback error:",
-                    rollbackError
-                );
-
-            }
-
-
-            console.error(
-                "Delete application error:",
-                error
-            );
-
-
-            return res.status(500).json({
-
+            return res.status(400).json({
                 success: false,
-
                 message:
-                    "Unable to delete application."
-
+                    "Payment proof must be 5MB or smaller."
             });
-
-        } finally {
-
-            client.release();
-
         }
 
+        return res.status(400).json({
+            success: false,
+            message:
+                "Payment proof upload failed."
+        });
     }
-);
 
+    if (error) {
+
+        return res.status(400).json({
+            success: false,
+            message:
+                error.message ||
+                "Payment request failed."
+        });
+    }
+
+    next();
+});
 
 // =========================================================
 // EXPORT
