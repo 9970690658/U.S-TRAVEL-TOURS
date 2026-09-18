@@ -1,312 +1,771 @@
 // =========================================================
 // U.S TRAVEL & TOURS
-// DATABASE CONFIGURATION
-// SQLite Database
+// MONGODB DATABASE LAYER
+// =========================================================
+//
+// MongoDB Atlas + Render
+//
+// Collections:
+//   users
+//   sessions
+//   password_resets
+//   applications
+//   payments
+//   support_chat_messages
+//   contact_messages
+//   job_applications
+//   counters
+//
+// IMPORTANT:
+// Existing frontend/API numeric IDs are preserved.
+// MongoDB's internal _id is separate.
 // =========================================================
 
-const path = require("path");
-const fs = require("fs");
-const Database = require("better-sqlite3");
-
-// ---------------------------------------------------------
-// DATABASE DIRECTORY
-// ---------------------------------------------------------
-
-const ROOT_DIR = path.join(__dirname, "..");
-const DATA_DIR = path.join(ROOT_DIR, "data");
-const DB_PATH = path.join(DATA_DIR, "database.db");
-
-// Create data folder if it doesn't exist
-if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-}
-
-// ---------------------------------------------------------
-// DATABASE CONNECTION
-// ---------------------------------------------------------
-
-const db = new Database(DB_PATH);
-
-// SQLite performance / safety settings
-db.pragma("journal_mode = WAL");
-db.pragma("foreign_keys = ON");
-
-// ---------------------------------------------------------
-// USERS TABLE
-// ---------------------------------------------------------
-
-db.exec(`
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-        name TEXT NOT NULL,
-        email TEXT NOT NULL UNIQUE,
-        phone TEXT,
-
-        password_hash TEXT NOT NULL,
-
-        role TEXT NOT NULL DEFAULT 'customer'
-            CHECK (role IN ('customer', 'admin')),
-
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-`);
-
-// ---------------------------------------------------------
-// APPLICATIONS TABLE
-// ---------------------------------------------------------
-
-db.exec(`
-    CREATE TABLE IF NOT EXISTS applications (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-        application_data TEXT NOT NULL,
-
-        status TEXT NOT NULL DEFAULT 'pending'
-            CHECK (
-                status IN (
-                    'pending',
-                    'payment_pending',
-                    'payment_submitted',
-                    'under_review',
-                    'approved',
-                    'rejected',
-                    'completed'
-                )
-            ),
-
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-`);
-
-// ---------------------------------------------------------
-// PAYMENTS TABLE
-// ---------------------------------------------------------
-
-db.exec(`
-    CREATE TABLE IF NOT EXISTS payments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-        application_id INTEGER NOT NULL,
-
-        payment_method TEXT NOT NULL
-            CHECK (payment_method IN ('bitcoin', 'paypal')),
-
-        payment_reference TEXT NOT NULL,
-
-        message TEXT,
-
-        proof_file TEXT,
-
-        status TEXT NOT NULL DEFAULT 'pending'
-            CHECK (
-                status IN (
-                    'pending',
-                    'verified',
-                    'rejected'
-                )
-            ),
-
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-
-        FOREIGN KEY (application_id)
-            REFERENCES applications(id)
-            ON DELETE CASCADE
-    );
-`);
-
-// ---------------------------------------------------------
-// CHAT MESSAGES TABLE
-// ---------------------------------------------------------
-
-db.exec(`
-    CREATE TABLE IF NOT EXISTS chat_messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-        name TEXT,
-        email TEXT,
-
-        message TEXT NOT NULL,
-
-        sender_type TEXT NOT NULL DEFAULT 'visitor'
-            CHECK (
-                sender_type IN (
-                    'visitor',
-                    'admin'
-                )
-            ),
-
-        is_read INTEGER NOT NULL DEFAULT 0,
-
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-`);
-
-// ---------------------------------------------------------
-// CONTACT MESSAGES TABLE
-// ---------------------------------------------------------
-
-db.exec(`
-    CREATE TABLE IF NOT EXISTS contact_messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-        name TEXT NOT NULL,
-        email TEXT NOT NULL,
-        phone TEXT,
-
-        subject TEXT,
-        message TEXT NOT NULL,
-
-        status TEXT NOT NULL DEFAULT 'new'
-            CHECK (
-                status IN (
-                    'new',
-                    'read',
-                    'replied',
-                    'closed'
-                )
-            ),
-
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-`);
-
-// ---------------------------------------------------------
-// JOB APPLICATIONS TABLE
-// ---------------------------------------------------------
-
-db.exec(`
-    CREATE TABLE IF NOT EXISTS job_applications (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-        job_title TEXT NOT NULL,
-
-        name TEXT NOT NULL,
-        email TEXT NOT NULL,
-        phone TEXT NOT NULL,
-
-        resume_file TEXT,
-
-        cover_letter TEXT,
-
-        status TEXT NOT NULL DEFAULT 'new'
-            CHECK (
-                status IN (
-                    'new',
-                    'reviewing',
-                    'shortlisted',
-                    'rejected',
-                    'hired'
-                )
-            ),
-
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-`);
+const {
+    MongoClient
+} = require("mongodb");
 
 // =========================================================
-// JOB APPLICATIONS MIGRATION
+// CONFIG
 // =========================================================
 
-try {
+const MONGODB_URI =
+    process.env.MONGODB_URI;
 
-    const jobApplicationColumns =
-        db.prepare(`
-            PRAGMA table_info(job_applications)
-        `).all();
+const MONGODB_DB_NAME =
+    process.env.MONGODB_DB_NAME ||
+    "us-travel-tours";
 
-    const hasUserId =
-        jobApplicationColumns.some(
-            column => column.name === "user_id"
-        );
+// =========================================================
+// VALIDATION
+// =========================================================
 
-    if (!hasUserId) {
-
-        db.exec(`
-            ALTER TABLE job_applications
-            ADD COLUMN user_id INTEGER
-        `);
-
-        console.log(
-            "job_applications.user_id column added."
-        );
-
-    }
-
-} catch (error) {
+if (!MONGODB_URI) {
 
     console.error(
-        "Job applications migration error:",
-        error
+        "========================================================="
+    );
+
+    console.error(
+        "MONGODB_URI environment variable is missing."
+    );
+
+    console.error(
+        "Add MONGODB_URI in Render Environment Variables."
+    );
+
+    console.error(
+        "========================================================="
     );
 
 }
 
-// ---------------------------------------------------------
-// INDEXES
-// ---------------------------------------------------------
-db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_users_email
-    ON users(email);
+// =========================================================
+// MONGODB CLIENT
+// =========================================================
 
-    CREATE INDEX IF NOT EXISTS idx_applications_status
-    ON applications(status);
+let client = null;
 
-    CREATE INDEX IF NOT EXISTS idx_payments_application
-    ON payments(application_id);
+let database = null;
 
-    CREATE INDEX IF NOT EXISTS idx_payments_status
-    ON payments(status);
+let initialized = false;
 
-    CREATE INDEX IF NOT EXISTS idx_chat_created
-    ON chat_messages(created_at);
+// =========================================================
+// CONNECT DATABASE
+// =========================================================
 
-    CREATE INDEX IF NOT EXISTS idx_contact_created
-    ON contact_messages(created_at);
+async function initDatabase() {
 
-    CREATE INDEX IF NOT EXISTS idx_job_created
-    ON job_applications(created_at);
+    if (initialized && database) {
 
-    CREATE INDEX IF NOT EXISTS idx_job_user
-    ON job_applications(user_id);
-`);
-// ---------------------------------------------------------
-// HELPER FUNCTIONS
-// ---------------------------------------------------------
+        return database;
+
+    }
+
+    if (!MONGODB_URI) {
+
+        throw new Error(
+            "MONGODB_URI environment variable is not configured."
+        );
+
+    }
+
+    try {
+
+        client =
+            new MongoClient(
+                MONGODB_URI,
+                {
+                    maxPoolSize: 20,
+                    minPoolSize: 1,
+                    serverSelectionTimeoutMS: 10000,
+                    connectTimeoutMS: 10000
+                }
+            );
+
+        await client.connect();
+
+        database =
+            client.db(
+                MONGODB_DB_NAME
+            );
+
+        // -----------------------------------------------------
+        // TEST CONNECTION
+        // -----------------------------------------------------
+
+        await database.command({
+            ping: 1
+        });
+
+        // -----------------------------------------------------
+        // CREATE COLLECTIONS / INDEXES
+        // -----------------------------------------------------
+
+        await createIndexes();
+
+        initialized = true;
+
+        console.log(
+            "========================================================="
+        );
+
+        console.log(
+            "MongoDB connected successfully."
+        );
+
+        console.log(
+            `MongoDB database: ${MONGODB_DB_NAME}`
+        );
+
+        console.log(
+            "========================================================="
+        );
+
+        return database;
+
+    } catch (error) {
+
+        console.error(
+            "MongoDB connection failed:"
+        );
+
+        console.error(
+            error
+        );
+
+        database = null;
+
+        initialized = false;
+
+        if (client) {
+
+            try {
+
+                await client.close();
+
+            } catch {}
+
+        }
+
+        client = null;
+
+        throw error;
+
+    }
+
+}
+
+// =========================================================
+// GET DATABASE
+// =========================================================
 
 function getDatabase() {
-    return db;
-}
 
-// ---------------------------------------------------------
-// CLOSE DATABASE
-// ---------------------------------------------------------
+    if (!database || !initialized) {
 
-function closeDatabase() {
-    if (db.open) {
-        db.close();
+        throw new Error(
+            "MongoDB database is not initialized. Call initDatabase() first."
+        );
+
     }
+
+    return database;
+
 }
 
-// ---------------------------------------------------------
-// EXPORT
-// ---------------------------------------------------------
+// =========================================================
+// GET COLLECTION
+// =========================================================
+
+function getCollection(
+    collectionName
+) {
+
+    return getDatabase().collection(
+        collectionName
+    );
+
+}
+
+// =========================================================
+// CREATE INDEXES
+// =========================================================
+
+async function createIndexes() {
+
+    const db =
+        getDatabase();
+
+    // -------------------------------------------------------
+    // USERS
+    // -------------------------------------------------------
+
+    await db
+        .collection("users")
+        .createIndex(
+            {
+                id: 1
+            },
+            {
+                unique: true
+            }
+        );
+
+    await db
+        .collection("users")
+        .createIndex(
+            {
+                email: 1
+            },
+            {
+                unique: true
+            }
+        );
+
+    await db
+        .collection("users")
+        .createIndex({
+            role: 1
+        });
+
+    // -------------------------------------------------------
+    // SESSIONS
+    // -------------------------------------------------------
+
+    await db
+        .collection("sessions")
+        .createIndex(
+            {
+                token_hash: 1
+            },
+            {
+                unique: true
+            }
+        );
+
+    await db
+        .collection("sessions")
+        .createIndex({
+            user_id: 1
+        });
+
+    await db
+        .collection("sessions")
+        .createIndex({
+            expires_at: 1
+        });
+
+    // -------------------------------------------------------
+    // PASSWORD RESETS
+    // -------------------------------------------------------
+
+    await db
+        .collection("password_resets")
+        .createIndex(
+            {
+                token_hash: 1
+            },
+            {
+                unique: true
+            }
+        );
+
+    await db
+        .collection("password_resets")
+        .createIndex({
+            user_id: 1
+        });
+
+    await db
+        .collection("password_resets")
+        .createIndex({
+            expires_at: 1
+        });
+
+    // -------------------------------------------------------
+    // APPLICATIONS
+    // -------------------------------------------------------
+
+    await db
+        .collection("applications")
+        .createIndex(
+            {
+                id: 1
+            },
+            {
+                unique: true
+            }
+        );
+
+    await db
+        .collection("applications")
+        .createIndex({
+            user_id: 1
+        });
+
+    await db
+        .collection("applications")
+        .createIndex({
+            status: 1
+        });
+
+    await db
+        .collection("applications")
+        .createIndex({
+            created_at: -1
+        });
+
+    // -------------------------------------------------------
+    // PAYMENTS
+    // -------------------------------------------------------
+
+    await db
+        .collection("payments")
+        .createIndex(
+            {
+                id: 1
+            },
+            {
+                unique: true
+            }
+        );
+
+    await db
+        .collection("payments")
+        .createIndex({
+            application_id: 1
+        });
+
+    await db
+        .collection("payments")
+        .createIndex({
+            status: 1
+        });
+
+    await db
+        .collection("payments")
+        .createIndex({
+            payment_reference: 1
+        });
+
+    await db
+        .collection("payments")
+        .createIndex({
+            created_at: -1
+        });
+
+    // -------------------------------------------------------
+    // SUPPORT CHAT
+    // -------------------------------------------------------
+
+    await db
+        .collection("support_chat_messages")
+        .createIndex({
+            id: 1
+        }, {
+            unique: true
+        });
+
+    await db
+        .collection("support_chat_messages")
+        .createIndex({
+            user_id: 1,
+            id: 1
+        });
+
+    await db
+        .collection("support_chat_messages")
+        .createIndex({
+            created_at: -1
+        });
+
+    // -------------------------------------------------------
+    // CONTACT MESSAGES
+    // -------------------------------------------------------
+
+    await db
+        .collection("contact_messages")
+        .createIndex({
+            id: 1
+        }, {
+            unique: true
+        });
+
+    await db
+        .collection("contact_messages")
+        .createIndex({
+            status: 1
+        });
+
+    await db
+        .collection("contact_messages")
+        .createIndex({
+            created_at: -1
+        });
+
+    // -------------------------------------------------------
+    // JOB APPLICATIONS
+    // -------------------------------------------------------
+
+    await db
+        .collection("job_applications")
+        .createIndex({
+            id: 1
+        }, {
+            unique: true
+        });
+
+    await db
+        .collection("job_applications")
+        .createIndex({
+            user_id: 1
+        });
+
+    await db
+        .collection("job_applications")
+        .createIndex({
+            status: 1
+        });
+
+    await db
+        .collection("job_applications")
+        .createIndex({
+            created_at: -1
+        });
+
+    // -------------------------------------------------------
+    // COUNTERS
+    // -------------------------------------------------------
+
+    await db
+        .collection("counters")
+        .createIndex(
+            {
+                name: 1
+            },
+            {
+                unique: true
+            }
+        );
+
+}
+
+// =========================================================
+// NUMERIC ID GENERATOR
+// =========================================================
+//
+// This replaces SQLite AUTOINCREMENT.
+//
+// Example:
+//
+// users            → 1, 2, 3...
+// applications     → 1, 2, 3...
+// payments         → 1, 2, 3...
+//
+// Atomic MongoDB operation prevents duplicate IDs when
+// multiple customers submit data at the same time.
+// =========================================================
+
+async function getNextSequence(
+    sequenceName
+) {
+
+    const db =
+        getDatabase();
+
+    const result =
+        await db
+            .collection("counters")
+            .findOneAndUpdate(
+
+                {
+                    name:
+                        sequenceName
+                },
+
+                {
+                    $inc: {
+                        value: 1
+                    }
+                },
+
+                {
+                    upsert: true,
+                    returnDocument: "after"
+                }
+
+            );
+
+    if (
+        !result ||
+        !result.value
+    ) {
+
+        throw new Error(
+            `Unable to generate ID for ${sequenceName}.`
+        );
+
+    }
+
+    return Number(
+        result.value.value
+    );
+
+}
+
+// =========================================================
+// SET / PRESERVE COUNTER
+// =========================================================
+//
+// Used during migration when old SQLite IDs already exist.
+// It makes sure future IDs continue after the largest old ID.
+// =========================================================
+
+async function setSequenceAtLeast(
+    sequenceName,
+    minimumValue
+) {
+
+    const db =
+        getDatabase();
+
+    const value =
+        Number(
+            minimumValue
+        );
+
+    if (
+        !Number.isFinite(value) ||
+        value < 0
+    ) {
+
+        return;
+
+    }
+
+    await db
+        .collection("counters")
+        .updateOne(
+
+            {
+                name:
+                    sequenceName
+            },
+
+            {
+                $max: {
+                    value:
+                        Math.floor(value)
+                }
+            },
+
+            {
+                upsert: true
+            }
+
+        );
+
+}
+
+// =========================================================
+// CLEAN EXPIRED SESSIONS
+// =========================================================
+
+async function cleanExpiredSessions() {
+
+    try {
+
+        const db =
+            getDatabase();
+
+        await db
+            .collection("sessions")
+            .deleteMany({
+                expires_at: {
+                    $lte:
+                        new Date()
+                }
+            });
+
+    } catch (error) {
+
+        console.error(
+            "Session cleanup error:",
+            error
+        );
+
+    }
+
+}
+
+// =========================================================
+// CLEAN EXPIRED PASSWORD RESETS
+// =========================================================
+
+async function cleanExpiredPasswordResets() {
+
+    try {
+
+        const db =
+            getDatabase();
+
+        await db
+            .collection("password_resets")
+            .deleteMany({
+                expires_at: {
+                    $lte:
+                        new Date()
+                }
+            });
+
+    } catch (error) {
+
+        console.error(
+            "Password reset cleanup error:",
+            error
+        );
+
+    }
+
+}
+
+// =========================================================
+// DATABASE STATUS
+// =========================================================
+
+async function isDatabaseConnected() {
+
+    try {
+
+        if (
+            !database ||
+            !initialized
+        ) {
+
+            return false;
+
+        }
+
+        await database.command({
+            ping: 1
+        });
+
+        return true;
+
+    } catch {
+
+        return false;
+
+    }
+
+}
+
+// =========================================================
+// CLOSE DATABASE
+// =========================================================
+
+async function closeDatabase() {
+
+    initialized = false;
+
+    database = null;
+
+    if (client) {
+
+        try {
+
+            await client.close();
+
+        } catch (error) {
+
+            console.error(
+                "MongoDB close error:",
+                error
+            );
+
+        }
+
+    }
+
+    client = null;
+
+}
+
+// =========================================================
+// SHUTDOWN HANDLERS
+// =========================================================
+
+process.once(
+    "SIGINT",
+    async function () {
+
+        await closeDatabase();
+
+        process.exit(
+            0
+        );
+
+    }
+);
+
+process.once(
+    "SIGTERM",
+    async function () {
+
+        await closeDatabase();
+
+        process.exit(
+            0
+        );
+
+    }
+);
+
+// =========================================================
+// EXPORTS
+// =========================================================
 
 module.exports = {
-    db,
-    getDatabase,
-    closeDatabase,
-    DB_PATH
-};
 
-console.log("==============================================");
-console.log("U.S TRAVEL & TOURS DATABASE");
-console.log("==============================================");
-console.log(`Database: ${DB_PATH}`);
-console.log("SQLite database initialized successfully.");
-console.log("==============================================");
+    initDatabase,
+
+    getDatabase,
+
+    getCollection,
+
+    getNextSequence,
+
+    setSequenceAtLeast,
+
+    cleanExpiredSessions,
+
+    cleanExpiredPasswordResets,
+
+    isDatabaseConnected,
+
+    closeDatabase,
+
+    MONGODB_DB_NAME
+
+};
