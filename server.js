@@ -475,34 +475,31 @@ async function bootstrapAdmin() {
 
 async function loadRoutes() {
 
-   /* -----------------------------------------------------
-   AUTH
------------------------------------------------------ */
+// =========================================================
+// AUTHENTICATION ROUTES
+// =========================================================
 
 try {
 
-    const authModule =
-        require("./auth");
+    const authRoutes = require("./auth");
 
-    /*
-     * auth.js exports an object containing:
-     * router
-     * requireAuth
-     * requireAdmin
-     * and other authentication helpers.
-     *
-     * Express needs the actual Router function here.
-     */
+    console.log(
+        "AUTH DEBUG TYPE:",
+        typeof authRoutes
+    );
 
-    const authRoutes =
-        authModule.router || authModule;
+    console.log(
+        "AUTH DEBUG REQUIRE:",
+        typeof authRoutes.requireAuth,
+        typeof authRoutes.requireAdmin
+    );
 
     if (
         typeof authRoutes !== "function"
     ) {
 
         throw new TypeError(
-            "AUTH ROUTES ERROR: ./auth must export an Express Router."
+            "AUTH ROUTES ERROR: ./auth.js is not exporting an Express Router."
         );
 
     }
@@ -513,7 +510,7 @@ try {
     );
 
     console.log(
-        "AUTH ROUTES LOADED"
+        "AUTH ROUTES LOADED SUCCESSFULLY"
     );
 
 } catch (error) {
