@@ -2129,22 +2129,14 @@ databaseReady
 // EXPORT
 // =========================================================
 
-module.exports = {
+module.exports = router;
 
-    router,
-
-    requireAuth,
-
-    requireAdmin,
-
-    getAuthenticatedUser,
-
-    createSession,
-
-    getSession,
-
-    deleteSession,
-
-    deleteAllUserSessions
-
-};
+// Export authentication helpers separately
+module.exports.router = router;
+module.exports.requireAuth = requireAuth;
+module.exports.requireAdmin = requireAdmin;
+module.exports.getAuthenticatedUser = getAuthenticatedUser;
+module.exports.createSession = createSession;
+module.exports.getSession = getSession;
+module.exports.deleteSession = deleteSession;
+module.exports.deleteAllUserSessions = deleteAllUserSessions;
