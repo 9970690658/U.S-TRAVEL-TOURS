@@ -1,244 +1,125 @@
-/* =========================================================
-   U.S TRAVEL & TOURS
-   AUTHENTICATION SYSTEM
-   PostgreSQL Version
-
-   Features:
-   - Customer registration
-   - Customer login
-   - Admin login
-   - Persistent sessions
-   - Remember Me
-   - Logout
-   - Current user
-   - Admin check
-   - Admin create user
-   - Forgot password
-   - Reset password
-   - Change password
-   ========================================================= */
+// =========================================================
+// U.S TRAVEL & TOURS
+// CUSTOMER + ADMIN AUTHENTICATION SYSTEM
+// =========================================================
 
 const express = require("express");
 const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
 const nodemailer = require("nodemailer");
 
-const {
-    pool,
-    initializeDatabase
-} = require("./database");
+const { db } = require("./database");
 
 const router = express.Router();
 
 
 // =========================================================
-// DATABASE READY
-// =========================================================
-
-const databaseReady = initializeDatabase();
-
-
-// =========================================================
-// SESSION SETTINGS
+// CONFIGURATION
 // =========================================================
 
 const SESSION_DURATION_MS =
-    7 * 24 * 60 * 60 * 1000;
-
-const REMEMBER_SESSION_DURATION_MS =
-    30 * 24 * 60 * 60 * 1000;
+    1000 * 60 * 60 * 24 * 7;
 
 const RESET_TOKEN_DURATION_MS =
-    30 * 60 * 1000;
+    1000 * 60 * 30; // 30 minutes
 
-
-// =========================================================
-// EMAIL SETTINGS
-// =========================================================
-
-const SMTP_HOST =
-    process.env.SMTP_HOST ||
-    "smtp-relay.brevo.com";
-
-const SMTP_PORT =
-    Number(process.env.SMTP_PORT || 587);
-
-const SMTP_USER =
-    String(process.env.SMTP_USER || "").trim();
-
-const SMTP_PASS =
-    String(process.env.SMTP_PASS || "").trim();
-
-const SMTP_SECURE =
-    String(
-        process.env.SMTP_SECURE || "false"
-    ).toLowerCase() === "true";
-
-const APP_BASE_URL =
-    String(
-        process.env.APP_BASE_URL ||
-        "https://us-travel-tours.netlify.app"
-    ).replace(/\/+$/, "");
-
-const MAIL_FROM =
-    String(
-        process.env.MAIL_FROM ||
-        SMTP_USER ||
-        "ellisgeorge690@gmail.com"
-    ).trim();
-
+const sessions = new Map();
 
 // =========================================================
-// SMTP TRANSPORTER
+// PASSWORD RESET TABLE
 // =========================================================
 
-let transporter = null;
-
-if (SMTP_USER && SMTP_PASS) {
-
-    transporter = nodemailer.createTransport({
-        host: SMTP_HOST,
-
-        port: SMTP_PORT,
-
-        secure: SMTP_SECURE,
-
-        auth: {
-            user: SMTP_USER,
-            pass: SMTP_PASS
-        }
-    });
-
-    console.log(
-        "Authentication email transporter configured."
+db.exec(`
+    CREATE TABLE IF NOT EXISTS password_resets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        expires_at INTEGER NOT NULL,
+        used_at INTEGER,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id)
     );
 
-} else {
+    CREATE INDEX IF NOT EXISTS idx_password_resets_token
+    ON password_resets(token_hash);
 
-    console.warn(
-        "SMTP credentials are not configured. Password reset emails will be unavailable."
-    );
-
-}
-
+    CREATE INDEX IF NOT EXISTS idx_password_resets_user
+    ON password_resets(user_id);
+`);
 
 // =========================================================
 // HELPERS
 // =========================================================
 
 function normalizeEmail(email) {
-
     return String(email || "")
         .trim()
         .toLowerCase();
-
 }
 
-
-function cleanText(value, maxLength = 500) {
-
-    return String(value || "")
-        .trim()
-        .replace(/\s+/g, " ")
-        .slice(0, maxLength);
-
+function cleanText(value) {
+    return String(value || "").trim();
 }
-
 
 function isValidEmail(email) {
-
-    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/
-        .test(email);
-
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
-
 
 function isStrongPassword(password) {
-
-    const value =
-        String(password || "");
-
     return (
-        value.length >= 8 &&
-        /[A-Z]/.test(value) &&
-        /[a-z]/.test(value) &&
-        /[0-9]/.test(value)
+        password.length >= 8 &&
+        /[A-Za-z]/.test(password) &&
+        /\d/.test(password)
     );
-
 }
 
+// =========================================================
+// EMAIL CONFIGURATION - BREVO SMTP
+// =========================================================
 
-function hashToken(token) {
+let mailTransporter = null;
 
-    return crypto
-        .createHash("sha256")
-        .update(token)
-        .digest("hex");
+function getMailTransporter() {
 
-}
+    if (mailTransporter) {
+        return mailTransporter;
+    }
 
+    const smtpHost = process.env.SMTP_HOST;
+    const smtpPort = Number(process.env.SMTP_PORT || 587);
+    const smtpUser = process.env.SMTP_USER;
+    const smtpPass = process.env.SMTP_PASS;
 
-function createRandomToken() {
+    if (!smtpHost || !smtpUser || !smtpPass) {
 
-    return crypto
-        .randomBytes(32)
-        .toString("hex");
+        console.error(
+            "SMTP CONFIG ERROR: SMTP_HOST / SMTP_USER / SMTP_PASS missing."
+        );
 
-}
-
-
-function getTokenFromRequest(req) {
-
-    const header =
-        String(
-            req.headers.authorization || ""
-        ).trim();
-
-    if (!header) {
         return null;
     }
 
-    if (
-        header
-            .toLowerCase()
-            .startsWith("bearer ")
-    ) {
+    console.log("Creating SMTP transporter...");
+    console.log("SMTP Host:", smtpHost);
+    console.log("SMTP Port:", smtpPort);
+    console.log("SMTP User:", smtpUser);
 
-        return header
-            .slice(7)
-            .trim() || null;
+    mailTransporter = nodemailer.createTransport({
+        host: smtpHost,
+        port: smtpPort,
+        secure:
+            String(
+                process.env.SMTP_SECURE || "false"
+            ).toLowerCase() === "true",
 
-    }
+        auth: {
+            user: smtpUser,
+            pass: smtpPass
+        }
+    });
 
-    return null;
-
+    return mailTransporter;
 }
-
-
-function publicUser(user) {
-
-    if (!user) {
-        return null;
-    }
-
-    return {
-        id: Number(user.id),
-
-        name: user.name,
-
-        email: user.email,
-
-        phone: user.phone || "",
-
-        role: user.role,
-
-        createdAt: user.created_at,
-
-        updatedAt: user.updated_at
-    };
-
-}
-
 
 // =========================================================
 // SEND PASSWORD RESET EMAIL
@@ -246,146 +127,124 @@ function publicUser(user) {
 
 async function sendPasswordResetEmail(
     user,
-    resetToken
+    rawToken
 ) {
 
-    if (!transporter) {
+    const transporter =
+        getMailTransporter();
 
+    if (!transporter) {
         throw new Error(
             "Email service is not configured."
         );
-
     }
 
-    const resetUrl =
-        `${APP_BASE_URL}/reset-password.html?token=${encodeURIComponent(resetToken)}`;
+    await transporter.verify();
 
-    const html = `
+console.log("SMTP connection verified successfully.");
+
+    const baseUrl =
+        String(
+            process.env.APP_BASE_URL ||
+            "http://localhost:3000"
+        ).replace(/\/+$/, "");
+
+    const resetUrl =
+        `${baseUrl}/reset-password.html?token=${encodeURIComponent(rawToken)}`;
+
+    const mailFrom =
+        process.env.MAIL_FROM ||
+        process.env.SMTP_USER;
+
+    const mailResult = await transporter.sendMail({
+
+        from: mailFrom,
+
+        to: user.email,
+
+        subject:
+            "Reset your U.S TRAVEL & TOURS password",
+
+        text:
+`Hello ${user.name || "Customer"},
+
+We received a request to reset your U.S TRAVEL & TOURS account password.
+
+Use the link below to create a new password:
+
+${resetUrl}
+
+This link will expire in 30 minutes and can only be used once.
+
+If you did not request a password reset, you can safely ignore this email.
+
+U.S TRAVEL & TOURS`,
+
+        html:
+`
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-
 <title>Password Reset</title>
-
 </head>
 
-<body style="
-    margin:0;
-    padding:0;
-    background:#f4f6f8;
-    font-family:Arial,Helvetica,sans-serif;
-">
+<body style="margin:0;padding:0;background:#f5f5f5;font-family:Arial,sans-serif;">
 
-<div style="
-    max-width:600px;
-    margin:40px auto;
-    background:#ffffff;
-    padding:35px;
-    border-radius:12px;
-    box-shadow:0 5px 25px rgba(0,0,0,0.08);
-">
+<div style="max-width:600px;margin:40px auto;background:#ffffff;padding:40px;border-radius:10px;">
 
-<h2 style="
-    margin-top:0;
-    color:#061426;
-">
-U.S TRAVEL & TOURS
-</h2>
+    <h2 style="margin-top:0;">
+        U.S TRAVEL & TOURS
+    </h2>
 
-<p>
-Hello ${escapeHtml(user.name || "Customer")},
-</p>
+    <p>
+        Hello ${escapeHtml(user.name || "Customer")},
+    </p>
 
-<p>
-We received a request to reset the password for your account.
-</p>
+    <p>
+        We received a request to reset your account password.
+    </p>
 
-<p>
-Click the button below to create a new password:
-</p>
+    <p>
+        Click the button below to create a new password.
+    </p>
 
-<p style="margin:30px 0;">
+    <p style="margin:30px 0;">
+        <a
+            href="${resetUrl}"
+            style="
+                display:inline-block;
+                padding:14px 24px;
+                background:#111111;
+                color:#ffffff;
+                text-decoration:none;
+                border-radius:6px;
+                font-weight:bold;
+            "
+        >
+            Reset Password
+        </a>
+    </p>
 
-<a
-    href="${resetUrl}"
-    style="
-        display:inline-block;
-        background:#061426;
-        color:#ffffff;
-        text-decoration:none;
-        padding:14px 24px;
-        border-radius:6px;
-        font-weight:bold;
-    "
->
-Reset Password
-</a>
+    <p style="font-size:14px;color:#666;">
+        This link expires in 30 minutes and can only be used once.
+    </p>
 
-</p>
-
-<p>
-This password reset link is valid for 30 minutes.
-</p>
-
-<p>
-If you did not request this password reset, you can safely ignore this email.
-</p>
-
-<hr style="
-    border:none;
-    border-top:1px solid #eeeeee;
-    margin:30px 0;
-">
-
-<p style="
-    color:#777777;
-    font-size:13px;
-">
-U.S TRAVEL & TOURS
-</p>
+    <p style="font-size:14px;color:#666;">
+        If you did not request this password reset, you can safely ignore this email.
+    </p>
 
 </div>
 
 </body>
 </html>
-`;
-
-    const text = `
-U.S TRAVEL & TOURS
-
-Hello ${user.name || "Customer"},
-
-We received a request to reset your password.
-
-Use the following link to reset your password:
-
-${resetUrl}
-
-This link is valid for 30 minutes.
-
-If you did not request this password reset, you can ignore this email.
-`;
-
-    await transporter.verify();
-
-    await transporter.sendMail({
-
-        from: MAIL_FROM,
-
-        to: user.email,
-
-        subject:
-            "U.S TRAVEL & TOURS - Password Reset",
-
-        text,
-
-        html
-
+`
     });
-
+     console.log("PASSWORD RESET EMAIL SENT");
+    console.log("Message ID:", mailResult.messageId);
+    console.log("Accepted:", mailResult.accepted);
+    console.log("Rejected:", mailResult.rejected);
 }
-
 
 // =========================================================
 // HTML ESCAPE
@@ -399,214 +258,85 @@ function escapeHtml(value) {
         .replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;")
         .replace(/'/g, "&#039;");
-
 }
 
-
 // =========================================================
-// CREATE SESSION
+// SESSION
 // =========================================================
 
-async function createSession(
-    user,
-    remember = false
-) {
-
-    await databaseReady;
+function createSession(user) {
 
     const token =
-        createRandomToken();
-
-    const tokenHash =
-        hashToken(token);
-
-    const duration =
-        remember
-            ? REMEMBER_SESSION_DURATION_MS
-            : SESSION_DURATION_MS;
+        crypto.randomBytes(32).toString("hex");
 
     const expiresAt =
-        Date.now() + duration;
+        Date.now() + SESSION_DURATION_MS;
 
-    await pool.query(
-        `
-        INSERT INTO sessions (
-            token_hash,
-            user_id,
-            role,
-            expires_at,
-            created_at,
-            last_used_at
-        )
-
-        VALUES (
-            $1,
-            $2,
-            $3,
-            $4,
-            CURRENT_TIMESTAMP,
-            CURRENT_TIMESTAMP
-        )
-        `,
-        [
-            tokenHash,
-            user.id,
-            user.role,
-            expiresAt
-        ]
-    );
+    sessions.set(token, {
+        userId: user.id,
+        role: user.role,
+        expiresAt
+    });
 
     return {
         token,
         expiresAt
     };
-
 }
-
 
 // =========================================================
 // GET SESSION
 // =========================================================
 
-async function getSession(token) {
+function getSession(token) {
 
     if (!token) {
-        return null;
-    }
-
-    await databaseReady;
-
-    const tokenHash =
-        hashToken(token);
-
-    const result =
-        await pool.query(
-            `
-            SELECT
-                id,
-                token_hash,
-                user_id,
-                role,
-                expires_at,
-                created_at,
-                last_used_at
-
-            FROM sessions
-
-            WHERE token_hash = $1
-
-            LIMIT 1
-            `,
-            [tokenHash]
-        );
-
-    if (result.rows.length === 0) {
         return null;
     }
 
     const session =
-        result.rows[0];
+        sessions.get(token);
 
-    const expiresAt =
-        Number(session.expires_at);
-
-    if (
-        !Number.isFinite(expiresAt) ||
-        expiresAt <= Date.now()
-    ) {
-
-        await pool.query(
-            `
-            DELETE FROM sessions
-            WHERE id = $1
-            `,
-            [session.id]
-        );
-
+    if (!session) {
         return null;
     }
 
-    await pool.query(
-        `
-        UPDATE sessions
-
-        SET last_used_at =
-            CURRENT_TIMESTAMP
-
-        WHERE id = $1
-        `,
-        [session.id]
-    );
-
-    return {
-        id: Number(session.id),
-
-        userId: Number(session.user_id),
-
-        role: session.role,
-
-        expiresAt
-    };
-
-}
-
-
-// =========================================================
-// DELETE SESSION
-// =========================================================
-
-async function deleteSession(token) {
-
-    if (!token) {
-        return;
+    if (
+        Date.now() >
+        session.expiresAt
+    ) {
+        sessions.delete(token);
+        return null;
     }
 
-    await databaseReady;
-
-    const tokenHash =
-        hashToken(token);
-
-    await pool.query(
-        `
-        DELETE FROM sessions
-
-        WHERE token_hash = $1
-        `,
-        [tokenHash]
-    );
-
+    return session;
 }
 
-
 // =========================================================
-// DELETE ALL USER SESSIONS
+// GET TOKEN
 // =========================================================
 
-async function deleteAllUserSessions(
-    userId
-) {
+function getTokenFromRequest(req) {
 
-    await databaseReady;
+    const authHeader =
+        req.headers.authorization || "";
 
-    await pool.query(
-        `
-        DELETE FROM sessions
+    if (
+        !authHeader.startsWith("Bearer ")
+    ) {
+        return null;
+    }
 
-        WHERE user_id = $1
-        `,
-        [userId]
-    );
-
+    return authHeader
+        .substring(7)
+        .trim();
 }
-
 
 // =========================================================
 // GET AUTHENTICATED USER
 // =========================================================
 
-async function getAuthenticatedUser(
-    req
-) {
+function getAuthenticatedUser(req) {
 
     const token =
         getTokenFromRequest(req);
@@ -616,179 +346,133 @@ async function getAuthenticatedUser(
     }
 
     const session =
-        await getSession(token);
+        getSession(token);
 
     if (!session) {
         return null;
     }
 
-    const result =
-        await pool.query(
-            `
+    const user =
+        db.prepare(`
             SELECT
                 id,
                 name,
                 email,
                 phone,
-                password_hash,
                 role,
                 created_at,
                 updated_at
-
             FROM users
-
-            WHERE id = $1
-
+            WHERE id = ?
             LIMIT 1
-            `,
-            [session.userId]
-        );
+        `).get(session.userId);
 
-    if (result.rows.length === 0) {
+    if (!user) {
 
-        await deleteSession(token);
+        sessions.delete(token);
 
         return null;
-
     }
 
-    const user =
-        result.rows[0];
-
-    // Keep session role synchronized.
-    if (user.role !== session.role) {
-
-        await pool.query(
-            `
-            UPDATE sessions
-
-            SET role = $1
-
-            WHERE id = $2
-            `,
-            [
-                user.role,
-                session.id
-            ]
-        );
-
-    }
-
-    return user;
-
+    return {
+        token,
+        session,
+        user
+    };
 }
 
-
 // =========================================================
-// AUTH MIDDLEWARE
+// REQUIRE LOGIN
 // =========================================================
 
-async function requireAuth(
+function requireAuth(
     req,
     res,
     next
 ) {
 
-    try {
+    const authenticated =
+        getAuthenticatedUser(req);
 
-        await databaseReady;
+    if (!authenticated) {
 
-        const user =
-            await getAuthenticatedUser(req);
+        return res.status(401).json({
 
-        if (!user) {
-
-            return res.status(401).json({
-                success: false,
-                message:
-                    "Authentication required."
-            });
-
-        }
-
-        req.user = user;
-
-        next();
-
-    } catch (error) {
-
-        console.error(
-            "Authentication middleware error:",
-            error
-        );
-
-        return res.status(500).json({
             success: false,
-            message:
-                "Authentication service error."
-        });
 
+            message:
+                "Authentication required."
+
+        });
     }
 
+    req.user =
+        authenticated.user;
+
+    req.authToken =
+        authenticated.token;
+
+    req.session =
+        authenticated.session;
+
+    next();
 }
 
-
 // =========================================================
-// ADMIN MIDDLEWARE
+// REQUIRE ADMIN
 // =========================================================
 
-async function requireAdmin(
+function requireAdmin(
     req,
     res,
     next
 ) {
 
-    try {
+    const authenticated =
+        getAuthenticatedUser(req);
 
-        await databaseReady;
+    if (!authenticated) {
 
-        const user =
-            await getAuthenticatedUser(req);
+        return res.status(401).json({
 
-        if (!user) {
-
-            return res.status(401).json({
-                success: false,
-                message:
-                    "Authentication required."
-            });
-
-        }
-
-        if (user.role !== "admin") {
-
-            return res.status(403).json({
-                success: false,
-                message:
-                    "Administrator access required."
-            });
-
-        }
-
-        req.user = user;
-
-        next();
-
-    } catch (error) {
-
-        console.error(
-            "Admin middleware error:",
-            error
-        );
-
-        return res.status(500).json({
             success: false,
-            message:
-                "Authentication service error."
-        });
 
+            message:
+                "Authentication required."
+
+        });
     }
 
+    if (
+        authenticated.user.role !==
+        "admin"
+    ) {
+
+        return res.status(403).json({
+
+            success: false,
+
+            message:
+                "Admin access required."
+
+        });
+    }
+
+    req.user =
+        authenticated.user;
+
+    req.authToken =
+        authenticated.token;
+
+    req.session =
+        authenticated.session;
+
+    next();
 }
 
-
 // =========================================================
-// REGISTER CUSTOMER
+// CUSTOMER REGISTER
+// POST /api/auth/register
 // =========================================================
 
 router.post(
@@ -797,12 +481,9 @@ router.post(
 
         try {
 
-            await databaseReady;
-
             const name =
                 cleanText(
-                    req.body.name,
-                    100
+                    req.body.name
                 );
 
             const email =
@@ -812,95 +493,111 @@ router.post(
 
             const phone =
                 cleanText(
-                    req.body.phone,
-                    30
+                    req.body.phone
+                );
+
+            const country =
+                cleanText(
+                    req.body.country
+                );
+
+            const city =
+                cleanText(
+                    req.body.city
                 );
 
             const password =
-                String(
-                    req.body.password || ""
+                cleanText(
+                    req.body.password
                 );
 
             const consent =
-                req.body.consent === true ||
-                req.body.consent === "true" ||
-                req.body.consent === 1 ||
-                req.body.consent === "1";
+                Boolean(
+                    req.body.consent
+                );
 
             // -------------------------------------------------
             // VALIDATION
             // -------------------------------------------------
 
-            if (!name) {
+            if (
+                !name ||
+                !email ||
+                !password
+            ) {
 
                 return res.status(400).json({
-                    success: false,
-                    message:
-                        "Name is required."
-                });
 
+                    success: false,
+
+                    message:
+                        "Full name, email and password are required."
+
+                });
             }
 
             if (!isValidEmail(email)) {
 
                 return res.status(400).json({
+
                     success: false,
+
                     message:
                         "Please enter a valid email address."
-                });
 
+                });
             }
 
             if (!isStrongPassword(password)) {
 
                 return res.status(400).json({
-                    success: false,
-                    message:
-                        "Password must be at least 8 characters and contain uppercase, lowercase and a number."
-                });
 
+                    success: false,
+
+                    message:
+                        "Password must contain at least 8 characters and include letters and numbers."
+
+                });
             }
 
             if (!consent) {
 
                 return res.status(400).json({
-                    success: false,
-                    message:
-                        "Please accept the terms and privacy policy."
-                });
 
+                    success: false,
+
+                    message:
+                        "You must agree to the Terms & Conditions and Privacy Policy."
+
+                });
             }
 
             // -------------------------------------------------
-            // CHECK DUPLICATE
+            // DUPLICATE EMAIL
             // -------------------------------------------------
 
-            const existing =
-                await pool.query(
-                    `
+            const existingUser =
+                db.prepare(`
                     SELECT id
-
                     FROM users
-
-                    WHERE LOWER(email) = LOWER($1)
-
+                    WHERE email = ?
                     LIMIT 1
-                    `,
-                    [email]
-                );
+                `).get(email);
 
-            if (existing.rows.length > 0) {
+            if (existingUser) {
 
                 return res.status(409).json({
-                    success: false,
-                    message:
-                        "An account with this email already exists."
-                });
 
+                    success: false,
+
+                    message:
+                        "An account with this email already exists. Please login instead."
+
+                });
             }
 
             // -------------------------------------------------
-            // PASSWORD HASH
+            // HASH PASSWORD
             // -------------------------------------------------
 
             const passwordHash =
@@ -914,99 +611,58 @@ router.post(
             // -------------------------------------------------
 
             const result =
-                await pool.query(
-                    `
+                db.prepare(`
                     INSERT INTO users (
                         name,
                         email,
                         phone,
                         password_hash,
-                        role,
-                        created_at,
-                        updated_at
+                        role
                     )
-
-                    VALUES (
-                        $1,
-                        $2,
-                        $3,
-                        $4,
-                        'customer',
-                        CURRENT_TIMESTAMP,
-                        CURRENT_TIMESTAMP
-                    )
-
-                    RETURNING
-                        id,
-                        name,
-                        email,
-                        phone,
-                        role,
-                        created_at,
-                        updated_at
-                    `,
-                    [
-                        name,
-                        email,
-                        phone || null,
-                        passwordHash
-                    ]
+                    VALUES (?, ?, ?, ?, ?)
+                `).run(
+                    name,
+                    email,
+                    phone || null,
+                    passwordHash,
+                    "customer"
                 );
-
-            const user =
-                result.rows[0];
-
-            console.log(
-                `New customer registered: ${email}`
-            );
 
             return res.status(201).json({
 
                 success: true,
 
                 message:
-                    "Account created successfully.",
+                    "Account created successfully. Please login.",
 
-                user: publicUser(user),
-
-                userId: Number(user.id)
+                userId:
+                    result.lastInsertRowid
 
             });
 
         } catch (error) {
 
             console.error(
-                "Registration error:",
+                "Customer registration error:",
                 error
             );
 
-            if (
-                error &&
-                error.code === "23505"
-            ) {
-
-                return res.status(409).json({
-                    success: false,
-                    message:
-                        "An account with this email already exists."
-                });
-
-            }
-
             return res.status(500).json({
+
                 success: false,
+
                 message:
-                    "Unable to create account."
+                    "Unable to create your account right now."
+
             });
-
         }
-
     }
 );
 
-
 // =========================================================
 // LOGIN
+// POST /api/auth/login
+// CUSTOMER + ADMIN
 // =========================================================
 
 router.post(
@@ -1015,25 +671,47 @@ router.post(
 
         try {
 
-            await databaseReady;
+            // -------------------------------------------------
+            // NORMALIZE EMAIL
+            // -------------------------------------------------
 
             const email =
-                normalizeEmail(
-                    req.body.email
-                );
+                String(
+                    req.body?.email || ""
+                )
+                    .trim()
+                    .toLowerCase();
 
-            // DO NOT trim password.
-            // Password spaces may be intentional.
+            // IMPORTANT:
+            // Do NOT trim password.
+            // Password must be checked exactly as entered.
+
             const password =
                 String(
-                    req.body.password || ""
+                    req.body?.password || ""
                 );
 
             const remember =
-                req.body.remember === true ||
-                req.body.remember === "true" ||
-                req.body.remember === 1 ||
-                req.body.remember === "1";
+                Boolean(
+                    req.body?.remember
+                );
+
+            // -------------------------------------------------
+            // BASIC VALIDATION
+            // -------------------------------------------------
+
+            if (
+                !email ||
+                !password
+            ) {
+
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        "Email and password are required."
+                });
+
+            }
 
             if (!isValidEmail(email)) {
 
@@ -1045,43 +723,35 @@ router.post(
 
             }
 
-            if (!password) {
-
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        "Password is required."
-                });
-
-            }
-
             // -------------------------------------------------
             // FIND USER
+            // CASE + SPACE SAFE EMAIL MATCH
             // -------------------------------------------------
 
-            const result =
-                await pool.query(
-                    `
+            const user =
+                db.prepare(`
                     SELECT
                         id,
                         name,
                         email,
                         phone,
                         password_hash,
-                        role,
-                        created_at,
-                        updated_at
-
+                        role
                     FROM users
-
-                    WHERE LOWER(email) = LOWER($1)
-
+                    WHERE LOWER(TRIM(email)) = ?
                     LIMIT 1
-                    `,
-                    [email]
-                );
+                `).get(email);
 
-            if (result.rows.length === 0) {
+            // -------------------------------------------------
+            // USER NOT FOUND
+            // -------------------------------------------------
+
+            if (!user) {
+
+                console.log(
+                    "LOGIN FAILED - USER NOT FOUND:",
+                    email
+                );
 
                 return res.status(401).json({
                     success: false,
@@ -1090,21 +760,47 @@ router.post(
                 });
 
             }
-
-            const user =
-                result.rows[0];
 
             // -------------------------------------------------
             // PASSWORD CHECK
             // -------------------------------------------------
 
-            const passwordMatch =
+            if (
+                !user.password_hash
+            ) {
+
+                console.error(
+                    "LOGIN ERROR - PASSWORD HASH MISSING:",
+                    {
+                        userId: user.id,
+                        email: user.email
+                    }
+                );
+
+                return res.status(401).json({
+                    success: false,
+                    message:
+                        "Invalid email or password."
+                });
+
+            }
+
+            const passwordMatches =
                 await bcrypt.compare(
                     password,
                     user.password_hash
                 );
 
-            if (!passwordMatch) {
+            // -------------------------------------------------
+            // WRONG PASSWORD
+            // -------------------------------------------------
+
+            if (!passwordMatches) {
+
+                console.log(
+                    "LOGIN FAILED - PASSWORD MISMATCH:",
+                    email
+                );
 
                 return res.status(401).json({
                     success: false,
@@ -1115,20 +811,63 @@ router.post(
             }
 
             // -------------------------------------------------
-            // CREATE PERSISTENT SESSION
+            // NORMALIZE ROLE
+            // -------------------------------------------------
+
+            const normalizedRole =
+                String(
+                    user.role || "customer"
+                )
+                    .trim()
+                    .toLowerCase();
+
+            // -------------------------------------------------
+            // CREATE SESSION
             // -------------------------------------------------
 
             const session =
-                await createSession(
-                    user,
-                    remember
-                );
+                createSession({
+                    ...user,
+                    role: normalizedRole
+                });
+
+            // -------------------------------------------------
+            // RESPONSE USER
+            // -------------------------------------------------
+
+            const responseUser = {
+
+                id: user.id,
+
+                name: user.name,
+
+                email:
+                    String(
+                        user.email || ""
+                    )
+                        .trim()
+                        .toLowerCase(),
+
+                phone: user.phone,
+
+                role: normalizedRole
+
+            };
+
+            // -------------------------------------------------
+            // SUCCESS
+            // -------------------------------------------------
 
             console.log(
-                `Successful login: ${email} (${user.role})`
+                "LOGIN SUCCESS:",
+                {
+                    userId: user.id,
+                    email: responseUser.email,
+                    role: normalizedRole
+                }
             );
 
-            return res.json({
+            return res.status(200).json({
 
                 success: true,
 
@@ -1144,7 +883,7 @@ router.post(
                 remember,
 
                 user:
-                    publicUser(user)
+                    responseUser
 
             });
 
@@ -1156,16 +895,18 @@ router.post(
             );
 
             return res.status(500).json({
+
                 success: false,
+
                 message:
-                    "Unable to login."
+                    "Unable to process login right now."
+
             });
 
         }
 
     }
 );
-
 
 // =========================================================
 // LOGOUT
@@ -1173,105 +914,47 @@ router.post(
 
 router.post(
     "/logout",
-    async (req, res) => {
+    requireAuth,
+    (req, res) => {
 
-        try {
+        sessions.delete(
+            req.authToken
+        );
 
-            await databaseReady;
+        return res.status(200).json({
 
-            const token =
-                getTokenFromRequest(req);
+            success: true,
 
-            if (token) {
+            message:
+                "Logout successful."
 
-                await deleteSession(
-                    token
-                );
-
-            }
-
-            return res.json({
-
-                success: true,
-
-                message:
-                    "Logged out successfully."
-
-            });
-
-        } catch (error) {
-
-            console.error(
-                "Logout error:",
-                error
-            );
-
-            return res.status(500).json({
-                success: false,
-                message:
-                    "Unable to logout."
-            });
-
-        }
-
+        });
     }
 );
 
+console.log("AUTH DEBUG requireAuth:", typeof requireAuth);
+console.log("AUTH DEBUG requireAdmin:", typeof requireAdmin);
 
 // =========================================================
 // CURRENT USER
+// GET /api/auth/me
 // =========================================================
 
 router.get(
     "/me",
-    async (req, res) => {
+    requireAuth,
+    (req, res) => {
 
-        try {
+        return res.status(200).json({
 
-            await databaseReady;
+            success: true,
 
-            const user =
-                await getAuthenticatedUser(req);
+            user:
+                req.user
 
-            if (!user) {
-
-                return res.status(401).json({
-                    success: false,
-                    message:
-                        "Not authenticated."
-                });
-
-            }
-
-            return res.json({
-
-                success: true,
-
-                authenticated: true,
-
-                user:
-                    publicUser(user)
-
-            });
-
-        } catch (error) {
-
-            console.error(
-                "GET /me error:",
-                error
-            );
-
-            return res.status(500).json({
-                success: false,
-                message:
-                    "Unable to load user."
-            });
-
-        }
-
+        });
     }
 );
-
 
 // =========================================================
 // ADMIN CHECK
@@ -1279,67 +962,22 @@ router.get(
 
 router.get(
     "/admin-check",
-    async (req, res) => {
+    requireAdmin,
+    (req, res) => {
 
-        try {
+        return res.status(200).json({
 
-            await databaseReady;
+            success: true,
 
-            const user =
-                await getAuthenticatedUser(req);
+            message:
+                "Admin authentication verified.",
 
-            if (!user) {
+            user:
+                req.user
 
-                return res.status(401).json({
-                    success: false,
-                    isAdmin: false,
-                    message:
-                        "Not authenticated."
-                });
-
-            }
-
-            if (user.role !== "admin") {
-
-                return res.status(403).json({
-                    success: false,
-                    isAdmin: false,
-                    message:
-                        "Administrator access required."
-                });
-
-            }
-
-            return res.json({
-
-                success: true,
-
-                isAdmin: true,
-
-                user:
-                    publicUser(user)
-
-            });
-
-        } catch (error) {
-
-            console.error(
-                "Admin check error:",
-                error
-            );
-
-            return res.status(500).json({
-                success: false,
-                isAdmin: false,
-                message:
-                    "Unable to check administrator access."
-            });
-
-        }
-
+        });
     }
 );
-
 
 // =========================================================
 // ADMIN CREATE USER
@@ -1352,12 +990,9 @@ router.post(
 
         try {
 
-            await databaseReady;
-
             const name =
                 cleanText(
-                    req.body.name,
-                    100
+                    req.body.name
                 );
 
             const email =
@@ -1367,87 +1002,93 @@ router.post(
 
             const phone =
                 cleanText(
-                    req.body.phone,
-                    30
+                    req.body.phone
                 );
 
             const password =
-                String(
-                    req.body.password || ""
+                cleanText(
+                    req.body.password
                 );
 
-            const requestedRole =
-                String(
-                    req.body.role || "customer"
-                )
-                    .trim()
-                    .toLowerCase();
+            const role =
+                cleanText(
+                    req.body.role ||
+                    "customer"
+                );
 
-            if (!name) {
+            if (
+                !name ||
+                !email ||
+                !password
+            ) {
 
                 return res.status(400).json({
-                    success: false,
-                    message:
-                        "Name is required."
-                });
 
+                    success: false,
+
+                    message:
+                        "Name, email and password are required."
+
+                });
             }
 
             if (!isValidEmail(email)) {
 
                 return res.status(400).json({
+
                     success: false,
+
                     message:
                         "Please enter a valid email address."
-                });
 
+                });
             }
 
             if (!isStrongPassword(password)) {
 
                 return res.status(400).json({
-                    success: false,
-                    message:
-                        "Password must be at least 8 characters and contain uppercase, lowercase and a number."
-                });
 
+                    success: false,
+
+                    message:
+                        "Password must contain at least 8 characters and include letters and numbers."
+
+                });
             }
 
             if (
-                requestedRole !== "customer" &&
-                requestedRole !== "admin"
+                !["customer", "admin"]
+                    .includes(role)
             ) {
 
                 return res.status(400).json({
-                    success: false,
-                    message:
-                        "Invalid user role."
-                });
 
+                    success: false,
+
+                    message:
+                        "Invalid account role."
+
+                });
             }
 
-            const existing =
-                await pool.query(
-                    `
+            const existingUser =
+                db.prepare(`
                     SELECT id
-
                     FROM users
-
-                    WHERE LOWER(email) = LOWER($1)
-
+                    WHERE email = ?
                     LIMIT 1
-                    `,
-                    [email]
-                );
+                `).get(email);
 
-            if (existing.rows.length > 0) {
+            if (existingUser) {
 
                 return res.status(409).json({
+
                     success: false,
+
                     message:
                         "An account with this email already exists."
-                });
 
+                });
             }
 
             const passwordHash =
@@ -1457,98 +1098,57 @@ router.post(
                 );
 
             const result =
-                await pool.query(
-                    `
+                db.prepare(`
                     INSERT INTO users (
                         name,
                         email,
                         phone,
                         password_hash,
-                        role,
-                        created_at,
-                        updated_at
+                        role
                     )
-
-                    VALUES (
-                        $1,
-                        $2,
-                        $3,
-                        $4,
-                        $5,
-                        CURRENT_TIMESTAMP,
-                        CURRENT_TIMESTAMP
-                    )
-
-                    RETURNING
-                        id,
-                        name,
-                        email,
-                        phone,
-                        role,
-                        created_at,
-                        updated_at
-                    `,
-                    [
-                        name,
-                        email,
-                        phone || null,
-                        passwordHash,
-                        requestedRole
-                    ]
+                    VALUES (?, ?, ?, ?, ?)
+                `).run(
+                    name,
+                    email,
+                    phone || null,
+                    passwordHash,
+                    role
                 );
-
-            const user =
-                result.rows[0];
 
             return res.status(201).json({
 
                 success: true,
 
                 message:
-                    "User created successfully.",
-
-                user:
-                    publicUser(user),
+                    "User account created successfully.",
 
                 userId:
-                    Number(user.id)
+                    result.lastInsertRowid
 
             });
 
         } catch (error) {
 
             console.error(
-                "Admin create-user error:",
+                "Create user error:",
                 error
             );
 
-            if (
-                error &&
-                error.code === "23505"
-            ) {
-
-                return res.status(409).json({
-                    success: false,
-                    message:
-                        "An account with this email already exists."
-                });
-
-            }
-
             return res.status(500).json({
+
                 success: false,
+
                 message:
-                    "Unable to create user."
+                    "Unable to create user account."
+
             });
-
         }
-
     }
 );
 
-
 // =========================================================
 // FORGOT PASSWORD
+// POST /api/auth/forgot-password
 // =========================================================
 
 router.post(
@@ -1557,123 +1157,136 @@ router.post(
 
         try {
 
-            await databaseReady;
-
             const email =
                 normalizeEmail(
                     req.body.email
                 );
 
-            if (!isValidEmail(email)) {
+            // Always return the same message.
+            // This prevents account enumeration.
 
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        "Please enter a valid email address."
-                });
+            const genericMessage =
+                "If an account exists for this email, a password reset link has been sent.";
 
-            }
+            if (
+                !email ||
+                !isValidEmail(email)
+            ) {
 
-            const result =
-                await pool.query(
-                    `
-                    SELECT
-                        id,
-                        name,
-                        email,
-                        role
-
-                    FROM users
-
-                    WHERE LOWER(email) = LOWER($1)
-
-                    LIMIT 1
-                    `,
-                    [email]
-                );
-
-            // Always use a generic response
-            // so account existence is not exposed.
-            if (result.rows.length === 0) {
-
-                return res.json({
+                return res.status(200).json({
 
                     success: true,
 
                     message:
-                        "If an account exists with this email, a password reset link has been sent."
+                        genericMessage
 
                 });
-
             }
 
             const user =
-                result.rows[0];
+                db.prepare(`
+                    SELECT
+                        id,
+                        name,
+                        email
+                    FROM users
+                    WHERE email = ?
+                    LIMIT 1
+                `).get(email);
+
+            if (!user) {
+
+                return res.status(200).json({
+
+                    success: true,
+
+                    message:
+                        genericMessage
+
+                });
+            }
 
             // -------------------------------------------------
-            // INVALIDATE OLD RESET TOKENS
+            // REMOVE OLD RESET TOKENS
             // -------------------------------------------------
 
-            await pool.query(
-                `
-                UPDATE password_resets
+            db.prepare(`
+                DELETE FROM password_resets
+                WHERE user_id = ?
+            `).run(user.id);
 
-                SET used_at = $1
+            // -------------------------------------------------
+            // GENERATE SECURE TOKEN
+            // -------------------------------------------------
 
-                WHERE user_id = $2
-
-                AND used_at IS NULL
-                `,
-                [
-                    Date.now(),
-                    user.id
-                ]
-            );
-
-            const resetToken =
-                createRandomToken();
+            const rawToken =
+                crypto
+                    .randomBytes(32)
+                    .toString("hex");
 
             const tokenHash =
-                hashToken(resetToken);
+                crypto
+                    .createHash("sha256")
+                    .update(rawToken)
+                    .digest("hex");
 
             const expiresAt =
                 Date.now() +
                 RESET_TOKEN_DURATION_MS;
 
-            await pool.query(
-                `
+            db.prepare(`
                 INSERT INTO password_resets (
                     user_id,
                     token_hash,
-                    expires_at,
-                    created_at
+                    expires_at
                 )
-
-                VALUES (
-                    $1,
-                    $2,
-                    $3,
-                    CURRENT_TIMESTAMP
-                )
-                `,
-                [
-                    user.id,
-                    tokenHash,
-                    expiresAt
-                ]
+                VALUES (?, ?, ?)
+            `).run(
+                user.id,
+                tokenHash,
+                expiresAt
             );
 
-            await sendPasswordResetEmail(
-                user,
-                resetToken
-            );
+            // -------------------------------------------------
+            // SEND EMAIL
+            // -------------------------------------------------
 
-            return res.json({
+            try {
+
+                await sendPasswordResetEmail(
+                    user,
+                    rawToken
+                );
+
+            } catch (mailError) {
+
+                console.error(
+                    "Password reset email error:",
+                    mailError
+                );
+
+                // Delete unusable token
+                db.prepare(`
+                    DELETE FROM password_resets
+                    WHERE token_hash = ?
+                `).run(tokenHash);
+
+                return res.status(200).json({
+
+                    success: true,
+
+                    message:
+                        genericMessage
+
+                });
+            }
+
+            return res.status(200).json({
 
                 success: true,
 
                 message:
-                    "If an account exists with this email, a password reset link has been sent."
+                    genericMessage
 
             });
 
@@ -1685,125 +1298,152 @@ router.post(
             );
 
             return res.status(500).json({
+
                 success: false,
+
                 message:
-                    "Unable to process password reset request."
+                    "Unable to process your password reset request right now."
+
             });
-
         }
-
     }
 );
 
-
 // =========================================================
 // RESET PASSWORD
+// POST /api/auth/reset-password
 // =========================================================
 
 router.post(
     "/reset-password",
     async (req, res) => {
 
-        const client =
-            await pool.connect();
-
         try {
 
-            await databaseReady;
-
             const token =
-                String(
-                    req.body.token || ""
-                ).trim();
-
-            const newPassword =
-                String(
-                    req.body.password ||
-                    req.body.newPassword ||
-                    ""
+                cleanText(
+                    req.body.token
                 );
 
-            if (!token) {
+            const newPassword =
+                cleanText(
+                    req.body.newPassword
+                );
+
+            const confirmPassword =
+                cleanText(
+                    req.body.confirmPassword
+                );
+
+            if (
+                !token ||
+                !newPassword ||
+                !confirmPassword
+            ) {
 
                 return res.status(400).json({
-                    success: false,
-                    message:
-                        "Reset token is required."
-                });
 
+                    success: false,
+
+                    message:
+                        "Reset token and password are required."
+
+                });
             }
 
-            if (!isStrongPassword(newPassword)) {
+            if (
+                newPassword !==
+                confirmPassword
+            ) {
 
                 return res.status(400).json({
-                    success: false,
-                    message:
-                        "Password must be at least 8 characters and contain uppercase, lowercase and a number."
-                });
 
+                    success: false,
+
+                    message:
+                        "Passwords do not match."
+
+                });
+            }
+
+            if (
+                !isStrongPassword(
+                    newPassword
+                )
+            ) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "Password must contain at least 8 characters and include letters and numbers."
+
+                });
             }
 
             const tokenHash =
-                hashToken(token);
+                crypto
+                    .createHash("sha256")
+                    .update(token)
+                    .digest("hex");
 
-            await client.query(
-                "BEGIN"
-            );
-
-            const resetResult =
-                await client.query(
-                    `
+            const resetRecord =
+                db.prepare(`
                     SELECT
                         id,
                         user_id,
                         expires_at,
                         used_at
-
                     FROM password_resets
-
-                    WHERE token_hash = $1
-
+                    WHERE token_hash = ?
                     LIMIT 1
+                `).get(tokenHash);
 
-                    FOR UPDATE
-                    `,
-                    [tokenHash]
-                );
-
-            if (
-                resetResult.rows.length === 0
-            ) {
-
-                await client.query(
-                    "ROLLBACK"
-                );
+            if (!resetRecord) {
 
                 return res.status(400).json({
-                    success: false,
-                    message:
-                        "Invalid or expired reset token."
-                });
 
+                    success: false,
+
+                    message:
+                        "This password reset link is invalid or has expired."
+
+                });
             }
 
-            const reset =
-                resetResult.rows[0];
-
-            if (
-                reset.used_at !== null ||
-                Number(reset.expires_at) <= Date.now()
-            ) {
-
-                await client.query(
-                    "ROLLBACK"
-                );
+            if (resetRecord.used_at) {
 
                 return res.status(400).json({
-                    success: false,
-                    message:
-                        "Invalid or expired reset token."
-                });
 
+                    success: false,
+
+                    message:
+                        "This password reset link has already been used."
+
+                });
+            }
+
+            if (
+                Date.now() >
+                Number(
+                    resetRecord.expires_at
+                )
+            ) {
+
+                db.prepare(`
+                    DELETE FROM password_resets
+                    WHERE id = ?
+                `).run(resetRecord.id);
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "This password reset link has expired. Please request a new one."
+
+                });
             }
 
             const passwordHash =
@@ -1816,73 +1456,64 @@ router.post(
             // UPDATE PASSWORD
             // -------------------------------------------------
 
-            await client.query(
-                `
-                UPDATE users
+            const transaction =
+                db.transaction(() => {
 
-                SET
-                    password_hash = $1,
-                    updated_at = CURRENT_TIMESTAMP
+                    db.prepare(`
+                        UPDATE users
+                        SET
+                            password_hash = ?,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                    `).run(
+                        passwordHash,
+                        resetRecord.user_id
+                    );
 
-                WHERE id = $2
-                `,
-                [
-                    passwordHash,
-                    reset.user_id
-                ]
-            );
+                    db.prepare(`
+                        UPDATE password_resets
+                        SET used_at = ?
+                        WHERE id = ?
+                    `).run(
+                        Date.now(),
+                        resetRecord.id
+                    );
+                });
 
-            // -------------------------------------------------
-            // MARK TOKEN USED
-            // -------------------------------------------------
-
-            await client.query(
-                `
-                UPDATE password_resets
-
-                SET used_at = $1
-
-                WHERE id = $2
-                `,
-                [
-                    Date.now(),
-                    reset.id
-                ]
-            );
+            transaction();
 
             // -------------------------------------------------
-            // DELETE ALL OLD SESSIONS
+            // INVALIDATE ALL EXISTING SESSIONS
             // -------------------------------------------------
 
-            await client.query(
-                `
-                DELETE FROM sessions
+            for (
+                const [
+                    sessionToken,
+                    session
+                ] of sessions.entries()
+            ) {
 
-                WHERE user_id = $1
-                `,
-                [reset.user_id]
-            );
+                if (
+                    session.userId ===
+                    resetRecord.user_id
+                ) {
 
-            await client.query(
-                "COMMIT"
-            );
+                    sessions.delete(
+                        sessionToken
+                    );
+                }
+            }
 
-            return res.json({
+            return res.status(200).json({
 
                 success: true,
 
                 message:
-                    "Password reset successfully. Please login again."
+                    "Your password has been reset successfully. Please login with your new password."
 
             });
 
         } catch (error) {
-
-            try {
-                await client.query(
-                    "ROLLBACK"
-                );
-            } catch (_) {}
 
             console.error(
                 "Reset password error:",
@@ -1890,20 +1521,16 @@ router.post(
             );
 
             return res.status(500).json({
+
                 success: false,
+
                 message:
-                    "Unable to reset password."
+                    "Unable to reset your password right now."
+
             });
-
-        } finally {
-
-            client.release();
-
         }
-
     }
 );
-
 
 // =========================================================
 // CHANGE PASSWORD
@@ -1916,101 +1543,121 @@ router.post(
 
         try {
 
-            await databaseReady;
-
             const currentPassword =
-                String(
-                    req.body.currentPassword || ""
+                cleanText(
+                    req.body.currentPassword
                 );
 
             const newPassword =
-                String(
-                    req.body.newPassword ||
-                    req.body.password ||
-                    ""
+                cleanText(
+                    req.body.newPassword
                 );
 
-            if (!currentPassword) {
-
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        "Current password is required."
-                });
-
-            }
-
-            if (!isStrongPassword(newPassword)) {
-
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        "New password must be at least 8 characters and contain uppercase, lowercase and a number."
-                });
-
-            }
-
             if (
-                currentPassword === newPassword
+                !currentPassword ||
+                !newPassword
             ) {
 
                 return res.status(400).json({
-                    success: false,
-                    message:
-                        "New password must be different from the current password."
-                });
 
+                    success: false,
+
+                    message:
+                        "Current password and new password are required."
+
+                });
             }
 
-            const passwordMatch =
+            if (
+                !isStrongPassword(
+                    newPassword
+                )
+            ) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "New password must contain at least 8 characters and include letters and numbers."
+
+                });
+            }
+
+            const user =
+                db.prepare(`
+                    SELECT
+                        id,
+                        password_hash
+                    FROM users
+                    WHERE id = ?
+                    LIMIT 1
+                `).get(req.user.id);
+
+            if (!user) {
+
+                return res.status(404).json({
+
+                    success: false,
+
+                    message:
+                        "User account not found."
+
+                });
+            }
+
+            const currentMatches =
                 await bcrypt.compare(
                     currentPassword,
-                    req.user.password_hash
+                    user.password_hash
                 );
 
-            if (!passwordMatch) {
+            if (!currentMatches) {
 
                 return res.status(401).json({
+
                     success: false,
+
                     message:
                         "Current password is incorrect."
-                });
 
+                });
             }
 
-            const passwordHash =
+            const newPasswordHash =
                 await bcrypt.hash(
                     newPassword,
                     12
                 );
 
-            await pool.query(
-                `
+            db.prepare(`
                 UPDATE users
-
                 SET
-                    password_hash = $1,
+                    password_hash = ?,
                     updated_at = CURRENT_TIMESTAMP
-
-                WHERE id = $2
-                `,
-                [
-                    passwordHash,
-                    req.user.id
-                ]
-            );
-
-            // -------------------------------------------------
-            // SECURITY:
-            // Remove all old sessions.
-            // User must login again.
-            // -------------------------------------------------
-
-            await deleteAllUserSessions(
+                WHERE id = ?
+            `).run(
+                newPasswordHash,
                 req.user.id
             );
 
-            return res.json({
+            for (
+                const [
+                    token,
+                    session
+                ] of sessions.entries()
+            ) {
+
+                if (
+                    session.userId ===
+                    req.user.id
+                ) {
+
+                    sessions.delete(token);
+                }
+            }
+
+            return res.status(200).json({
 
                 success: true,
 
@@ -2027,103 +1674,49 @@ router.post(
             );
 
             return res.status(500).json({
+
                 success: false,
+
                 message:
-                    "Unable to change password."
+                    "Unable to change password right now."
+
             });
-
         }
-
     }
 );
-
 
 // =========================================================
 // CLEAN EXPIRED SESSIONS / RESET TOKENS
 // =========================================================
 
-async function cleanupExpiredAuthData() {
+setInterval(() => {
 
-    try {
+    const now =
+        Date.now();
 
-        await databaseReady;
+    for (
+        const [
+            token,
+            session
+        ] of sessions.entries()
+    ) {
 
-        const now =
-            Date.now();
+        if (
+            now >
+            session.expiresAt
+        ) {
 
-        await pool.query(
-            `
-            DELETE FROM sessions
-
-            WHERE expires_at <= $1
-            `,
-            [now]
-        );
-
-        await pool.query(
-            `
-            DELETE FROM password_resets
-
-            WHERE expires_at <= $1
-
-            OR used_at IS NOT NULL
-            `,
-            [now]
-        );
-
-    } catch (error) {
-
-        console.error(
-            "Auth cleanup error:",
-            error
-        );
-
+            sessions.delete(token);
+        }
     }
 
-}
+    db.prepare(`
+        DELETE FROM password_resets
+        WHERE expires_at < ?
+        OR used_at IS NOT NULL
+    `).run(now);
 
-
-// =========================================================
-// CLEANUP EVERY 30 MINUTES
-// =========================================================
-
-const cleanupTimer =
-    setInterval(
-        cleanupExpiredAuthData,
-        30 * 60 * 1000
-    );
-
-if (
-    cleanupTimer &&
-    typeof cleanupTimer.unref === "function"
-) {
-
-    cleanupTimer.unref();
-
-}
-
-
-// =========================================================
-// INITIAL DATABASE READY LOG
-// =========================================================
-
-databaseReady
-    .then(() => {
-
-        console.log(
-            "Persistent PostgreSQL authentication is ready."
-        );
-
-    })
-    .catch((error) => {
-
-        console.error(
-            "PostgreSQL authentication initialization failed:",
-            error
-        );
-
-    });
-
+}, 1000 * 60 * 30);
 
 // =========================================================
 // EXPORT
@@ -2131,12 +1724,12 @@ databaseReady
 
 module.exports = router;
 
-// Export authentication helpers separately
-module.exports.router = router;
-module.exports.requireAuth = requireAuth;
-module.exports.requireAdmin = requireAdmin;
-module.exports.getAuthenticatedUser = getAuthenticatedUser;
-module.exports.createSession = createSession;
-module.exports.getSession = getSession;
-module.exports.deleteSession = deleteSession;
-module.exports.deleteAllUserSessions = deleteAllUserSessions;
+module.exports.requireAuth =
+    requireAuth;
+
+module.exports.requireAdmin =
+    requireAdmin;
+
+console.log(
+    "U.S TRAVEL & TOURS authentication system initialized."
+);
