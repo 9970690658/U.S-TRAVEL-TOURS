@@ -1,646 +1,167 @@
-// =========================================================
-// U.S TRAVEL & TOURS
-// APPLICATION BACKEND
-// MongoDB Version
-// =========================================================
+    const express = require("express");
+    const router = express.Router();
 
-const express = require("express");
+    const { db } = require("./database");
 
-const {
-    getDatabase,
-    getNextSequence
-} = require("./database");
+    const {
+        requireAuth,
+        requireAdmin
+    } = require("./auth");
 
-const {
-    requireAuth,
-    requireAdmin
-} = require("./auth");
 
-const router = express.Router();
+    // =========================================================
+    // U.S TRAVEL & TOURS
+    // APPLICATIONS BACKEND
+    //
+    // CUSTOMER:
+    // 1. Create application
+    // 2. View own application
+    //
+    // ADMIN:
+    // 1. View all applications
+    // 2. View any application
+    // 3. Update application status
+    // 4. Delete application
+    //
+    // Application flow:
+    //
+    // application submitted
+    //        ↓
+    // payment_pending
+    //        ↓
+    // payment_submitted
+    //        ↓
+    // under_review
+    //        ↓
+    // approved / rejected / completed
+    // =========================================================
 
-// =========================================================
-// HELPERS
-// =========================================================
 
-function getValue(
-    object,
-    paths
-) {
+    // =========================================================
+    // DATABASE COMPATIBILITY
+    // =========================================================
+    //
+    // Older database versions may not have user_id in
+    // applications table.
+    //
+    // This automatically adds user_id if missing.
+    //
+    // This allows existing database.db to continue working.
+    // =========================================================
 
-    if (!object) {
+    try {
 
-        return "";
+        const columns = db.prepare(
+            `PRAGMA table_info(applications)`
+        ).all();
 
-    }
-
-    for (
-        const path of paths
-    ) {
-
-        const parts =
-            String(path)
-                .split(".");
-
-        let value =
-            object;
-
-        for (
-            const part of parts
-        ) {
-
-            if (
-                value === null ||
-                value === undefined
-            ) {
-
-                value =
-                    undefined;
-
-                break;
-
-            }
-
-            value =
-                value[part];
-
-        }
-
-        if (
-            value !== undefined &&
-            value !== null &&
-            String(value).trim() !== ""
-        ) {
-
-            return value;
-
-        }
-
-    }
-
-    return "";
-
-}
-
-function cleanString(
-    value,
-    maxLength = 500
-) {
-
-    return String(
-        value ?? ""
-    )
-        .trim()
-        .slice(
-            0,
-            maxLength
+        const hasUserId = columns.some(
+            column => column.name === "user_id"
         );
 
-}
+        if (!hasUserId) {
 
-function parseApplicationData(
-    application
-) {
+            db.prepare(`
+                ALTER TABLE applications
+                ADD COLUMN user_id INTEGER
+            `).run();
 
-    if (!application) {
+            console.log(
+                "Applications table updated: user_id column added."
+            );
+        }
+
+    } catch (error) {
+
+        console.error(
+            "Applications database migration error:",
+            error
+        );
+
+    }
+
+
+    // =========================================================
+    // HELPER FUNCTIONS
+    // =========================================================
+
+    function getValue(data, paths = []) {
+
+        for (const path of paths) {
+
+            const parts = path.split(".");
+
+            let value = data;
+
+            for (const part of parts) {
+
+                if (
+                    value === undefined ||
+                    value === null ||
+                    typeof value !== "object"
+                ) {
+
+                    value = undefined;
+
+                    break;
+                }
+
+                value = value[part];
+            }
+
+            if (
+                value !== undefined &&
+                value !== null &&
+                String(value).trim() !== ""
+            ) {
+
+                return value;
+            }
+        }
 
         return null;
-
     }
 
-    let data =
-        application.application_data;
 
-    if (
-        typeof data ===
-        "string"
-    ) {
+    // =========================================================
+    // CLEAN STRING
+    // =========================================================
 
-        try {
+    function cleanString(value) {
 
-            data =
-                JSON.parse(
-                    data
-                );
+        if (
+            value === undefined ||
+            value === null
+        ) {
 
-        } catch {
-
-            data = {};
-
+            return "";
         }
 
+        return String(value).trim();
     }
 
-    if (
-        !data ||
-        typeof data !==
-            "object"
-    ) {
 
-        data = {};
-
-    }
-
-    return data;
-
-}
-
-function formatApplication(
-    application
-) {
-
-    const data =
-        parseApplicationData(
-            application
-        );
-
-    return {
-
-        id:
-            Number(
-                application.id
-            ),
-
-        data:
-            data,
-
-        status:
-            application.status,
-
-        createdAt:
-            application.created_at,
-
-        updatedAt:
-            application.updated_at
-
-    };
-
-}
-
-// =========================================================
-// CREATE APPLICATION
-//
-// POST /api/applications
-// =========================================================
-
-router.post(
-    "/",
-    requireAuth,
-    async function (
-        req,
-        res
-    ) {
-
-        try {
-
-            // -------------------------------------------------
-            // CUSTOMER ONLY
-            // -------------------------------------------------
-
-            if (
-                req.user?.role !==
-                "customer"
-            ) {
-
-                return res.status(403).json({
-
-                    success: false,
-
-                    message:
-                        "Only customer accounts can submit applications."
-
-                });
-
-            }
-
-            const userId =
-                Number(
-                    req.user.id
-                );
-
-            if (
-                !Number.isInteger(
-                    userId
-                ) ||
-                userId <= 0
-            ) {
-
-                return res.status(401).json({
-
-                    success: false,
-
-                    message:
-                        "Authentication is invalid."
-
-                });
-
-            }
-
-            // -------------------------------------------------
-            // APPLICATION DATA
-            // -------------------------------------------------
-
-            let applicationData =
-                req.body;
-
-            if (
-                applicationData &&
-                typeof applicationData ===
-                    "object" &&
-                !Array.isArray(
-                    applicationData
-                )
-            ) {
-
-                applicationData =
-                    {
-                        ...applicationData
-                    };
-
-            } else {
-
-                applicationData =
-                    {};
-
-            }
-
-            // -------------------------------------------------
-            // VALIDATION
-            // -------------------------------------------------
-
-            const passportNumber =
-                cleanString(
-                    getValue(
-                        applicationData,
-                        [
-                            "passportNumber",
-                            "passport_number",
-                            "passport.number",
-                            "passportNo"
-                        ]
-                    ),
-                    100
-                );
-
-            const surname =
-                cleanString(
-                    getValue(
-                        applicationData,
-                        [
-                            "surname",
-                            "lastName",
-                            "last_name",
-                            "familyName"
-                        ]
-                    ),
-                    150
-                );
-
-            const firstMiddleName =
-                cleanString(
-                    getValue(
-                        applicationData,
-                        [
-                            "firstMiddleName",
-                            "firstMiddle",
-                            "firstName",
-                            "first_name",
-                            "givenName"
-                        ]
-                    ),
-                    200
-                );
-
-            const dateOfBirth =
-                cleanString(
-                    getValue(
-                        applicationData,
-                        [
-                            "dateOfBirth",
-                            "date_of_birth",
-                            "dob"
-                        ]
-                    ),
-                    50
-                );
-
-            const nationality =
-                cleanString(
-                    getValue(
-                        applicationData,
-                        [
-                            "nationality",
-                            "country",
-                            "citizenship"
-                        ]
-                    ),
-                    100
-                );
-
-            if (!passportNumber) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Passport number is required."
-
-                });
-
-            }
-
-            if (!surname) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Surname is required."
-
-                });
-
-            }
-
-            if (!firstMiddleName) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "First and middle name is required."
-
-                });
-
-            }
-
-            if (!dateOfBirth) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Date of birth is required."
-
-                });
-
-            }
-
-            if (!nationality) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Nationality is required."
-
-                });
-
-            }
-
-            // -------------------------------------------------
-            // SIZE PROTECTION
-            // -------------------------------------------------
-
-            let serializedData;
+    // =========================================================
+    // CREATE APPLICATION
+    // POST /api/applications
+    //
+    // CUSTOMER ONLY
+    // =========================================================
+
+    router.post(
+        "/",
+        requireAuth,
+        (req, res) => {
 
             try {
 
-                serializedData =
-                    JSON.stringify(
-                        applicationData
-                    );
-
-            } catch {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Invalid application data."
-
-                });
-
-            }
-
-            if (
-                Buffer.byteLength(
-                    serializedData,
-                    "utf8"
-                ) >
-                1024 *
-                1024
-            ) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Application data is too large."
-
-                });
-
-            }
-
-            // -------------------------------------------------
-            // VERIFY USER EXISTS
-            // -------------------------------------------------
-
-            const db =
-                getDatabase();
-
-            const user =
-                await db
-                    .collection("users")
-                    .findOne({
-
-                        id:
-                            userId
-
-                    });
-
-            if (!user) {
-
-                return res.status(401).json({
-
-                    success: false,
-
-                    message:
-                        "Customer account not found."
-
-                });
-
-            }
-
-            // -------------------------------------------------
-            // CREATE NUMERIC APPLICATION ID
-            // -------------------------------------------------
-
-            const applicationId =
-                await getNextSequence(
-                    "applications"
-                );
-
-            const now =
-                new Date();
-
-            // -------------------------------------------------
-            // SAVE APPLICATION
-            // -------------------------------------------------
-
-            await db
-                .collection("applications")
-                .insertOne({
-
-                    id:
-                        applicationId,
-
-                    user_id:
-                        userId,
-
-                    application_data:
-                        serializedData,
-
-                    status:
-                        "payment_pending",
-
-                    created_at:
-                        now,
-
-                    updated_at:
-                        now
-
-                });
-
-            // -------------------------------------------------
-            // RESPONSE
-            // -------------------------------------------------
-
-            return res.status(201).json({
-
-                success: true,
-
-                message:
-                    "Application submitted successfully.",
-
-                applicationId:
-                    applicationId,
-
-                status:
-                    "payment_pending"
-
-            });
-
-        } catch (error) {
-
-            console.error(
-                "Application submission error:",
-                error
-            );
-
-            return res.status(500).json({
-
-                success: false,
-
-                message:
-                    "Unable to submit application."
-
-            });
-
-        }
-
-    }
-);
-
-// =========================================================
-// GET SINGLE APPLICATION
-//
-// GET /api/applications/:id
-// =========================================================
-
-router.get(
-    "/:id",
-    requireAuth,
-    async function (
-        req,
-        res
-    ) {
-
-        try {
-
-            const applicationId =
-                Number(
-                    req.params.id
-                );
-
-            if (
-                !Number.isInteger(
-                    applicationId
-                ) ||
-                applicationId <= 0
-            ) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Invalid application ID."
-
-                });
-
-            }
-
-            const db =
-                getDatabase();
-
-            const application =
-                await db
-                    .collection("applications")
-                    .findOne({
-
-                        id:
-                            applicationId
-
-                    });
-
-            if (!application) {
-
-                return res.status(404).json({
-
-                    success: false,
-
-                    message:
-                        "Application not found."
-
-                });
-
-            }
-
-            // -------------------------------------------------
-            // CUSTOMER OWNERSHIP
-            // -------------------------------------------------
-
-            if (
-                req.user.role !==
-                "admin"
-            ) {
-
-                const userId =
-                    Number(
-                        req.user.id
-                    );
+                // -------------------------------------------------
+                // CUSTOMER ROLE CHECK
+                // -------------------------------------------------
 
                 if (
-                    Number(
-                        application.user_id
-                    ) !==
-                    userId
+                    !req.user ||
+                    req.user.role !== "customer"
                 ) {
 
                     return res.status(403).json({
@@ -648,401 +169,1055 @@ router.get(
                         success: false,
 
                         message:
-                            "You are not authorized to view this application."
+                            "Only customer accounts can submit applications."
 
                     });
 
                 }
 
-            }
 
-            return res.json({
+                // -------------------------------------------------
+                // REQUEST DATA
+                // -------------------------------------------------
 
-                success: true,
+                const applicationData = req.body;
 
-                application:
-                    formatApplication(
-                        application
-                    )
 
-            });
+                // -------------------------------------------------
+                // BASIC REQUEST VALIDATION
+                // -------------------------------------------------
 
-        } catch (error) {
+                if (
+                    !applicationData ||
+                    typeof applicationData !== "object" ||
+                    Array.isArray(applicationData)
+                ) {
 
-            console.error(
-                "Get application error:",
-                error
-            );
+                    return res.status(400).json({
 
-            return res.status(500).json({
+                        success: false,
 
-                success: false,
-
-                message:
-                    "Unable to load application."
-
-            });
-
-        }
-
-    }
-);
-
-// =========================================================
-// GET ALL APPLICATIONS
-//
-// GET /api/applications
-// ADMIN ONLY
-// =========================================================
-
-router.get(
-    "/",
-    requireAdmin,
-    async function (
-        req,
-        res
-    ) {
-
-        try {
-
-            const db =
-                getDatabase();
-
-            const applications =
-                await db
-                    .collection("applications")
-                    .find({})
-                    .sort({
-                        id: -1
-                    })
-                    .toArray();
-
-            return res.json({
-
-                success: true,
-
-                applications:
-                    applications.map(
-                        formatApplication
-                    )
-
-            });
-
-        } catch (error) {
-
-            console.error(
-                "Admin applications error:",
-                error
-            );
-
-            return res.status(500).json({
-
-                success: false,
-
-                message:
-                    "Unable to load applications."
-
-            });
-
-        }
-
-    }
-);
-
-// =========================================================
-// UPDATE APPLICATION STATUS
-//
-// PATCH /api/applications/:id/status
-// ADMIN ONLY
-// =========================================================
-
-router.patch(
-    "/:id/status",
-    requireAdmin,
-    async function (
-        req,
-        res
-    ) {
-
-        try {
-
-            const applicationId =
-                Number(
-                    req.params.id
-                );
-
-            if (
-                !Number.isInteger(
-                    applicationId
-                ) ||
-                applicationId <= 0
-            ) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Invalid application ID."
-
-                });
-
-            }
-
-            const newStatus =
-                cleanString(
-                    req.body.status,
-                    50
-                ).toLowerCase();
-
-            const allowedStatuses = [
-
-                "pending",
-
-                "payment_pending",
-
-                "payment_submitted",
-
-                "under_review",
-
-                "approved",
-
-                "rejected",
-
-                "completed"
-
-            ];
-
-            if (
-                !allowedStatuses.includes(
-                    newStatus
-                )
-            ) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Invalid application status."
-
-                });
-
-            }
-
-            const db =
-                getDatabase();
-
-            const existing =
-                await db
-                    .collection("applications")
-                    .findOne({
-
-                        id:
-                            applicationId
+                        message:
+                            "Application data is required."
 
                     });
 
-            if (!existing) {
+                }
 
-                return res.status(404).json({
 
-                    success: false,
+                // -------------------------------------------------
+                // SUPPORT BOTH FORMATS
+                // -------------------------------------------------
 
-                    message:
-                        "Application not found."
+                const passportNumber = cleanString(
 
-                });
+                    getValue(
+                        applicationData,
+                        [
+                            "passportNumber",
+                            "passportInformation.passportNumber"
+                        ]
+                    )
 
-            }
+                );
 
-            const updatedAt =
-                new Date();
 
-            await db
-                .collection("applications")
-                .updateOne(
+                const surname = cleanString(
+
+                    getValue(
+                        applicationData,
+                        [
+                            "surname",
+                            "nameInformation.surname"
+                        ]
+                    )
+
+                );
+
+
+                const firstMiddleName = cleanString(
+
+                    getValue(
+                        applicationData,
+                        [
+                            "firstMiddleName",
+                            "nameInformation.firstMiddleName"
+                        ]
+                    )
+
+                );
+
+
+                const dateOfBirth = cleanString(
+
+                    getValue(
+                        applicationData,
+                        [
+                            "dateOfBirth",
+                            "personalInformation.dateOfBirth"
+                        ]
+                    )
+
+                );
+
+
+                const nationality = cleanString(
+
+                    getValue(
+                        applicationData,
+                        [
+                            "nationality",
+                            "personalInformation.nationality"
+                        ]
+                    )
+
+                );
+
+
+                // -------------------------------------------------
+                // REQUIRED FIELD VALIDATION
+                // -------------------------------------------------
+
+                const requiredFields = [
 
                     {
-                        id:
-                            applicationId
+                        name: "passportNumber",
+                        value: passportNumber
                     },
 
                     {
-                        $set: {
+                        name: "surname",
+                        value: surname
+                    },
 
-                            status:
-                                newStatus,
+                    {
+                        name: "firstMiddleName",
+                        value: firstMiddleName
+                    },
 
-                            updated_at:
-                                updatedAt
+                    {
+                        name: "dateOfBirth",
+                        value: dateOfBirth
+                    },
 
-                        }
-
+                    {
+                        name: "nationality",
+                        value: nationality
                     }
 
-                );
+                ];
 
-            return res.json({
 
-                success: true,
+                for (
+                    const field of requiredFields
+                ) {
 
-                message:
-                    `Application status updated to ${newStatus}.`,
+                    if (!field.value) {
 
-                applicationId:
-                    applicationId,
+                        return res.status(400).json({
 
-                status:
-                    newStatus
+                            success: false,
 
-            });
+                            message:
+                                `Please provide ${field.name}.`
 
-        } catch (error) {
+                        });
 
-            console.error(
-                "Application status error:",
-                error
-            );
+                    }
+                }
 
-            return res.status(500).json({
 
-                success: false,
+                // -------------------------------------------------
+                // REQUEST SIZE PROTECTION
+                // -------------------------------------------------
 
-                message:
-                    "Unable to update application status."
+                const applicationJSON =
+                    JSON.stringify(
+                        applicationData
+                    );
 
-            });
 
-        }
+                if (
+                    Buffer.byteLength(
+                        applicationJSON,
+                        "utf8"
+                    ) > 1024 * 1024
+                ) {
 
-    }
-);
+                    return res.status(413).json({
 
-// =========================================================
-// DELETE APPLICATION
-//
-// DELETE /api/applications/:id
-// ADMIN ONLY
-// =========================================================
+                        success: false,
 
-router.delete(
-    "/:id",
-    requireAdmin,
-    async function (
-        req,
-        res
-    ) {
-
-        try {
-
-            const applicationId =
-                Number(
-                    req.params.id
-                );
-
-            if (
-                !Number.isInteger(
-                    applicationId
-                ) ||
-                applicationId <= 0
-            ) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Invalid application ID."
-
-                });
-
-            }
-
-            const db =
-                getDatabase();
-
-            const existing =
-                await db
-                    .collection("applications")
-                    .findOne({
-
-                        id:
-                            applicationId
+                        message:
+                            "Application data is too large."
 
                     });
 
-            if (!existing) {
+                }
 
-                return res.status(404).json({
+
+                // -------------------------------------------------
+                // LOGGED-IN CUSTOMER ID
+                // -------------------------------------------------
+
+                const userId =
+                    Number(req.user.id);
+
+
+                if (
+                    !Number.isInteger(userId) ||
+                    userId <= 0
+                ) {
+
+                    return res.status(401).json({
+
+                        success: false,
+
+                        message:
+                            "Invalid customer authentication."
+
+                    });
+
+                }
+
+
+                // -------------------------------------------------
+                // SAVE APPLICATION
+                //
+                // Application starts as payment_pending.
+                //
+                // It is linked to the logged-in customer.
+                // -------------------------------------------------
+
+                const insert = db.prepare(`
+
+                    INSERT INTO applications (
+                        user_id,
+                        application_data,
+                        status
+                    )
+
+                    VALUES (?, ?, ?)
+
+                `);
+
+
+                const result = insert.run(
+
+                    userId,
+
+                    applicationJSON,
+
+                    "payment_pending"
+
+                );
+
+
+                const applicationId =
+                    Number(
+                        result.lastInsertRowid
+                    );
+
+
+                console.log(
+
+                    `New application received. ` +
+                    `Application ID: ${applicationId}. ` +
+                    `Customer ID: ${userId}`
+
+                );
+
+
+                // -------------------------------------------------
+                // RESPONSE
+                // -------------------------------------------------
+
+                return res.status(201).json({
+
+                    success: true,
+
+                    message:
+                        "Application submitted successfully. Please proceed with payment.",
+
+                    applicationId:
+                        applicationId,
+
+                    status:
+                        "payment_pending"
+
+                });
+
+
+            } catch (error) {
+
+                console.error(
+                    "Application submission error:",
+                    error
+                );
+
+
+                return res.status(500).json({
 
                     success: false,
 
                     message:
-                        "Application not found."
+                        "Unable to save application. Please try again."
 
                 });
 
             }
 
-            // -------------------------------------------------
-            // DELETE RELATED PAYMENTS FIRST
-            // -------------------------------------------------
+        }
+    );
 
-            await db
-                .collection("payments")
-                .deleteMany({
 
-                    application_id:
+    // =========================================================
+    // GET SINGLE APPLICATION
+    // GET /api/applications/:id
+    //
+    // CUSTOMER:
+    // Own application only
+    //
+    // ADMIN:
+    // Any application
+    // =========================================================
+
+    router.get(
+        "/:id",
+        requireAuth,
+        (req, res) => {
+
+            try {
+
+                const applicationId =
+                    Number(
+                        req.params.id
+                    );
+
+
+                // -------------------------------------------------
+                // VALIDATE ID
+                // -------------------------------------------------
+
+                if (
+                    !Number.isInteger(applicationId) ||
+                    applicationId <= 0
+                ) {
+
+                    return res.status(400).json({
+
+                        success: false,
+
+                        message:
+                            "Invalid application ID."
+
+                    });
+
+                }
+
+
+                // -------------------------------------------------
+                // GET APPLICATION
+                // -------------------------------------------------
+
+                const application =
+                    db.prepare(`
+
+                        SELECT
+                            id,
+                            user_id,
+                            application_data,
+                            status,
+                            created_at,
+                            updated_at
+
+                        FROM applications
+
+                        WHERE id = ?
+
+                    `).get(
                         applicationId
+                    );
+
+
+                // -------------------------------------------------
+                // NOT FOUND
+                // -------------------------------------------------
+
+                if (!application) {
+
+                    return res.status(404).json({
+
+                        success: false,
+
+                        message:
+                            "Application not found."
+
+                    });
+
+                }
+
+
+                // -------------------------------------------------
+                // CUSTOMER OWNERSHIP CHECK
+                // -------------------------------------------------
+
+                if (
+                    req.user.role !== "admin"
+                ) {
+
+                    const loggedInUserId =
+                        Number(req.user.id);
+
+                    const applicationUserId =
+                        Number(application.user_id);
+
+
+                    if (
+                        !Number.isInteger(
+                            loggedInUserId
+                        ) ||
+                        loggedInUserId !==
+                            applicationUserId
+                    ) {
+
+                        return res.status(403).json({
+
+                            success: false,
+
+                            message:
+                                "You are not authorized to view this application."
+
+                        });
+
+                    }
+
+                }
+
+
+                // -------------------------------------------------
+                // PARSE APPLICATION DATA
+                // -------------------------------------------------
+
+                let parsedData = {};
+
+
+                try {
+
+                    parsedData =
+                        JSON.parse(
+                            application.application_data
+                        );
+
+                } catch (error) {
+
+                    console.error(
+
+                        `Application JSON parse error ` +
+                        `for application ${application.id}:`,
+
+                        error
+
+                    );
+
+                    parsedData = {};
+
+                }
+
+
+                // -------------------------------------------------
+                // RESPONSE
+                // -------------------------------------------------
+
+                return res.json({
+
+                    success: true,
+
+                    application: {
+
+                        id:
+                            application.id,
+
+                        data:
+                            parsedData,
+
+                        status:
+                            application.status,
+
+                        createdAt:
+                            application.created_at,
+
+                        updatedAt:
+                            application.updated_at
+
+                    }
 
                 });
 
-            // -------------------------------------------------
-            // DELETE APPLICATION
-            // -------------------------------------------------
 
-            await db
-                .collection("applications")
-                .deleteOne({
+            } catch (error) {
 
-                    id:
-                        applicationId
+                console.error(
+                    "Get application error:",
+                    error
+                );
+
+
+                return res.status(500).json({
+
+                    success: false,
+
+                    message:
+                        "Unable to retrieve application."
 
                 });
 
-            return res.json({
-
-                success: true,
-
-                message:
-                    "Application deleted successfully."
-
-            });
-
-        } catch (error) {
-
-            console.error(
-                "Delete application error:",
-                error
-            );
-
-            return res.status(500).json({
-
-                success: false,
-
-                message:
-                    "Unable to delete application."
-
-            });
+            }
 
         }
+    );
 
-    }
-);
 
-// =========================================================
-// EXPORT
-// =========================================================
+    // =========================================================
+    // GET ALL APPLICATIONS
+    // GET /api/applications
+    //
+    // ADMIN ONLY
+    // =========================================================
 
-module.exports = router;
+    router.get(
+        "/",
+        requireAdmin,
+        (req, res) => {
+
+            try {
+
+                const applications =
+                    db.prepare(`
+
+                        SELECT
+                            id,
+                            user_id,
+                            application_data,
+                            status,
+                            created_at,
+                            updated_at
+
+                        FROM applications
+
+                        ORDER BY created_at DESC
+
+                    `).all();
+
+
+                const formattedApplications =
+                    applications.map(
+                        (application) => {
+
+                            let parsedData = {};
+
+
+                            try {
+
+                                parsedData =
+                                    JSON.parse(
+                                        application.application_data
+                                    );
+
+                            } catch (error) {
+
+                                console.error(
+
+                                    `Unable to parse application ` +
+                                    `${application.id}:`,
+
+                                    error
+
+                                );
+
+                                parsedData = {};
+
+                            }
+
+
+                            return {
+
+                                id:
+                                    application.id,
+
+                                userId:
+                                    application.user_id,
+
+                                data:
+                                    parsedData,
+
+                                status:
+                                    application.status,
+
+                                createdAt:
+                                    application.created_at,
+
+                                updatedAt:
+                                    application.updated_at
+
+                            };
+
+                        }
+                    );
+
+
+                return res.json({
+
+                    success: true,
+
+                    count:
+                        formattedApplications.length,
+
+                    applications:
+                        formattedApplications
+
+                });
+
+
+            } catch (error) {
+
+                console.error(
+                    "Get applications error:",
+                    error
+                );
+
+
+                return res.status(500).json({
+
+                    success: false,
+
+                    message:
+                        "Unable to retrieve applications."
+
+                });
+
+            }
+
+        }
+    );
+
+
+    // =========================================================
+    // UPDATE APPLICATION STATUS
+    // PATCH /api/applications/:id/status
+    //
+    // ADMIN ONLY
+    // =========================================================
+
+    router.patch(
+        "/:id/status",
+        requireAdmin,
+        (req, res) => {
+
+            try {
+
+                const applicationId =
+                    Number(
+                        req.params.id
+                    );
+
+
+                const status =
+                    cleanString(
+                        req.body?.status
+                    );
+
+
+                // -------------------------------------------------
+                // ALLOWED STATUSES
+                // -------------------------------------------------
+
+                const allowedStatuses = [
+
+                    "pending",
+
+                    "payment_pending",
+
+                    "payment_submitted",
+
+                    "under_review",
+
+                    "approved",
+
+                    "rejected",
+
+                    "completed"
+
+                ];
+
+
+                // -------------------------------------------------
+                // VALIDATE ID
+                // -------------------------------------------------
+
+                if (
+                    !Number.isInteger(
+                        applicationId
+                    ) ||
+                    applicationId <= 0
+                ) {
+
+                    return res.status(400).json({
+
+                        success: false,
+
+                        message:
+                            "Invalid application ID."
+
+                    });
+
+                }
+
+
+                // -------------------------------------------------
+                // VALIDATE STATUS
+                // -------------------------------------------------
+
+                if (
+                    !allowedStatuses.includes(
+                        status
+                    )
+                ) {
+
+                    return res.status(400).json({
+
+                        success: false,
+
+                        message:
+                            "Invalid application status."
+
+                    });
+
+                }
+
+
+                // -------------------------------------------------
+                // CHECK APPLICATION
+                // -------------------------------------------------
+
+                const existingApplication =
+                    db.prepare(`
+
+                        SELECT
+                            id,
+                            status
+
+                        FROM applications
+
+                        WHERE id = ?
+
+                    `).get(
+                        applicationId
+                    );
+
+
+                if (!existingApplication) {
+
+                    return res.status(404).json({
+
+                        success: false,
+
+                        message:
+                            "Application not found."
+
+                    });
+
+                }
+
+
+                // -------------------------------------------------
+                // UPDATE
+                // -------------------------------------------------
+
+                const result =
+                    db.prepare(`
+
+                        UPDATE applications
+
+                        SET
+                            status = ?,
+                            updated_at = CURRENT_TIMESTAMP
+
+                        WHERE id = ?
+
+                    `).run(
+
+                        status,
+
+                        applicationId
+
+                    );
+
+
+                if (
+                    result.changes === 0
+                ) {
+
+                    return res.status(404).json({
+
+                        success: false,
+
+                        message:
+                            "Application not found."
+
+                    });
+
+                }
+
+
+                console.log(
+
+                    `Application ${applicationId} ` +
+                    `status changed from ` +
+                    `${existingApplication.status} ` +
+                    `to ${status}`
+
+                );
+
+
+                // -------------------------------------------------
+                // RESPONSE
+                // -------------------------------------------------
+
+                return res.json({
+
+                    success: true,
+
+                    message:
+                        "Application status updated.",
+
+                    applicationId:
+                        applicationId,
+
+                    status:
+                        status
+
+                });
+
+
+            } catch (error) {
+
+                console.error(
+                    "Update application status error:",
+                    error
+                );
+
+
+                return res.status(500).json({
+
+                    success: false,
+
+                    message:
+                        "Unable to update application status."
+
+                });
+
+            }
+
+        }
+    );
+
+
+    // =========================================================
+    // DELETE APPLICATION
+    // DELETE /api/applications/:id
+    //
+    // ADMIN ONLY
+    // =========================================================
+
+    router.delete(
+        "/:id",
+        requireAdmin,
+        (req, res) => {
+
+            try {
+
+                const applicationId =
+                    Number(
+                        req.params.id
+                    );
+
+
+                // -------------------------------------------------
+                // VALIDATE ID
+                // -------------------------------------------------
+
+                if (
+                    !Number.isInteger(
+                        applicationId
+                    ) ||
+                    applicationId <= 0
+                ) {
+
+                    return res.status(400).json({
+
+                        success: false,
+
+                        message:
+                            "Invalid application ID."
+
+                    });
+
+                }
+
+
+                // -------------------------------------------------
+                // CHECK APPLICATION
+                // -------------------------------------------------
+
+                const existingApplication =
+                    db.prepare(`
+
+                        SELECT
+                            id
+
+                        FROM applications
+
+                        WHERE id = ?
+
+                    `).get(
+                        applicationId
+                    );
+
+
+                if (!existingApplication) {
+
+                    return res.status(404).json({
+
+                        success: false,
+
+                        message:
+                            "Application not found."
+
+                    });
+
+                }
+
+
+                // -------------------------------------------------
+                // DELETE RELATED PAYMENTS FIRST
+                // -------------------------------------------------
+
+                const deletePayments =
+                    db.prepare(`
+
+                        DELETE FROM payments
+
+                        WHERE application_id = ?
+
+                    `);
+
+
+                // -------------------------------------------------
+                // DELETE APPLICATION
+                // -------------------------------------------------
+
+                const deleteApplication =
+                    db.prepare(`
+
+                        DELETE FROM applications
+
+                        WHERE id = ?
+
+                    `);
+
+
+                // -------------------------------------------------
+                // TRANSACTION
+                // -------------------------------------------------
+
+                const deleteTransaction =
+                    db.transaction(() => {
+
+                        deletePayments.run(
+                            applicationId
+                        );
+
+                        return deleteApplication.run(
+                            applicationId
+                        );
+
+                    });
+
+
+                const result =
+                    deleteTransaction();
+
+
+                // -------------------------------------------------
+                // DELETE FAILED
+                // -------------------------------------------------
+
+                if (
+                    result.changes === 0
+                ) {
+
+                    return res.status(404).json({
+
+                        success: false,
+
+                        message:
+                            "Application not found."
+
+                    });
+
+                }
+
+
+                console.log(
+
+                    `Application ${applicationId} deleted.`
+
+                );
+
+
+                // -------------------------------------------------
+                // RESPONSE
+                // -------------------------------------------------
+
+                return res.json({
+
+                    success: true,
+
+                    message:
+                        "Application deleted successfully.",
+
+                    applicationId:
+                        applicationId
+
+                });
+
+
+            } catch (error) {
+
+                console.error(
+                    "Delete application error:",
+                    error
+                );
+
+
+                return res.status(500).json({
+
+                    success: false,
+
+                    message:
+                        "Unable to delete application."
+
+                });
+
+            }
+
+        }
+    );
+
+
+    // =========================================================
+    // EXPORT ROUTER
+    // =========================================================
+
+    module.exports = router;
