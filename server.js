@@ -1,458 +1,171 @@
-/* =========================================================
-   U.S TRAVEL & TOURS
-   MAIN SERVER
-   PostgreSQL Version
-   ========================================================= */
+// =========================================================
+// U.S TRAVEL & TOURS
+// MAIN BACKEND SERVER
+// PRODUCTION API SERVER
+// =========================================================
 
-const express = require("express");
 const path = require("path");
 const fs = require("fs");
+
+// ---------------------------------------------------------
+// ENVIRONMENT
+// Backend files are in the project ROOT
+// ---------------------------------------------------------
+
+require("dotenv").config({
+    path: path.join(__dirname, ".env")
+});
+
+// ---------------------------------------------------------
+// PACKAGES
+// ---------------------------------------------------------
+
+const express = require("express");
+const cors = require("cors");
 const bcrypt = require("bcryptjs");
 
-const {
-    pool,
-    initializeDatabase,
-    checkDatabaseConnection,
-    closeDatabase
-} = require("./database");
-
-
-/* =========================================================
-   APP
-========================================================= */
-
-const app = express();
-
-const PORT =
-    Number(process.env.PORT || 10000);
-
-const ROOT_DIR =
-    path.join(__dirname, "..");
-
-
-/* =========================================================
-   BASIC CONFIG
-========================================================= */
-
-app.disable("x-powered-by");
-
-app.set(
-    "trust proxy",
-    1
-);
-
-
-/* =========================================================
-   CORS
-========================================================= */
-
-const allowedOrigins = [
-
-    "https://us-travel-tours.netlify.app",
-
-    "http://localhost:3000",
-
-    "http://127.0.0.1:3000",
-
-    process.env.FRONTEND_URL
-
-].filter(Boolean);
-
-
-app.use(
-    function (
-        req,
-        res,
-        next
-    ) {
-
-        const origin =
-            req.headers.origin;
-
-
-        if (
-            origin &&
-            allowedOrigins.includes(origin)
-        ) {
-
-            res.header(
-                "Access-Control-Allow-Origin",
-                origin
-            );
-
-        } else if (!origin) {
-
-            res.header(
-                "Access-Control-Allow-Origin",
-                "*"
-            );
-
-        }
-
-
-        res.header(
-            "Vary",
-            "Origin"
-        );
-
-
-        res.header(
-            "Access-Control-Allow-Credentials",
-            "true"
-        );
-
-
-        res.header(
-            "Access-Control-Allow-Headers",
-            "Origin, X-Requested-With, Content-Type, Accept, Authorization"
-        );
-
-
-        res.header(
-            "Access-Control-Allow-Methods",
-            "GET,POST,PUT,PATCH,DELETE,OPTIONS"
-        );
-
-
-        if (
-            req.method === "OPTIONS"
-        ) {
-
-            return res.sendStatus(204);
-
-        }
-
-
-        next();
-
-    }
-);
-
-
-/* =========================================================
-   BODY PARSERS
-========================================================= */
-
-app.use(
-    express.json({
-        limit: "10mb"
-    })
-);
-
-
-app.use(
-    express.urlencoded({
-        extended: true,
-        limit: "10mb"
-    })
-);
-
-
-/* =========================================================
-   STATIC FILES
-========================================================= */
-
-const DATA_DIR =
-    path.join(
-        __dirname,
-        "data"
-    );
-
-
-if (
-    !fs.existsSync(DATA_DIR)
-) {
-
-    fs.mkdirSync(
-        DATA_DIR,
-        {
-            recursive: true
-        }
-    );
-
-}
-
-
-/* =========================================================
-   HEALTH CHECK
-========================================================= */
-
-app.get(
-    "/",
-    async function (
-        req,
-        res
-    ) {
-
-        let databaseStatus =
-            "disconnected";
-
-
-        try {
-
-            const connected =
-                await checkDatabaseConnection();
-
-            databaseStatus =
-                connected
-                    ? "connected"
-                    : "disconnected";
-
-        } catch (error) {
-
-            databaseStatus =
-                "disconnected";
-
-        }
-
-
-        return res.json({
-
-            success: true,
-
-            message:
-                "U.S TRAVEL & TOURS API is running.",
-
-            database:
-                databaseStatus,
-
-            timestamp:
-                new Date().toISOString()
-
-        });
-
-    }
-);
-
-
-/* =========================================================
-   API HEALTH CHECK
-========================================================= */
-
-app.get(
-    "/api/health",
-    async function (
-        req,
-        res
-    ) {
-
-        try {
-
-            const connected =
-                await checkDatabaseConnection();
-
-
-            if (!connected) {
-
-                return res.status(503).json({
-
-                    success: false,
-
-                    database:
-                        "disconnected",
-
-                    message:
-                        "Database connection is unavailable."
-
-                });
-
-            }
-
-
-            return res.json({
-
-                success: true,
-
-                database:
-                    "connected",
-
-                message:
-                    "API and PostgreSQL database are working."
-
-            });
-
-        } catch (error) {
-
-            console.error(
-                "HEALTH CHECK ERROR:",
-                error
-            );
-
-
-            return res.status(503).json({
-
-                success: false,
-
-                database:
-                    "disconnected",
-
-                message:
-                    "Database connection failed."
-
-            });
-
-        }
-
-    }
-);
-
-
-/* =========================================================
-   DATABASE STARTUP
-========================================================= */
-
-let databaseInitialized = false;
-
-async function startDatabase() {
-
-    if (databaseInitialized) {
-        return;
-    }
-
-
-    await initializeDatabase();
-
-
-    const result =
-        await pool.query(
-            `
-            SELECT COUNT(*)::INTEGER AS count
-            FROM users
-            `
-        );
-
-
-    console.log(
-        "DATABASE USERS:",
-        result.rows[0].count
-    );
-
-
-    databaseInitialized = true;
-
-}
-
-
-/* =========================================================
-   ADMIN BOOTSTRAP
-========================================================= */
-
-async function bootstrapAdmin() {
+// ---------------------------------------------------------
+// DATABASE
+// ---------------------------------------------------------
+
+const { db } = require("./database");
+// =========================================================
+// ADMIN BOOTSTRAP
+// CREATE / RESET PRODUCTION ADMIN
+// =========================================================
+
+function bootstrapAdmin() {
+
+    const adminName =
+        process.env.BOOTSTRAP_ADMIN_NAME;
 
     const adminEmail =
-        (
-            process.env.ADMIN_EMAIL ||
-            "ellisgeorge690@gmail.com"
-        )
-            .trim()
-            .toLowerCase();
-
+        process.env.BOOTSTRAP_ADMIN_EMAIL;
 
     const adminPassword =
-        process.env.ADMIN_PASSWORD ||
-        "";
+        process.env.BOOTSTRAP_ADMIN_PASSWORD;
 
-
-    if (!adminPassword) {
+    if (
+        !adminName ||
+        !adminEmail ||
+        !adminPassword
+    ) {
 
         console.log(
-            "ADMIN_PASSWORD not set. Existing admin account will be preserved."
+            "Admin bootstrap skipped: environment variables not configured."
         );
 
         return;
 
     }
-
 
     try {
 
-        const existing =
-            await pool.query(
-                `
-                SELECT
-                    id,
-                    email,
-                    role
-                FROM users
-                WHERE LOWER(email) = LOWER($1)
-                LIMIT 1
-                `,
-                [adminEmail]
-            );
+        const normalizedEmail =
+            adminEmail.trim().toLowerCase();
 
+        const existingAdmin =
+            db.prepare(`
+                SELECT id, role
+                FROM users
+                WHERE email = ?
+            `).get(normalizedEmail);
 
         const passwordHash =
-            await bcrypt.hash(
+            bcrypt.hashSync(
                 adminPassword,
                 12
             );
 
+        if (!existingAdmin) {
 
-        if (
-            existing.rows.length === 0
-        ) {
-
-            const result =
-                await pool.query(
-                    `
-                    INSERT INTO users
-                    (
-                        name,
-                        email,
-                        password_hash,
-                        role,
-                        created_at
-                    )
-                    VALUES
-                    (
-                        $1,
-                        $2,
-                        $3,
-                        'admin',
-                        CURRENT_TIMESTAMP
-                    )
-                    RETURNING
-                        id,
-                        email,
-                        role
-                    `,
-                    [
-                        "Administrator",
-                        adminEmail,
-                        passwordHash
-                    ]
-                );
-
-
-            console.log(
-                "ADMIN ACCOUNT CREATED:",
-                result.rows[0].email
+            db.prepare(`
+                INSERT INTO users
+                (
+                    name,
+                    email,
+                    password_hash,
+                    role
+                )
+                VALUES
+                (?, ?, ?, 'admin')
+            `).run(
+                adminName.trim(),
+                normalizedEmail,
+                passwordHash
             );
 
+            console.log("");
+            console.log(
+                "=============================================="
+            );
+            console.log(
+                "ADMIN BOOTSTRAP"
+            );
+            console.log(
+                "=============================================="
+            );
+            console.log(
+                "Admin account created successfully."
+            );
+            console.log(
+                "Admin Email:",
+                normalizedEmail
+            );
+            console.log(
+                "Admin Role: admin"
+            );
+            console.log(
+                "=============================================="
+            );
+            console.log("");
+
+        } else if (
+            existingAdmin.role === "admin"
+        ) {
+
+            db.prepare(`
+                UPDATE users
+                SET
+                    name = ?,
+                    password = ?,
+                    role = 'admin'
+                WHERE id = ?
+            `).run(
+                adminName.trim(),
+                passwordHash,
+                existingAdmin.id
+            );
+
+            console.log("");
+            console.log(
+                "=============================================="
+            );
+            console.log(
+                "ADMIN BOOTSTRAP"
+            );
+            console.log(
+                "=============================================="
+            );
+            console.log(
+                "Existing admin password reset successfully."
+            );
+            console.log(
+                "Admin Email:",
+                normalizedEmail
+            );
+            console.log(
+                "Admin Role: admin"
+            );
+            console.log(
+                "=============================================="
+            );
+            console.log("");
 
         } else {
 
-            await pool.query(
-                `
-                UPDATE users
-
-                SET
-                    password_hash = $1,
-                    role = 'admin'
-
-                WHERE
-                    LOWER(email) = LOWER($2)
-                `,
-                [
-                    passwordHash,
-                    adminEmail
-                ]
-            );
-
-
-            console.log(
-                "ADMIN ACCOUNT VERIFIED:",
-                adminEmail
+            console.error(
+                "ADMIN BOOTSTRAP ERROR: Email already belongs to a non-admin user."
             );
 
         }
@@ -468,380 +181,285 @@ async function bootstrapAdmin() {
 
 }
 
+// ---------------------------------------------------------
+// EXPRESS
+// ---------------------------------------------------------
 
-/* =========================================================
-   LOAD ROUTES
-========================================================= */
+const app = express();
 
-async function loadRoutes() {
+const PORT =
+    process.env.PORT || 3000;
 
-// =========================================================
-// AUTHENTICATION ROUTES
-// =========================================================
+// ---------------------------------------------------------
+// DATA DIRECTORY
+// ---------------------------------------------------------
 
-try {
+const DATA_DIR =
+    path.join(__dirname, "data");
 
-    const authRoutes = require("./auth");
+// ---------------------------------------------------------
+// CREATE DATA DIRECTORY
+// ---------------------------------------------------------
 
-    console.log(
-        "AUTH DEBUG TYPE:",
-        typeof authRoutes
-    );
+if (!fs.existsSync(DATA_DIR)) {
 
-    console.log(
-        "AUTH DEBUG REQUIRE:",
-        typeof authRoutes.requireAuth,
-        typeof authRoutes.requireAdmin
-    );
-
-    if (
-        typeof authRoutes !== "function"
-    ) {
-
-        throw new TypeError(
-            "AUTH ROUTES ERROR: ./auth.js is not exporting an Express Router."
-        );
-
-    }
-
-    app.use(
-        "/api/auth",
-        authRoutes
-    );
-
-    console.log(
-        "AUTH ROUTES LOADED SUCCESSFULLY"
-    );
-
-} catch (error) {
-
-    console.error(
-        "AUTH ROUTES ERROR:",
-        error
-    );
-
-    throw error;
+    fs.mkdirSync(DATA_DIR, {
+        recursive: true
+    });
 
 }
 
+// =========================================================
+// CORS
+// FRONTEND = NETLIFY
+// BACKEND = RENDER
+// =========================================================
 
-    /* -----------------------------------------------------
-       APPLICATIONS
-    ----------------------------------------------------- */
+const allowedOrigins = [
 
-    try {
+    "https://us-travel-tours.netlify.app",
 
-        const applicationRoutes =
-            require("./applications");
+    "http://localhost:3000",
 
-        app.use(
-            "/api/applications",
-            applicationRoutes
-        );
+    "http://127.0.0.1:3000"
 
-        console.log(
-            "APPLICATION ROUTES LOADED"
-        );
-
-    } catch (error) {
-
-        console.error(
-            "APPLICATION ROUTES ERROR:",
-            error
-        );
-
-        throw error;
-
-    }
-
-
-    /* -----------------------------------------------------
-       PAYMENTS
-    ----------------------------------------------------- */
-
-    try {
-
-        const paymentRoutes =
-            require("./payments");
-
-
-        app.use(
-            "/api/payments",
-            paymentRoutes
-        );
-
-
-        app.use(
-            "/api/application-payment",
-            paymentRoutes
-        );
-
-
-        console.log(
-            "PAYMENT ROUTES LOADED"
-        );
-
-    } catch (error) {
-
-        console.error(
-            "PAYMENT ROUTES ERROR:",
-            error
-        );
-
-        throw error;
-
-    }
-
-
-    /* -----------------------------------------------------
-       CONTACT
-    ----------------------------------------------------- */
-
-    const contactPath =
-        path.join(
-            __dirname,
-            "contact.js"
-        );
-
-
-    if (
-        fs.existsSync(contactPath)
-    ) {
-
-        try {
-
-            const contactRoutes =
-                require(contactPath);
-
-
-            app.use(
-                "/api/contact",
-                contactRoutes
-            );
-
-
-            console.log(
-                "CONTACT ROUTES LOADED"
-            );
-
-        } catch (error) {
-
-            console.error(
-                "CONTACT ROUTES ERROR:",
-                error
-            );
-
-            throw error;
-
-        }
-
-    }
-
-
-    /* -----------------------------------------------------
-       LIVE CHAT
-    ----------------------------------------------------- */
-
-    const chatPath =
-        path.join(
-            __dirname,
-            "chat.js"
-        );
-
-
-    if (
-        fs.existsSync(chatPath)
-    ) {
-
-        try {
-
-            const chatRoutes =
-                require(chatPath);
-
-
-            app.use(
-                "/api/chat",
-                chatRoutes
-            );
-
-
-            console.log(
-                "CHAT ROUTES LOADED"
-            );
-
-        } catch (error) {
-
-            console.error(
-                "CHAT ROUTES ERROR:",
-                error
-            );
-
-            throw error;
-
-        }
-
-    }
-
-
-    /* -----------------------------------------------------
-       JOBS
-    ----------------------------------------------------- */
-
-    const jobsPath =
-        path.join(
-            __dirname,
-            "jobs.js"
-        );
-
-
-    if (
-        fs.existsSync(jobsPath)
-    ) {
-
-        try {
-
-            const jobsRoutes =
-                require(jobsPath);
-
-
-            app.use(
-                "/api/jobs",
-                jobsRoutes
-            );
-
-
-            console.log(
-                "JOBS ROUTES LOADED"
-            );
-
-        } catch (error) {
-
-            console.error(
-                "JOBS ROUTES ERROR:",
-                error
-            );
-
-            throw error;
-
-        }
-
-    }
-
-}
-
-
-/* =========================================================
-   404 API HANDLER
-========================================================= */
+];
 
 app.use(
-    function (
-        req,
-        res,
-        next
-    ) {
+    cors({
 
-        if (
-            req.path.startsWith("/api/")
+        origin: function (
+            origin,
+            callback
         ) {
 
-            return res.status(404).json({
+            // Allow requests without Origin
+            // such as server-to-server requests
 
-                success: false,
+            if (!origin) {
 
-                message:
-                    "API endpoint not found.",
+                return callback(
+                    null,
+                    true
+                );
 
-                path:
-                    req.path
+            }
 
-            });
+            if (
+                allowedOrigins.includes(
+                    origin
+                )
+            ) {
 
-        }
+                return callback(
+                    null,
+                    true
+                );
 
+            }
 
-        next();
+            console.warn(
+                "CORS blocked:",
+                origin
+            );
 
-    }
+            return callback(
+                new Error(
+                    "CORS: Origin not allowed."
+                )
+            );
+
+        },
+
+        credentials: true
+
+    })
 );
 
-
-/* =========================================================
-   GENERAL ERROR HANDLER
-========================================================= */
+// =========================================================
+// BODY PARSERS
+// =========================================================
 
 app.use(
-    function (
-        error,
-        req,
-        res,
-        next
-    ) {
+    express.json({
+        limit: "10mb"
+    })
+);
 
-        console.error(
-            "SERVER ERROR:",
-            error
-        );
+app.use(
+    express.urlencoded({
+        extended: true,
+        limit: "10mb"
+    })
+);
 
+// =========================================================
+// AUTHENTICATION
+// =========================================================
 
-        if (res.headersSent) {
+const authRoutes =
+    require("./auth");
 
-            return next(error);
+app.use(
+    "/api/auth",
+    authRoutes
+);
 
-        }
+console.log(
+    "Authentication routes loaded."
+);
 
+// =========================================================
+// HEALTH CHECK
+// =========================================================
 
-        const status =
-            Number(error.statusCode) ||
-            Number(error.status) ||
-            500;
+app.get(
+    "/api/health",
+    (req, res) => {
 
+        res.json({
 
-        return res.status(status).json({
-
-            success: false,
+            success: true,
 
             message:
-                status === 500
-                    ? "Internal server error."
-                    : (
-                        error.message ||
-                        "Request failed."
-                    )
+                "U.S TRAVEL & TOURS backend is running.",
+
+            database:
+                db.open
+                    ? "connected"
+                    : "disconnected",
+
+            frontend:
+                "https://us-travel-tours.netlify.app",
+
+            backend:
+    "https://u-s-travel-tours-1.onrender.com",
+
+            time:
+                new Date().toISOString()
 
         });
 
     }
 );
 
+// =========================================================
+// APPLICATIONS
+// =========================================================
 
-/* =========================================================
-   GRACEFUL SHUTDOWN
-========================================================= */
+const applicationsRoutes =
+    require("./applications");
 
-let server = null;
+app.use(
+    "/api/applications",
+    applicationsRoutes
+);
 
-async function shutdown(
-    signal
-) {
+console.log(
+    "Application routes loaded."
+);
 
-    console.log(
-        `${signal} received. Shutting down server...`
+// =========================================================
+// PAYMENTS
+// =========================================================
+
+const paymentsRoutes =
+    require("./payments");
+
+app.use(
+    "/api/payments",
+    paymentsRoutes
+);
+
+app.use(
+    "/api/application-payment",
+    paymentsRoutes
+);
+
+console.log(
+    "Payment routes loaded."
+);
+
+// =========================================================
+// CHAT
+// =========================================================
+
+const chatPath =
+    path.join(
+        __dirname,
+        "chat.js"
     );
 
+if (
+    fs.existsSync(chatPath)
+) {
 
     try {
 
-        if (server) {
+        const chatRoutes =
+            require(chatPath);
 
-            await new Promise(
-                (resolve) => {
+        app.use(
+            "/api/chat",
+            chatRoutes
+        );
 
-                    server.close(
-                        () => resolve()
-                    );
+        console.log(
+            "Chat routes loaded successfully."
+        );
 
-                }
+        console.log(
+            "Chat API: /api/chat"
+        );
+
+    } catch (error) {
+
+        console.error(
+            "CHAT ROUTES LOAD ERROR:",
+            error
+        );
+
+    }
+
+} else {
+
+    console.error(
+        "CHAT ERROR: chat.js not found."
+    );
+
+}
+
+// =========================================================
+// CONTACT
+// =========================================================
+
+const contactPath =
+    path.join(
+        __dirname,
+        "contact.js"
+    );
+
+if (
+    fs.existsSync(contactPath)
+) {
+
+    try {
+
+        const contactRoutes =
+            require(contactPath);
+
+        if (
+            typeof contactRoutes ===
+            "function"
+        ) {
+
+            app.use(
+                "/api/contact",
+                contactRoutes
+            );
+
+            console.log(
+                "Contact routes loaded."
             );
 
         }
@@ -849,177 +467,216 @@ async function shutdown(
     } catch (error) {
 
         console.error(
-            "SERVER CLOSE ERROR:",
+            "Unable to load contact.js:",
             error
         );
 
     }
 
+} else {
 
-    try {
-
-        await closeDatabase();
-
-    } catch (error) {
-
-        console.error(
-            "DATABASE CLOSE ERROR:",
-            error
-        );
-
-    }
-
-
-    process.exit(0);
+    console.warn(
+        "CONTACT: contact.js not found."
+    );
 
 }
 
+// =========================================================
+// JOB APPLICATIONS
+// =========================================================
 
-process.on(
-    "SIGTERM",
-    () => shutdown("SIGTERM")
-);
+const jobsPath =
+    path.join(
+        __dirname,
+        "jobs.js"
+    );
 
-
-process.on(
-    "SIGINT",
-    () => shutdown("SIGINT")
-);
-
-
-/* =========================================================
-   UNHANDLED ERRORS
-========================================================= */
-
-process.on(
-    "unhandledRejection",
-    function (error) {
-
-        console.error(
-            "UNHANDLED REJECTION:",
-            error
-        );
-
-    }
-);
-
-
-process.on(
-    "uncaughtException",
-    function (error) {
-
-        console.error(
-            "UNCAUGHT EXCEPTION:",
-            error
-        );
-
-    }
-);
-
-
-/* =========================================================
-   START SERVER
-========================================================= */
-
-async function startServer() {
+if (
+    fs.existsSync(jobsPath)
+) {
 
     try {
 
-        console.log(
-            "=============================================="
-        );
+        const jobsRoutes =
+            require(jobsPath);
 
-        console.log(
-            "U.S TRAVEL & TOURS SERVER STARTING..."
-        );
+        if (
+            typeof jobsRoutes ===
+            "function"
+        ) {
 
-        console.log(
-            "=============================================="
-        );
+            // Main jobs API
 
-
-        /* -------------------------------------------------
-           DATABASE
-        ------------------------------------------------- */
-
-        await startDatabase();
-
-
-        /* -------------------------------------------------
-           ADMIN
-        ------------------------------------------------- */
-
-        await bootstrapAdmin();
-
-
-        /* -------------------------------------------------
-           ROUTES
-        ------------------------------------------------- */
-
-        await loadRoutes();
-
-
-        /* -------------------------------------------------
-           START HTTP SERVER
-        ------------------------------------------------- */
-
-        server =
-            app.listen(
-                PORT,
-                "0.0.0.0",
-                function () {
-
-                    console.log(
-                        "=============================================="
-                    );
-
-                    console.log(
-                        `SERVER RUNNING ON PORT ${PORT}`
-                    );
-
-                    console.log(
-                        "DATABASE: POSTGRESQL"
-                    );
-
-                    console.log(
-                        "=============================================="
-                    );
-
-                }
+            app.use(
+                "/api/jobs",
+                jobsRoutes
             );
 
+            // Existing frontend compatibility API
+
+            app.use(
+                "/api/job-applications",
+                jobsRoutes
+            );
+
+        }
+
+        console.log(
+            "Job routes loaded."
+        );
 
     } catch (error) {
 
         console.error(
-            "SERVER STARTUP FAILED:",
+            "Job routes error:",
             error
         );
 
-
-        try {
-
-            await closeDatabase();
-
-        } catch (_) {}
-
-
-        process.exit(1);
-
     }
+
+} else {
+
+    console.warn(
+        "JOBS: jobs.js not found."
+    );
 
 }
 
+// =========================================================
+// API 404
+// =========================================================
 
-/* =========================================================
-   START
-========================================================= */
+app.use(
+    "/api",
+    (req, res) => {
 
-startServer();
+        res.status(404).json({
 
+            success: false,
 
-/* =========================================================
-   EXPORT
-========================================================= */
+            message:
+                "API endpoint not found."
 
-module.exports = app;
+        });
+
+    }
+);
+
+// =========================================================
+// GLOBAL ERROR HANDLER
+// =========================================================
+
+app.use(
+    (
+        error,
+        req,
+        res,
+        next
+    ) => {
+
+        console.error(
+            "GLOBAL SERVER ERROR:",
+            error
+        );
+
+        if (
+            res.headersSent
+        ) {
+
+            return next(error);
+
+        }
+
+        res.status(500).json({
+
+            success: false,
+
+            message:
+                "An internal server error occurred."
+
+        });
+
+    }
+);
+
+// =========================================================
+// DATABASE USER CHECK
+// =========================================================
+
+try {
+
+    const userCount = db.prepare(
+        "SELECT COUNT(*) AS count FROM users"
+    ).get();
+
+    console.log("");
+    console.log(
+        "DATABASE USER CHECK"
+    );
+    console.log(
+        "Database path:",
+        require("./database").DB_PATH
+    );
+    console.log(
+        "Total users:",
+        userCount.count
+    );
+    console.log("");
+
+} catch (error) {
+
+    console.error(
+        "DATABASE USER CHECK ERROR:",
+        error
+    );
+
+}
+
+bootstrapAdmin();
+
+// =========================================================
+// START SERVER
+// RENDER
+// =========================================================
+
+app.listen(
+    PORT,
+    "0.0.0.0",
+    () => {
+
+        console.log("");
+
+        console.log(
+            "=============================================="
+        );
+
+        console.log(
+            "       U.S TRAVEL & TOURS API SERVER"
+        );
+
+        console.log(
+            "=============================================="
+        );
+
+        console.log(
+            `Server running on port ${PORT}`
+        );
+
+        console.log(
+            "Health: /api/health"
+        );
+
+        console.log(
+            "Frontend: https://us-travel-tours.netlify.app"
+        );
+
+        console.log(
+    "Backend: https://u-s-travel-tours-1.onrender.com"
+);
+
+        console.log(
+            "=============================================="
+        );
+
+    }
+);
