@@ -1,347 +1,364 @@
-// =========================================================
-// U.S TRAVEL & TOURS
-// LIVE SUPPORT CHAT BACKEND
-// =========================================================
+/* =========================================================
+   U.S TRAVEL & TOURS
+   LIVE SUPPORT CHAT MODULE
+   MongoDB Version
+========================================================= */
 
 const express = require("express");
-const nodemailer = require("nodemailer");
 
-const { db } = require("./database");
-const { requireAuth, requireAdmin } = require("./auth");
+const {
+    getDatabase,
+    getNextSequence
+} = require("./database");
+
+const {
+    requireAuth,
+    requireAdmin
+} = require("./auth");
 
 const router = express.Router();
 
-console.log("CHAT: Initializing live chat backend...");
 
-// =========================================================
-// DATABASE SETUP
-// =========================================================
+/* =========================================================
+   OPTIONAL EMAIL CONFIG
+========================================================= */
 
-const CHAT_TABLE = "support_chat_messages";
+const nodemailer = require("nodemailer");
 
-try {
+const SMTP_HOST =
+    process.env.SMTP_HOST || "smtp-relay.brevo.com";
 
-    db.exec(`
-        CREATE TABLE IF NOT EXISTS support_chat_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            sender_type TEXT NOT NULL
-                CHECK(sender_type IN ('customer', 'admin')),
-            message TEXT NOT NULL,
-            is_read INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
+const SMTP_PORT =
+    Number(process.env.SMTP_PORT || 587);
 
-        CREATE INDEX IF NOT EXISTS idx_support_chat_user_id
-        ON support_chat_messages(user_id);
+const SMTP_USER =
+    process.env.SMTP_USER || "";
 
-        CREATE INDEX IF NOT EXISTS idx_support_chat_created_at
-        ON support_chat_messages(created_at);
+const SMTP_PASS =
+    process.env.SMTP_PASS || "";
 
-        CREATE INDEX IF NOT EXISTS idx_support_chat_unread
-        ON support_chat_messages(
-            user_id,
-            sender_type,
-            is_read
-        );
-    `);
+const MAIL_FROM =
+    process.env.MAIL_FROM ||
+    SMTP_USER ||
+    "";
 
-    console.log(
-        "CHAT DATABASE: support chat table ready."
-    );
+const transporter =
+    SMTP_USER && SMTP_PASS
+        ? nodemailer.createTransport({
 
-} catch (error) {
+            host:
+                SMTP_HOST,
 
-    console.error(
-        "CHAT DATABASE ERROR:",
-        error
-    );
+            port:
+                SMTP_PORT,
 
-    throw error;
-}
+            secure:
+                SMTP_PORT === 465,
 
-// =========================================================
-// EMAIL CONFIGURATION
-// =========================================================
+            auth: {
 
-let transporter = null;
+                user:
+                    SMTP_USER,
 
-function createTransporter() {
+                pass:
+                    SMTP_PASS
 
-    if (
-        !process.env.SMTP_HOST ||
-        !process.env.SMTP_PORT ||
-        !process.env.SMTP_USER ||
-        !process.env.SMTP_PASS
-    ) {
+            }
 
-        console.warn(
-            "CHAT SMTP: SMTP configuration missing."
-        );
+        })
+        : null;
 
-        return null;
-    }
 
-    return nodemailer.createTransport({
+/* =========================================================
+   HELPERS
+========================================================= */
 
-        host: process.env.SMTP_HOST,
-
-        port: Number(
-            process.env.SMTP_PORT
-        ),
-
-        secure:
-            String(
-                process.env.SMTP_SECURE || ""
-            ).toLowerCase() === "true",
-
-        auth: {
-            user: process.env.SMTP_USER,
-            pass: process.env.SMTP_PASS
-        }
-
-    });
-}
-
-transporter = createTransporter();
-
-// =========================================================
-// HELPERS
-// =========================================================
-
-function cleanMessage(value) {
+function cleanString(
+    value,
+    maxLength = 5000
+) {
 
     if (
-        typeof value !== "string"
+        value === undefined ||
+        value === null
     ) {
+
         return "";
+
     }
 
-    return value
-        .replace(/\u0000/g, "")
-        .trim();
+    return String(value)
+        .trim()
+        .slice(0, maxLength);
+
 }
 
-function getUserId(req) {
 
-    if (
-        !req.user ||
-        req.user.id === undefined ||
-        req.user.id === null
-    ) {
-        return null;
-    }
+function cleanEmail(
+    value
+) {
 
-    const userId =
-        Number(req.user.id);
+    return cleanString(
+        value,
+        320
+    ).toLowerCase();
 
-    if (
-        !Number.isInteger(userId) ||
-        userId <= 0
-    ) {
-        return null;
-    }
-
-    return userId;
 }
 
-function getCustomerById(userId) {
 
-    return db.prepare(`
-        SELECT
-            id,
-            name,
-            email,
-            role
-        FROM users
-        WHERE id = ?
-        LIMIT 1
-    `).get(userId);
+function formatMessage(
+    message
+) {
+
+    return {
+
+        id:
+            message.id,
+
+        userId:
+            message.user_id,
+
+        senderType:
+            message.sender_type,
+
+        message:
+            message.message,
+
+        isRead:
+            Boolean(
+                message.is_read
+            ),
+
+        createdAt:
+            message.created_at
+
+    };
+
 }
 
-function escapeHtml(value) {
 
-    return String(value ?? "")
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#039;");
-}
-
-// =========================================================
-// CUSTOMER - GET OWN MESSAGES
-// =========================================================
+/* =========================================================
+   GET CUSTOMER CHAT MESSAGES
+========================================================= */
 
 router.get(
     "/messages",
     requireAuth,
-    (req, res) => {
+    async function (
+        req,
+        res
+    ) {
 
         try {
 
-            if (
-                !req.user ||
-                req.user.role !== "customer"
-            ) {
-
-                return res.status(403).json({
-                    success: false,
-                    message:
-                        "Customer access required."
-                });
-            }
-
-            const userId =
-                getUserId(req);
-
-            if (!userId) {
-
-                return res.status(401).json({
-                    success: false,
-                    message:
-                        "Authentication required."
-                });
-            }
+            const db =
+                getDatabase();
 
             const messages =
-                db.prepare(`
-                    SELECT
-                        id,
-                        user_id,
-                        sender_type,
-                        message,
-                        is_read,
-                        created_at
-                    FROM support_chat_messages
-                    WHERE user_id = ?
-                    ORDER BY id ASC
-                `).all(userId);
+                db.collection(
+                    "support_chat_messages"
+                );
 
-            // Admin replies become read when
-            // customer opens the chat.
-            db.prepare(`
-                UPDATE support_chat_messages
-                SET is_read = 1
-                WHERE
-                    user_id = ?
-                    AND sender_type = 'admin'
-            `).run(userId);
+
+            const userId =
+                Number(
+                    req.user.id
+                );
+
+
+            /* -------------------------------------------------
+               GET OWN CONVERSATION
+            ------------------------------------------------- */
+
+            const chatMessages =
+                await messages
+                    .find({
+                        user_id:
+                            userId
+                    })
+                    .sort({
+                        id: 1
+                    })
+                    .toArray();
+
+
+            /* -------------------------------------------------
+               CUSTOMER OPENED CHAT
+               MARK ADMIN REPLIES AS READ
+            ------------------------------------------------- */
+
+            await messages.updateMany(
+
+                {
+                    user_id:
+                        userId,
+
+                    sender_type:
+                        "admin",
+
+                    is_read:
+                        false
+
+                },
+
+                {
+                    $set: {
+
+                        is_read:
+                            true
+
+                    }
+
+                }
+
+            );
+
 
             return res.json({
+
                 success: true,
-                messages
+
+                messages:
+                    chatMessages.map(
+                        formatMessage
+                    )
+
             });
 
         } catch (error) {
 
             console.error(
-                "CHAT GET CUSTOMER ERROR:",
+                "GET CHAT MESSAGES ERROR:",
                 error
             );
 
             return res.status(500).json({
+
                 success: false,
+
                 message:
                     "Unable to load chat messages."
+
             });
+
         }
+
     }
 );
 
-// =========================================================
-// CUSTOMER - SEND MESSAGE
-// =========================================================
+
+/* =========================================================
+   CUSTOMER SEND MESSAGE
+========================================================= */
 
 router.post(
     "/messages",
     requireAuth,
-    (req, res) => {
+    async function (
+        req,
+        res
+    ) {
 
         try {
 
-            if (
-                !req.user ||
-                req.user.role !== "customer"
-            ) {
-
-                return res.status(403).json({
-                    success: false,
-                    message:
-                        "Customer access required."
-                });
-            }
-
-            const userId =
-                getUserId(req);
-
-            if (!userId) {
-
-                return res.status(401).json({
-                    success: false,
-                    message:
-                        "Authentication required."
-                });
-            }
-
             const message =
-                cleanMessage(
-                    req.body?.message
+                cleanString(
+                    req.body?.message,
+                    5000
                 );
+
 
             if (!message) {
 
                 return res.status(400).json({
+
                     success: false,
+
                     message:
-                        "Message cannot be empty."
+                        "Message is required."
+
                 });
+
             }
 
-            if (message.length > 2000) {
 
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        "Message cannot exceed 2000 characters."
+            const db =
+                getDatabase();
+
+            const messages =
+                db.collection(
+                    "support_chat_messages"
+                );
+
+
+            const userId =
+                Number(
+                    req.user.id
+                );
+
+
+            const user =
+                await db.collection(
+                    "users"
+                ).findOne({
+
+                    id:
+                        userId
+
                 });
+
+
+            if (!user) {
+
+                return res.status(401).json({
+
+                    success: false,
+
+                    message:
+                        "User account not found."
+
+                });
+
             }
 
-            const result =
-                db.prepare(`
-                    INSERT INTO support_chat_messages
-                    (
-                        user_id,
-                        sender_type,
-                        message,
-                        is_read
-                    )
-                    VALUES
-                    (?, 'customer', ?, 0)
-                `).run(
+
+            const now =
+                new Date();
+
+
+            const messageId =
+                await getNextSequence(
+                    "support_chat_messages"
+                );
+
+
+            const chatMessage = {
+
+                id:
+                    messageId,
+
+                user_id:
                     userId,
-                    message
-                );
 
-            const savedMessage =
-                db.prepare(`
-                    SELECT
-                        id,
-                        user_id,
-                        sender_type,
-                        message,
-                        is_read,
-                        created_at
-                    FROM support_chat_messages
-                    WHERE id = ?
-                    LIMIT 1
-                `).get(
-                    result.lastInsertRowid
-                );
+                sender_type:
+                    "customer",
 
-            console.log(
-                `CHAT: Customer ${userId} sent message #${result.lastInsertRowid}`
+                message:
+                    message,
+
+                is_read:
+                    false,
+
+                created_at:
+                    now
+
+            };
+
+
+            await messages.insertOne(
+                chatMessage
             );
+
 
             return res.status(201).json({
 
@@ -350,112 +367,256 @@ router.post(
                 message:
                     "Message sent successfully.",
 
-                data: savedMessage
+                chatMessage:
+                    formatMessage(
+                        chatMessage
+                    )
 
             });
 
         } catch (error) {
 
             console.error(
-                "CHAT SEND CUSTOMER ERROR:",
+                "SEND CHAT MESSAGE ERROR:",
                 error
             );
 
             return res.status(500).json({
+
                 success: false,
+
                 message:
                     "Unable to send message."
+
             });
+
         }
+
     }
 );
 
-// =========================================================
-// ADMIN - CUSTOMER CONVERSATION LIST
-// =========================================================
+
+/* =========================================================
+   ADMIN - GET ALL CONVERSATIONS
+========================================================= */
 
 router.get(
     "/conversations",
     requireAdmin,
-    (req, res) => {
+    async function (
+        req,
+        res
+    ) {
 
         try {
 
-            const rows =
-                db.prepare(`
-                    SELECT
-                        u.id AS user_id,
-                        u.name,
-                        u.email,
+            const db =
+                getDatabase();
 
-                        (
-                            SELECT cm.message
-                            FROM support_chat_messages cm
-                            WHERE cm.user_id = u.id
-                            ORDER BY cm.id DESC
-                            LIMIT 1
-                        ) AS last_message,
+            const messages =
+                db.collection(
+                    "support_chat_messages"
+                );
 
-                        (
-                            SELECT cm.created_at
-                            FROM support_chat_messages cm
-                            WHERE cm.user_id = u.id
-                            ORDER BY cm.id DESC
-                            LIMIT 1
-                        ) AS last_message_at,
+            const users =
+                db.collection(
+                    "users"
+                );
 
-                        (
-                            SELECT COUNT(*)
-                            FROM support_chat_messages cm
-                            WHERE
-                                cm.user_id = u.id
-                                AND cm.sender_type = 'customer'
-                                AND cm.is_read = 0
-                        ) AS unread_count
 
-                    FROM users u
+            /* -------------------------------------------------
+               GET ALL CUSTOMER USERS
+            ------------------------------------------------- */
 
-                    WHERE
-                        u.role = 'customer'
-                        AND EXISTS (
-                            SELECT 1
-                            FROM support_chat_messages cm2
-                            WHERE cm2.user_id = u.id
-                        )
+            const customerUsers =
+                await users
+                    .find({
+                        role:
+                            "customer"
+                    })
+                    .sort({
+                        id: 1
+                    })
+                    .toArray();
 
-                    ORDER BY
-                        last_message_at DESC
-                `).all();
+
+            const conversations = [];
+
+
+            for (
+                const user
+                of customerUsers
+            ) {
+
+                const userId =
+                    Number(
+                        user.id
+                    );
+
+
+                /* -------------------------------------------------
+                   LATEST MESSAGE
+                ------------------------------------------------- */
+
+                const latestMessage =
+                    await messages
+                        .findOne(
+                            {
+                                user_id:
+                                    userId
+                            },
+                            {
+                                sort: {
+                                    id: -1
+                                }
+                            }
+                        );
+
+
+                /* -------------------------------------------------
+                   UNREAD CUSTOMER MESSAGES
+                ------------------------------------------------- */
+
+                const unreadCount =
+                    await messages.countDocuments({
+
+                        user_id:
+                            userId,
+
+                        sender_type:
+                            "customer",
+
+                        is_read:
+                            false
+
+                    });
+
+
+                /* -------------------------------------------------
+                   ONLY SHOW USERS WITH CHAT
+                   OR KEEP ALL USERS FOR ADMIN LIST
+                ------------------------------------------------- */
+
+                conversations.push({
+
+                    userId:
+                        userId,
+
+                    name:
+                        user.name || "",
+
+                    email:
+                        user.email || "",
+
+                    phone:
+                        user.phone || "",
+
+                    latestMessage:
+                        latestMessage
+                            ? formatMessage(
+                                latestMessage
+                            )
+                            : null,
+
+                    unreadCount:
+                        unreadCount
+
+                });
+
+            }
+
+
+            /* -------------------------------------------------
+               SORT:
+               1. UNREAD FIRST
+               2. LATEST MESSAGE
+            ------------------------------------------------- */
+
+            conversations.sort(
+                function (
+                    a,
+                    b
+                ) {
+
+                    if (
+                        b.unreadCount !==
+                        a.unreadCount
+                    ) {
+
+                        return (
+                            b.unreadCount -
+                            a.unreadCount
+                        );
+
+                    }
+
+
+                    const aTime =
+                        a.latestMessage?.createdAt
+                            ? new Date(
+                                a.latestMessage.createdAt
+                            ).getTime()
+                            : 0;
+
+                    const bTime =
+                        b.latestMessage?.createdAt
+                            ? new Date(
+                                b.latestMessage.createdAt
+                            ).getTime()
+                            : 0;
+
+
+                    return (
+                        bTime -
+                        aTime
+                    );
+
+                }
+            );
+
 
             return res.json({
+
                 success: true,
-                conversations: rows
+
+                conversations:
+                    conversations
+
             });
 
         } catch (error) {
 
             console.error(
-                "CHAT ADMIN CONVERSATIONS ERROR:",
+                "GET CHAT CONVERSATIONS ERROR:",
                 error
             );
 
             return res.status(500).json({
+
                 success: false,
+
                 message:
-                    "Unable to load chat conversations."
+                    "Unable to load conversations."
+
             });
+
         }
+
     }
 );
 
-// =========================================================
-// ADMIN - GET CUSTOMER MESSAGES
-// =========================================================
+
+/* =========================================================
+   ADMIN - GET SPECIFIC CONVERSATION
+========================================================= */
 
 router.get(
     "/conversations/:userId",
     requireAdmin,
-    (req, res) => {
+    async function (
+        req,
+        res
+    ) {
 
         try {
 
@@ -464,95 +625,166 @@ router.get(
                     req.params.userId
                 );
 
+
             if (
-                !Number.isInteger(userId) ||
+                !Number.isInteger(
+                    userId
+                ) ||
                 userId <= 0
             ) {
 
                 return res.status(400).json({
+
                     success: false,
+
                     message:
-                        "Invalid customer."
+                        "Invalid user ID."
+
                 });
+
             }
 
-            const customer =
-                getCustomerById(userId);
 
-            if (
-                !customer ||
-                customer.role !== "customer"
-            ) {
-
-                return res.status(404).json({
-                    success: false,
-                    message:
-                        "Customer not found."
-                });
-            }
+            const db =
+                getDatabase();
 
             const messages =
-                db.prepare(`
-                    SELECT
-                        id,
-                        user_id,
-                        sender_type,
-                        message,
-                        is_read,
-                        created_at
-                    FROM support_chat_messages
-                    WHERE user_id = ?
-                    ORDER BY id ASC
-                `).all(userId);
+                db.collection(
+                    "support_chat_messages"
+                );
 
-            // Customer messages become read
-            // when admin opens the conversation.
-            db.prepare(`
-                UPDATE support_chat_messages
-                SET is_read = 1
-                WHERE
-                    user_id = ?
-                    AND sender_type = 'customer'
-            `).run(userId);
+            const users =
+                db.collection(
+                    "users"
+                );
+
+
+            const user =
+                await users.findOne({
+
+                    id:
+                        userId
+
+                });
+
+
+            if (!user) {
+
+                return res.status(404).json({
+
+                    success: false,
+
+                    message:
+                        "User not found."
+
+                });
+
+            }
+
+
+            const chatMessages =
+                await messages
+                    .find({
+                        user_id:
+                            userId
+                    })
+                    .sort({
+                        id: 1
+                    })
+                    .toArray();
+
+
+            /* -------------------------------------------------
+               MARK CUSTOMER MESSAGES AS READ
+            ------------------------------------------------- */
+
+            await messages.updateMany(
+
+                {
+                    user_id:
+                        userId,
+
+                    sender_type:
+                        "customer",
+
+                    is_read:
+                        false
+
+                },
+
+                {
+                    $set: {
+
+                        is_read:
+                            true
+
+                    }
+
+                }
+
+            );
+
 
             return res.json({
 
                 success: true,
 
-                customer: {
-                    id: customer.id,
-                    name: customer.name,
-                    email: customer.email
+                user: {
+
+                    id:
+                        user.id,
+
+                    name:
+                        user.name || "",
+
+                    email:
+                        user.email || "",
+
+                    phone:
+                        user.phone || ""
+
                 },
 
-                messages
+                messages:
+                    chatMessages.map(
+                        formatMessage
+                    )
 
             });
 
         } catch (error) {
 
             console.error(
-                "CHAT ADMIN MESSAGES ERROR:",
+                "GET ADMIN CONVERSATION ERROR:",
                 error
             );
 
             return res.status(500).json({
+
                 success: false,
+
                 message:
                     "Unable to load conversation."
+
             });
+
         }
+
     }
 );
 
-// =========================================================
-// ADMIN - REPLY
-// =========================================================
+
+/* =========================================================
+   ADMIN - REPLY TO CUSTOMER
+========================================================= */
 
 router.post(
     "/conversations/:userId/reply",
     requireAdmin,
-    async (req, res) => {
+    async function (
+        req,
+        res
+    ) {
 
         try {
 
@@ -561,100 +793,130 @@ router.post(
                     req.params.userId
                 );
 
+
             if (
-                !Number.isInteger(userId) ||
+                !Number.isInteger(
+                    userId
+                ) ||
                 userId <= 0
             ) {
 
                 return res.status(400).json({
+
                     success: false,
+
                     message:
-                        "Invalid customer."
+                        "Invalid user ID."
+
                 });
+
             }
 
+
             const message =
-                cleanMessage(
-                    req.body?.message
+                cleanString(
+                    req.body?.message,
+                    5000
                 );
+
 
             if (!message) {
 
                 return res.status(400).json({
+
                     success: false,
+
                     message:
-                        "Reply cannot be empty."
+                        "Message is required."
+
                 });
+
             }
 
-            if (message.length > 2000) {
 
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        "Reply cannot exceed 2000 characters."
+            const db =
+                getDatabase();
+
+            const messages =
+                db.collection(
+                    "support_chat_messages"
+                );
+
+            const users =
+                db.collection(
+                    "users"
+                );
+
+
+            const user =
+                await users.findOne({
+
+                    id:
+                        userId
+
                 });
-            }
 
-            const customer =
-                getCustomerById(userId);
 
-            if (
-                !customer ||
-                customer.role !== "customer"
-            ) {
+            if (!user) {
 
                 return res.status(404).json({
+
                     success: false,
+
                     message:
                         "Customer not found."
+
                 });
+
             }
 
-            const result =
-                db.prepare(`
-                    INSERT INTO support_chat_messages
-                    (
-                        user_id,
-                        sender_type,
-                        message,
-                        is_read
-                    )
-                    VALUES
-                    (?, 'admin', ?, 0)
-                `).run(
+
+            const now =
+                new Date();
+
+
+            const messageId =
+                await getNextSequence(
+                    "support_chat_messages"
+                );
+
+
+            const chatMessage = {
+
+                id:
+                    messageId,
+
+                user_id:
                     userId,
-                    message
-                );
 
-            const savedMessage =
-                db.prepare(`
-                    SELECT
-                        id,
-                        user_id,
-                        sender_type,
-                        message,
-                        is_read,
-                        created_at
-                    FROM support_chat_messages
-                    WHERE id = ?
-                    LIMIT 1
-                `).get(
-                    result.lastInsertRowid
-                );
+                sender_type:
+                    "admin",
 
-            console.log(
-                `CHAT: Admin replied to customer ${userId}`
+                message:
+                    message,
+
+                is_read:
+                    false,
+
+                created_at:
+                    now
+
+            };
+
+
+            await messages.insertOne(
+                chatMessage
             );
 
-            // =================================================
-            // EMAIL CUSTOMER
-            // =================================================
+
+            /* -------------------------------------------------
+               EMAIL CUSTOMER
+               OPTIONAL
+            ------------------------------------------------- */
 
             if (
                 transporter &&
-                customer.email &&
-                process.env.MAIL_FROM
+                user.email
             ) {
 
                 try {
@@ -662,80 +924,70 @@ router.post(
                     await transporter.sendMail({
 
                         from:
-                            process.env.MAIL_FROM,
+                            MAIL_FROM,
 
                         to:
-                            customer.email,
+                            user.email,
 
                         subject:
                             "New message from U.S TRAVEL & TOURS",
 
                         text:
-`Hello ${customer.name || "Customer"},
-
-You have received a new message from U.S TRAVEL & TOURS Support.
-
-Support message:
-
-${message}
-
-Please log in to your account to continue the conversation.
-
-U.S TRAVEL & TOURS
-Miami, Florida, USA`,
+                            message,
 
                         html:
-`
-<div style="font-family:Arial,sans-serif;line-height:1.6;color:#222">
+                            `
+                            <div style="font-family:Arial,sans-serif;line-height:1.6;">
+                                <h2>U.S TRAVEL & TOURS</h2>
 
-    <h2>U.S TRAVEL & TOURS</h2>
+                                <p>Hello ${String(
+                                    user.name || "Customer"
+                                )},</p>
 
-    <p>
-        Hello ${escapeHtml(
-            customer.name || "Customer"
-        )},
-    </p>
+                                <p>You have received a new message from our support team:</p>
 
-    <p>
-        You have received a new message from
-        U.S TRAVEL & TOURS Support.
-    </p>
+                                <div style="
+                                    padding:15px;
+                                    background:#f5f5f5;
+                                    border-radius:8px;
+                                    margin:15px 0;
+                                ">
+                                    ${message
+                                        .replace(
+                                            /\n/g,
+                                            "<br>"
+                                        )}
+                                </div>
 
-    <div style="
-        background:#f5f5f5;
-        border-left:4px solid #b8944a;
-        padding:15px;
-        margin:20px 0;
-    ">
-        ${escapeHtml(message)}
-    </div>
+                                <p>Please log in to your account to continue the conversation.</p>
 
-    <p>
-        Please log in to your account to continue
-        the conversation.
-    </p>
+                                <p>
+                                    Regards,<br>
+                                    U.S TRAVEL & TOURS
+                                </p>
+                            </div>
+                            `
 
-    <p>
-        U.S TRAVEL & TOURS<br>
-        Miami, Florida, USA
-    </p>
-
-</div>
-`
                     });
 
-                    console.log(
-                        `CHAT EMAIL: Notification sent to ${customer.email}`
-                    );
-
-                } catch (emailError) {
+                } catch (
+                    emailError
+                ) {
 
                     console.error(
                         "CHAT EMAIL ERROR:",
                         emailError
                     );
+
+                    /*
+                       Email failure must NOT
+                       make chat message fail.
+                    */
+
                 }
+
             }
+
 
             return res.status(201).json({
 
@@ -744,34 +996,46 @@ Miami, Florida, USA`,
                 message:
                     "Reply sent successfully.",
 
-                data: savedMessage
+                chatMessage:
+                    formatMessage(
+                        chatMessage
+                    )
 
             });
 
         } catch (error) {
 
             console.error(
-                "CHAT ADMIN REPLY ERROR:",
+                "ADMIN CHAT REPLY ERROR:",
                 error
             );
 
             return res.status(500).json({
+
                 success: false,
+
                 message:
                     "Unable to send reply."
+
             });
+
         }
+
     }
 );
 
-// =========================================================
-// ADMIN - MARK CUSTOMER CHAT READ
-// =========================================================
+
+/* =========================================================
+   ADMIN - MARK CONVERSATION AS READ
+========================================================= */
 
 router.patch(
     "/conversations/:userId/read",
     requireAdmin,
-    (req, res) => {
+    async function (
+        req,
+        res
+    ) {
 
         try {
 
@@ -780,52 +1044,100 @@ router.patch(
                     req.params.userId
                 );
 
+
             if (
-                !Number.isInteger(userId) ||
+                !Number.isInteger(
+                    userId
+                ) ||
                 userId <= 0
             ) {
 
                 return res.status(400).json({
+
                     success: false,
+
                     message:
-                        "Invalid customer."
+                        "Invalid user ID."
+
                 });
+
             }
 
-            db.prepare(`
-                UPDATE support_chat_messages
-                SET is_read = 1
-                WHERE
-                    user_id = ?
-                    AND sender_type = 'customer'
-            `).run(userId);
+
+            const db =
+                getDatabase();
+
+            const messages =
+                db.collection(
+                    "support_chat_messages"
+                );
+
+
+            const result =
+                await messages.updateMany(
+
+                    {
+                        user_id:
+                            userId,
+
+                        sender_type:
+                            "customer",
+
+                        is_read:
+                            false
+
+                    },
+
+                    {
+                        $set: {
+
+                            is_read:
+                                true
+
+                        }
+
+                    }
+
+                );
+
 
             return res.json({
-                success: true
+
+                success: true,
+
+                message:
+                    "Conversation marked as read.",
+
+                updated:
+                    result.modifiedCount
+
             });
 
         } catch (error) {
 
             console.error(
-                "CHAT READ ERROR:",
+                "MARK CHAT READ ERROR:",
                 error
             );
 
             return res.status(500).json({
+
                 success: false,
+
                 message:
-                    "Unable to update chat."
+                    "Unable to mark conversation as read."
+
             });
+
         }
+
     }
 );
 
-// =========================================================
-// EXPORT
-// =========================================================
 
-module.exports = router;
+/* =========================================================
+   EXPORT
+========================================================= */
 
-console.log(
-    "CHAT: Live chat backend loaded."
-);
+module.exports =
+    router;
