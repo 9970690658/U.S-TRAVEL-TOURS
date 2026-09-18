@@ -1,33 +1,17 @@
-// =========================================================
-// U.S TRAVEL & TOURS
-// MONGODB DATABASE LAYER
-// =========================================================
-//
-// MongoDB Atlas + Render
-//
-// Collections:
-//   users
-//   sessions
-//   password_resets
-//   applications
-//   payments
-//   support_chat_messages
-//   contact_messages
-//   job_applications
-//   counters
-//
-// IMPORTANT:
-// Existing frontend/API numeric IDs are preserved.
-// MongoDB's internal _id is separate.
-// =========================================================
+/* =========================================================
+   U.S TRAVEL & TOURS
+   DATABASE MODULE
+   MongoDB Version
+========================================================= */
 
 const {
     MongoClient
 } = require("mongodb");
 
-// =========================================================
-// CONFIG
-// =========================================================
+
+/* =========================================================
+   MONGODB CONFIGURATION
+========================================================= */
 
 const MONGODB_URI =
     process.env.MONGODB_URI;
@@ -36,33 +20,10 @@ const MONGODB_DB_NAME =
     process.env.MONGODB_DB_NAME ||
     "us-travel-tours";
 
-// =========================================================
-// VALIDATION
-// =========================================================
 
-if (!MONGODB_URI) {
-
-    console.error(
-        "========================================================="
-    );
-
-    console.error(
-        "MONGODB_URI environment variable is missing."
-    );
-
-    console.error(
-        "Add MONGODB_URI in Render Environment Variables."
-    );
-
-    console.error(
-        "========================================================="
-    );
-
-}
-
-// =========================================================
-// MONGODB CLIENT
-// =========================================================
+/* =========================================================
+   DATABASE STATE
+========================================================= */
 
 let client = null;
 
@@ -70,19 +31,19 @@ let database = null;
 
 let initialized = false;
 
-// =========================================================
-// CONNECT DATABASE
-// =========================================================
+let initializationPromise = null;
 
-async function initDatabase() {
 
-    if (initialized && database) {
+/* =========================================================
+   VALIDATE CONFIGURATION
+========================================================= */
 
-        return database;
+function validateMongoConfig() {
 
-    }
-
-    if (!MONGODB_URI) {
+    if (
+        !MONGODB_URI ||
+        typeof MONGODB_URI !== "string"
+    ) {
 
         throw new Error(
             "MONGODB_URI environment variable is not configured."
@@ -90,99 +51,178 @@ async function initDatabase() {
 
     }
 
-    try {
+}
 
-        client =
-            new MongoClient(
-                MONGODB_URI,
-                {
-                    maxPoolSize: 20,
-                    minPoolSize: 1,
-                    serverSelectionTimeoutMS: 10000,
-                    connectTimeoutMS: 10000
-                }
-            );
 
-        await client.connect();
+/* =========================================================
+   INITIALIZE DATABASE
+========================================================= */
 
-        database =
-            client.db(
-                MONGODB_DB_NAME
-            );
+async function initDatabase() {
 
-        // -----------------------------------------------------
-        // TEST CONNECTION
-        // -----------------------------------------------------
+    /*
+       Prevent multiple simultaneous
+       MongoDB connection attempts.
+    */
 
-        await database.command({
-            ping: 1
-        });
-
-        // -----------------------------------------------------
-        // CREATE COLLECTIONS / INDEXES
-        // -----------------------------------------------------
-
-        await createIndexes();
-
-        initialized = true;
-
-        console.log(
-            "========================================================="
-        );
-
-        console.log(
-            "MongoDB connected successfully."
-        );
-
-        console.log(
-            `MongoDB database: ${MONGODB_DB_NAME}`
-        );
-
-        console.log(
-            "========================================================="
-        );
+    if (initialized) {
 
         return database;
 
-    } catch (error) {
+    }
 
-        console.error(
-            "MongoDB connection failed:"
-        );
 
-        console.error(
-            error
-        );
+    if (initializationPromise) {
 
-        database = null;
-
-        initialized = false;
-
-        if (client) {
-
-            try {
-
-                await client.close();
-
-            } catch {}
-
-        }
-
-        client = null;
-
-        throw error;
+        return initializationPromise;
 
     }
 
+
+    initializationPromise =
+        (async function () {
+
+            try {
+
+                validateMongoConfig();
+
+
+                console.log(
+                    "Connecting to MongoDB..."
+                );
+
+
+                client =
+                    new MongoClient(
+                        MONGODB_URI,
+                        {
+
+                            maxPoolSize:
+                                20,
+
+                            minPoolSize:
+                                1,
+
+                            serverSelectionTimeoutMS:
+                                15000,
+
+                            connectTimeoutMS:
+                                15000,
+
+                            socketTimeoutMS:
+                                45000
+
+                        }
+                    );
+
+
+                await client.connect();
+
+
+                /*
+                   Confirm the database connection
+                   before the server starts.
+                */
+
+                await client
+                    .db("admin")
+                    .command({
+                        ping: 1
+                    });
+
+
+                database =
+                    client.db(
+                        MONGODB_DB_NAME
+                    );
+
+
+                /*
+                   IMPORTANT:
+                   Set initialized BEFORE createIndexes()
+                   because createIndexes() uses getDatabase().
+                */
+
+                initialized =
+                    true;
+
+
+                await createIndexes();
+
+
+                console.log(
+                    `MongoDB connected successfully: ${MONGODB_DB_NAME}`
+                );
+
+
+                return database;
+
+            } catch (error) {
+
+                initialized =
+                    false;
+
+                database =
+                    null;
+
+
+                if (client) {
+
+                    try {
+
+                        await client.close();
+
+                    } catch (
+                        closeError
+                    ) {
+
+                        console.error(
+                            "MongoDB close error:",
+                            closeError
+                        );
+
+                    }
+
+                }
+
+
+                client =
+                    null;
+
+
+                console.error(
+                    "MongoDB initialization failed:",
+                    error
+                );
+
+
+                throw error;
+
+            } finally {
+
+                initializationPromise =
+                    null;
+
+            }
+
+        })();
+
+
+    return initializationPromise;
+
 }
 
-// =========================================================
-// GET DATABASE
-// =========================================================
+
+/* =========================================================
+   GET DATABASE
+========================================================= */
 
 function getDatabase() {
 
-    if (!database || !initialized) {
+    if (
+        !initialized ||
+        !database
+    ) {
 
         throw new Error(
             "MongoDB database is not initialized. Call initDatabase() first."
@@ -190,383 +230,604 @@ function getDatabase() {
 
     }
 
+
     return database;
 
 }
 
-// =========================================================
-// GET COLLECTION
-// =========================================================
+
+/* =========================================================
+   GET COLLECTION
+========================================================= */
 
 function getCollection(
     collectionName
 ) {
 
-    return getDatabase().collection(
-        collectionName
-    );
+    if (
+        !collectionName ||
+        typeof collectionName !== "string"
+    ) {
+
+        throw new Error(
+            "A valid collection name is required."
+        );
+
+    }
+
+
+    return getDatabase()
+        .collection(
+            collectionName
+        );
 
 }
 
-// =========================================================
-// CREATE INDEXES
-// =========================================================
+
+/* =========================================================
+   CREATE INDEXES
+========================================================= */
 
 async function createIndexes() {
 
     const db =
         getDatabase();
 
-    // -------------------------------------------------------
-    // USERS
-    // -------------------------------------------------------
+
+    /* =====================================================
+       USERS
+    ===================================================== */
 
     await db
-        .collection("users")
+        .collection(
+            "users"
+        )
         .createIndex(
             {
                 id: 1
             },
             {
-                unique: true
+                unique: true,
+                name: "users_id_unique"
             }
         );
 
+
     await db
-        .collection("users")
+        .collection(
+            "users"
+        )
         .createIndex(
             {
                 email: 1
             },
             {
-                unique: true
+                unique: true,
+                name: "users_email_unique"
             }
         );
 
-    await db
-        .collection("users")
-        .createIndex({
-            role: 1
-        });
-
-    // -------------------------------------------------------
-    // SESSIONS
-    // -------------------------------------------------------
 
     await db
-        .collection("sessions")
+        .collection(
+            "users"
+        )
+        .createIndex(
+            {
+                role: 1
+            },
+            {
+                name: "users_role"
+            }
+        );
+
+
+    /* =====================================================
+       SESSIONS
+    ===================================================== */
+
+    await db
+        .collection(
+            "sessions"
+        )
         .createIndex(
             {
                 token_hash: 1
             },
             {
-                unique: true
+                unique: true,
+                name: "sessions_token_hash_unique"
             }
         );
 
-    await db
-        .collection("sessions")
-        .createIndex({
-            user_id: 1
-        });
 
     await db
-        .collection("sessions")
-        .createIndex({
-            expires_at: 1
-        });
+        .collection(
+            "sessions"
+        )
+        .createIndex(
+            {
+                user_id: 1
+            },
+            {
+                name: "sessions_user_id"
+            }
+        );
 
-    // -------------------------------------------------------
-    // PASSWORD RESETS
-    // -------------------------------------------------------
 
     await db
-        .collection("password_resets")
+        .collection(
+            "sessions"
+        )
+        .createIndex(
+            {
+                expires_at: 1
+            },
+            {
+                name: "sessions_expires_at"
+            }
+        );
+
+
+    /*
+       MongoDB automatically removes expired
+       sessions when expires_at is reached.
+    */
+
+    await db
+        .collection(
+            "sessions"
+        )
+        .createIndex(
+            {
+                expires_at: 1
+            },
+            {
+                expireAfterSeconds: 0,
+                name: "sessions_ttl"
+            }
+        );
+
+
+    /* =====================================================
+       PASSWORD RESETS
+    ===================================================== */
+
+    await db
+        .collection(
+            "password_resets"
+        )
         .createIndex(
             {
                 token_hash: 1
             },
             {
-                unique: true
+                unique: true,
+                name: "password_resets_token_unique"
             }
         );
 
-    await db
-        .collection("password_resets")
-        .createIndex({
-            user_id: 1
-        });
 
     await db
-        .collection("password_resets")
-        .createIndex({
-            expires_at: 1
-        });
+        .collection(
+            "password_resets"
+        )
+        .createIndex(
+            {
+                user_id: 1
+            },
+            {
+                name: "password_resets_user_id"
+            }
+        );
 
-    // -------------------------------------------------------
-    // APPLICATIONS
-    // -------------------------------------------------------
 
     await db
-        .collection("applications")
+        .collection(
+            "password_resets"
+        )
+        .createIndex(
+            {
+                expires_at: 1
+            },
+            {
+                name: "password_resets_expires_at"
+            }
+        );
+
+
+    await db
+        .collection(
+            "password_resets"
+        )
+        .createIndex(
+            {
+                expires_at: 1
+            },
+            {
+                expireAfterSeconds: 0,
+                name: "password_resets_ttl"
+            }
+        );
+
+
+    /* =====================================================
+       APPLICATIONS
+    ===================================================== */
+
+    await db
+        .collection(
+            "applications"
+        )
         .createIndex(
             {
                 id: 1
             },
             {
-                unique: true
+                unique: true,
+                name: "applications_id_unique"
             }
         );
 
-    await db
-        .collection("applications")
-        .createIndex({
-            user_id: 1
-        });
 
     await db
-        .collection("applications")
-        .createIndex({
-            status: 1
-        });
+        .collection(
+            "applications"
+        )
+        .createIndex(
+            {
+                user_id: 1
+            },
+            {
+                name: "applications_user_id"
+            }
+        );
+
 
     await db
-        .collection("applications")
-        .createIndex({
-            created_at: -1
-        });
+        .collection(
+            "applications"
+        )
+        .createIndex(
+            {
+                status: 1
+            },
+            {
+                name: "applications_status"
+            }
+        );
 
-    // -------------------------------------------------------
-    // PAYMENTS
-    // -------------------------------------------------------
 
     await db
-        .collection("payments")
+        .collection(
+            "applications"
+        )
+        .createIndex(
+            {
+                created_at: -1
+            },
+            {
+                name: "applications_created"
+            }
+        );
+
+
+    /* =====================================================
+       PAYMENTS
+    ===================================================== */
+
+    await db
+        .collection(
+            "payments"
+        )
         .createIndex(
             {
                 id: 1
             },
             {
-                unique: true
+                unique: true,
+                name: "payments_id_unique"
             }
         );
 
-    await db
-        .collection("payments")
-        .createIndex({
-            application_id: 1
-        });
 
     await db
-        .collection("payments")
-        .createIndex({
-            status: 1
-        });
+        .collection(
+            "payments"
+        )
+        .createIndex(
+            {
+                application_id: 1
+            },
+            {
+                name: "payments_application_id"
+            }
+        );
+
 
     await db
-        .collection("payments")
-        .createIndex({
-            payment_reference: 1
-        });
+        .collection(
+            "payments"
+        )
+        .createIndex(
+            {
+                user_id: 1
+            },
+            {
+                name: "payments_user_id"
+            }
+        );
+
 
     await db
-        .collection("payments")
-        .createIndex({
-            created_at: -1
-        });
+        .collection(
+            "payments"
+        )
+        .createIndex(
+            {
+                status: 1
+            },
+            {
+                name: "payments_status"
+            }
+        );
 
-    // -------------------------------------------------------
-    // SUPPORT CHAT
-    // -------------------------------------------------------
-
-    await db
-        .collection("support_chat_messages")
-        .createIndex({
-            id: 1
-        }, {
-            unique: true
-        });
 
     await db
-        .collection("support_chat_messages")
-        .createIndex({
-            user_id: 1,
-            id: 1
-        });
+        .collection(
+            "payments"
+        )
+        .createIndex(
+            {
+                payment_reference: 1
+            },
+            {
+                name: "payments_reference"
+            }
+        );
+
 
     await db
-        .collection("support_chat_messages")
-        .createIndex({
-            created_at: -1
-        });
+        .collection(
+            "payments"
+        )
+        .createIndex(
+            {
+                created_at: -1
+            },
+            {
+                name: "payments_created"
+            }
+        );
 
-    // -------------------------------------------------------
-    // CONTACT MESSAGES
-    // -------------------------------------------------------
 
-    await db
-        .collection("contact_messages")
-        .createIndex({
-            id: 1
-        }, {
-            unique: true
-        });
-
-    await db
-        .collection("contact_messages")
-        .createIndex({
-            status: 1
-        });
+    /* =====================================================
+       SUPPORT CHAT
+    ===================================================== */
 
     await db
-        .collection("contact_messages")
-        .createIndex({
-            created_at: -1
-        });
+        .collection(
+            "support_chat_messages"
+        )
+        .createIndex(
+            {
+                id: 1
+            },
+            {
+                unique: true,
+                name: "chat_id_unique"
+            }
+        );
 
-    // -------------------------------------------------------
-    // JOB APPLICATIONS
-    // -------------------------------------------------------
-
-    await db
-        .collection("job_applications")
-        .createIndex({
-            id: 1
-        }, {
-            unique: true
-        });
 
     await db
-        .collection("job_applications")
-        .createIndex({
-            user_id: 1
-        });
+        .collection(
+            "support_chat_messages"
+        )
+        .createIndex(
+            {
+                user_id: 1,
+                id: 1
+            },
+            {
+                name: "chat_user_messages"
+            }
+        );
+
 
     await db
-        .collection("job_applications")
-        .createIndex({
-            status: 1
-        });
+        .collection(
+            "support_chat_messages"
+        )
+        .createIndex(
+            {
+                user_id: 1,
+                sender_type: 1,
+                is_read: 1
+            },
+            {
+                name: "chat_unread"
+            }
+        );
+
 
     await db
-        .collection("job_applications")
-        .createIndex({
-            created_at: -1
-        });
+        .collection(
+            "support_chat_messages"
+        )
+        .createIndex(
+            {
+                created_at: -1
+            },
+            {
+                name: "chat_created"
+            }
+        );
 
-    // -------------------------------------------------------
-    // COUNTERS
-    // -------------------------------------------------------
+
+    /* =====================================================
+       CONTACT MESSAGES
+    ===================================================== */
 
     await db
-        .collection("counters")
+        .collection(
+            "contact_messages"
+        )
+        .createIndex(
+            {
+                id: 1
+            },
+            {
+                unique: true,
+                name: "contact_id_unique"
+            }
+        );
+
+
+    await db
+        .collection(
+            "contact_messages"
+        )
+        .createIndex(
+            {
+                status: 1
+            },
+            {
+                name: "contact_status"
+            }
+        );
+
+
+    await db
+        .collection(
+            "contact_messages"
+        )
+        .createIndex(
+            {
+                created_at: -1
+            },
+            {
+                name: "contact_created"
+            }
+        );
+
+
+    /* =====================================================
+       JOB APPLICATIONS
+    ===================================================== */
+
+    await db
+        .collection(
+            "job_applications"
+        )
+        .createIndex(
+            {
+                id: 1
+            },
+            {
+                unique: true,
+                name: "jobs_id_unique"
+            }
+        );
+
+
+    await db
+        .collection(
+            "job_applications"
+        )
+        .createIndex(
+            {
+                user_id: 1
+            },
+            {
+                name: "jobs_user_id"
+            }
+        );
+
+
+    await db
+        .collection(
+            "job_applications"
+        )
+        .createIndex(
+            {
+                status: 1
+            },
+            {
+                name: "jobs_status"
+            }
+        );
+
+
+    await db
+        .collection(
+            "job_applications"
+        )
+        .createIndex(
+            {
+                created_at: -1
+            },
+            {
+                name: "jobs_created"
+            }
+        );
+
+
+    /* =====================================================
+       COUNTERS
+    ===================================================== */
+
+    await db
+        .collection(
+            "counters"
+        )
         .createIndex(
             {
                 name: 1
             },
             {
-                unique: true
+                unique: true,
+                name: "counters_name_unique"
             }
         );
 
+
+    console.log(
+        "MongoDB indexes created/verified."
+    );
+
 }
 
-// =========================================================
-// NUMERIC ID GENERATOR
-// =========================================================
-//
-// This replaces SQLite AUTOINCREMENT.
-//
-// Example:
-//
-// users            → 1, 2, 3...
-// applications     → 1, 2, 3...
-// payments         → 1, 2, 3...
-//
-// Atomic MongoDB operation prevents duplicate IDs when
-// multiple customers submit data at the same time.
-// =========================================================
+
+/* =========================================================
+   NUMERIC SEQUENCE GENERATOR
+========================================================= */
 
 async function getNextSequence(
     sequenceName
 ) {
 
-    const db =
-        getDatabase();
-
-    const result =
-        await db
-            .collection("counters")
-            .findOneAndUpdate(
-
-                {
-                    name:
-                        sequenceName
-                },
-
-                {
-                    $inc: {
-                        value: 1
-                    }
-                },
-
-                {
-                    upsert: true,
-                    returnDocument: "after"
-                }
-
-            );
-
     if (
-        !result ||
-        !result.value
+        !sequenceName ||
+        typeof sequenceName !== "string"
     ) {
 
         throw new Error(
-            `Unable to generate ID for ${sequenceName}.`
+            "Sequence name is required."
         );
 
     }
 
-    return Number(
-        result.value.value
-    );
 
-}
+    const counters =
+        getDatabase()
+            .collection(
+                "counters"
+            );
 
-// =========================================================
-// SET / PRESERVE COUNTER
-// =========================================================
-//
-// Used during migration when old SQLite IDs already exist.
-// It makes sure future IDs continue after the largest old ID.
-// =========================================================
 
-async function setSequenceAtLeast(
-    sequenceName,
-    minimumValue
-) {
-
-    const db =
-        getDatabase();
-
-    const value =
-        Number(
-            minimumValue
-        );
-
-    if (
-        !Number.isFinite(value) ||
-        value < 0
-    ) {
-
-        return;
-
-    }
-
-    await db
-        .collection("counters")
-        .updateOne(
+    const result =
+        await counters.findOneAndUpdate(
 
             {
                 name:
@@ -574,75 +835,330 @@ async function setSequenceAtLeast(
             },
 
             {
-                $max: {
-                    value:
-                        Math.floor(value)
+                $inc: {
+
+                    seq:
+                        1
+
+                },
+
+                $set: {
+
+                    updated_at:
+                        new Date()
+
                 }
+
             },
 
             {
-                upsert: true
+                upsert:
+                    true,
+
+                returnDocument:
+                    "after"
             }
 
         );
 
+
+    /*
+       MongoDB Node driver v6 returns
+       the document directly.
+    */
+
+    const document =
+        result;
+
+
+    if (
+        !document ||
+        typeof document.seq !==
+            "number"
+    ) {
+
+        throw new Error(
+            `Unable to generate sequence for ${sequenceName}.`
+        );
+
+    }
+
+
+    return Number(
+        document.seq
+    );
+
 }
 
-// =========================================================
-// CLEAN EXPIRED SESSIONS
-// =========================================================
+
+/* =========================================================
+   MAKE SEQUENCE AT LEAST A VALUE
+========================================================= */
+
+async function setSequenceAtLeast(
+    sequenceName,
+    minimumValue
+) {
+
+    if (
+        !sequenceName ||
+        typeof sequenceName !== "string"
+    ) {
+
+        throw new Error(
+            "Sequence name is required."
+        );
+
+    }
+
+
+    const minimum =
+        Number(
+            minimumValue
+        );
+
+
+    if (
+        !Number.isFinite(
+            minimum
+        ) ||
+        minimum < 0
+    ) {
+
+        throw new Error(
+            "Minimum sequence value must be a valid non-negative number."
+        );
+
+    }
+
+
+    const counters =
+        getDatabase()
+            .collection(
+                "counters"
+            );
+
+
+    const current =
+        await counters.findOne({
+
+            name:
+                sequenceName
+
+        });
+
+
+    if (
+        current &&
+        Number(current.seq) >=
+            minimum
+    ) {
+
+        return Number(
+            current.seq
+        );
+
+    }
+
+
+    await counters.updateOne(
+
+        {
+            name:
+                sequenceName
+        },
+
+        {
+            $set: {
+
+                seq:
+                    minimum,
+
+                updated_at:
+                    new Date()
+
+            }
+
+        },
+
+        {
+            upsert:
+                true
+        }
+
+    );
+
+
+    return minimum;
+
+}
+
+
+/* =========================================================
+   CLEAN EXPIRED SESSIONS
+========================================================= */
 
 async function cleanExpiredSessions() {
 
-    try {
+    const sessions =
+        getDatabase()
+            .collection(
+                "sessions"
+            );
 
-        const db =
-            getDatabase();
 
-        await db
-            .collection("sessions")
-            .deleteMany({
-                expires_at: {
-                    $lte:
-                        new Date()
-                }
-            });
+    const result =
+        await sessions.deleteMany({
 
-    } catch (error) {
+            expires_at: {
 
-        console.error(
-            "Session cleanup error:",
-            error
-        );
+                $lte:
+                    new Date()
 
-    }
+            }
+
+        });
+
+
+    return result.deletedCount || 0;
 
 }
 
-// =========================================================
-// CLEAN EXPIRED PASSWORD RESETS
-// =========================================================
+
+/* =========================================================
+   CLEAN EXPIRED PASSWORD RESETS
+========================================================= */
 
 async function cleanExpiredPasswordResets() {
 
+    const resets =
+        getDatabase()
+            .collection(
+                "password_resets"
+            );
+
+
+    const result =
+        await resets.deleteMany({
+
+            expires_at: {
+
+                $lte:
+                    new Date()
+
+            }
+
+        });
+
+
+    return result.deletedCount || 0;
+
+}
+
+
+/* =========================================================
+   DATABASE CONNECTION STATUS
+========================================================= */
+
+function isDatabaseConnected() {
+
+    return (
+        initialized === true &&
+        database !== null &&
+        client !== null
+    );
+
+}
+
+
+/* =========================================================
+   CLOSE DATABASE
+========================================================= */
+
+async function closeDatabase() {
+
+    if (!client) {
+
+        initialized =
+            false;
+
+        database =
+            null;
+
+        return;
+
+    }
+
+
     try {
 
-        const db =
-            getDatabase();
+        await client.close();
 
-        await db
-            .collection("password_resets")
-            .deleteMany({
-                expires_at: {
-                    $lte:
-                        new Date()
-                }
-            });
-
-    } catch (error) {
+    } catch (
+        error
+    ) {
 
         console.error(
-            "Password reset cleanup error:",
+            "MongoDB close error:",
+            error
+        );
+
+    } finally {
+
+        client =
+            null;
+
+        database =
+            null;
+
+        initialized =
+            false;
+
+    }
+
+}
+
+
+/* =========================================================
+   PROCESS SHUTDOWN
+========================================================= */
+
+let shuttingDown =
+    false;
+
+
+async function shutdown(
+    signal
+) {
+
+    if (
+        shuttingDown
+    ) {
+
+        return;
+
+    }
+
+
+    shuttingDown =
+        true;
+
+
+    console.log(
+        `${signal} received. Closing MongoDB connection...`
+    );
+
+
+    try {
+
+        await closeDatabase();
+
+    } catch (
+        error
+    ) {
+
+        console.error(
+            "Database shutdown error:",
             error
         );
 
@@ -650,101 +1166,38 @@ async function cleanExpiredPasswordResets() {
 
 }
 
-// =========================================================
-// DATABASE STATUS
-// =========================================================
 
-async function isDatabaseConnected() {
-
-    try {
-
-        if (
-            !database ||
-            !initialized
-        ) {
-
-            return false;
-
-        }
-
-        await database.command({
-            ping: 1
-        });
-
-        return true;
-
-    } catch {
-
-        return false;
-
-    }
-
-}
-
-// =========================================================
-// CLOSE DATABASE
-// =========================================================
-
-async function closeDatabase() {
-
-    initialized = false;
-
-    database = null;
-
-    if (client) {
-
-        try {
-
-            await client.close();
-
-        } catch (error) {
-
-            console.error(
-                "MongoDB close error:",
-                error
-            );
-
-        }
-
-    }
-
-    client = null;
-
-}
-
-// =========================================================
-// SHUTDOWN HANDLERS
-// =========================================================
+/* =========================================================
+   SIGNAL HANDLERS
+========================================================= */
 
 process.once(
     "SIGINT",
-    async function () {
+    function () {
 
-        await closeDatabase();
-
-        process.exit(
-            0
+        shutdown(
+            "SIGINT"
         );
 
     }
 );
+
 
 process.once(
     "SIGTERM",
-    async function () {
+    function () {
 
-        await closeDatabase();
-
-        process.exit(
-            0
+        shutdown(
+            "SIGTERM"
         );
 
     }
 );
 
-// =========================================================
-// EXPORTS
-// =========================================================
+
+/* =========================================================
+   EXPORTS
+========================================================= */
 
 module.exports = {
 
