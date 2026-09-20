@@ -125,13 +125,15 @@ function bootstrapAdmin() {
         ) {
 
             db.prepare(`
-                UPDATE users
-                SET
-                    name = ?,
-                    password = ?,
-                    role = 'admin'
-                WHERE id = ?
-            `).run(
+    UPDATE users
+    SET
+        name = ?,
+        password_hash = ?,
+        role = 'admin',
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = ?
+`).run(
+
                 adminName.trim(),
                 passwordHash,
                 existingAdmin.id
