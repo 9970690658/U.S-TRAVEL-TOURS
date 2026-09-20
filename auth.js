@@ -722,6 +722,14 @@ async function requireAuth(
 // =========================================================
 // REQUIRE ADMIN
 // =========================================================
+//
+// ADMIN ROUTES:
+// - Works when requireAuth has already run
+// - Also authenticates automatically when used directly
+//
+// This keeps existing admin routes compatible while using
+// the PostgreSQL persistent-session system.
+// =========================================================
 
 async function requireAdmin(
     req,
@@ -731,22 +739,58 @@ async function requireAdmin(
 
     try {
 
-        if (
-            !req.user
-        ) {
+        // -------------------------------------------------
+        // IF USER IS NOT ALREADY AUTHENTICATED,
+        // VERIFY THE BEARER TOKEN NOW.
+        // -------------------------------------------------
 
-            return res.status(401).json({
+        if (!req.user) {
 
-                success:
-                    false,
+            const authenticated =
+                await getAuthenticatedUser(
+                    req
+                );
 
-                message:
-                    "Authentication required."
 
-            });
+            if (!authenticated) {
+
+                return res.status(401).json({
+
+                    success:
+                        false,
+
+                    message:
+                        "Authentication required."
+
+                });
+
+            }
+
+
+            // -------------------------------------------------
+            // ATTACH AUTHENTICATED USER
+            // -------------------------------------------------
+
+            req.user =
+                publicUser(
+                    authenticated.user
+                );
+
+            req.authUser =
+                authenticated.user;
+
+            req.session =
+                authenticated.session;
+
+            req.authToken =
+                authenticated.token;
 
         }
 
+
+        // -------------------------------------------------
+        // ADMIN ROLE CHECK
+        // -------------------------------------------------
 
         if (
             req.user.role !==
@@ -766,7 +810,12 @@ async function requireAdmin(
         }
 
 
+        // -------------------------------------------------
+        // ADMIN AUTHENTICATION SUCCESSFUL
+        // -------------------------------------------------
+
         return next();
+
 
     } catch (error) {
 
@@ -774,6 +823,7 @@ async function requireAdmin(
             "Admin authentication error:",
             error
         );
+
 
         return res.status(500).json({
 
@@ -788,7 +838,6 @@ async function requireAdmin(
     }
 
 }
-
 
 // =========================================================
 // REGISTER
