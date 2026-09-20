@@ -1,13 +1,17 @@
 // =========================================================
 // U.S TRAVEL & TOURS
 // DATABASE CONFIGURATION
-// SUPABASE POSTGRESQL
+// PostgreSQL / Supabase
+//
+// IMPORTANT:
+// This file replaces the old better-sqlite3 database.
+// Render DATABASE_URL -> Supabase PostgreSQL
 // =========================================================
 
 const { Pool } = require("pg");
 
 // =========================================================
-// DATABASE URL
+// DATABASE CONFIGURATION
 // =========================================================
 
 const DATABASE_URL =
@@ -15,14 +19,31 @@ const DATABASE_URL =
 
 if (!DATABASE_URL) {
 
+    console.error(
+        "========================================================="
+    );
+
+    console.error(
+        "DATABASE_URL IS MISSING"
+    );
+
+    console.error(
+        "Please add DATABASE_URL in Render Environment Variables."
+    );
+
+    console.error(
+        "========================================================="
+    );
+
     throw new Error(
-        "DATABASE_URL is not configured. Add your Supabase PostgreSQL connection string to Render Environment Variables."
+        "DATABASE_URL environment variable is required."
     );
 
 }
 
+
 // =========================================================
-// POSTGRESQL POOL
+// POSTGRESQL CONNECTION POOL
 // =========================================================
 
 const pool =
@@ -31,12 +52,10 @@ const pool =
         connectionString:
             DATABASE_URL,
 
-        ssl:
-            process.env.NODE_ENV === "production"
-                ? {
-                    rejectUnauthorized: false
-                }
-                : false,
+        ssl: {
+            rejectUnauthorized:
+                false
+        },
 
         max: 10,
 
@@ -44,15 +63,35 @@ const pool =
             30000,
 
         connectionTimeoutMillis:
-            10000
+            15000
 
     });
 
+
 // =========================================================
-// DATABASE TEST
+// DATABASE ERROR HANDLER
 // =========================================================
 
-async function testDatabase() {
+pool.on(
+    "error",
+    function (
+        error
+    ) {
+
+        console.error(
+            "Unexpected PostgreSQL pool error:",
+            error
+        );
+
+    }
+);
+
+
+// =========================================================
+// TEST DATABASE CONNECTION
+// =========================================================
+
+async function testDatabaseConnection() {
 
     const client =
         await pool.connect();
@@ -64,7 +103,7 @@ async function testDatabase() {
         );
 
         console.log(
-            "DATABASE: Supabase PostgreSQL connected successfully."
+            "PostgreSQL / Supabase database connection successful."
         );
 
     } finally {
@@ -75,104 +114,84 @@ async function testDatabase() {
 
 }
 
+
 // =========================================================
-// INITIALIZE TABLES
+// INITIALIZE DATABASE
+// =========================================================
+//
+// All tables required by the existing U.S TRAVEL & TOURS
+// backend are created here.
+//
+// Existing API functionality is preserved.
 // =========================================================
 
 async function initializeDatabase() {
 
-    // -----------------------------------------------------
-    // USERS
-    // -----------------------------------------------------
+    const client =
+        await pool.connect();
 
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS users (
+    try {
 
-            id BIGSERIAL PRIMARY KEY,
+        await client.query(
+            "BEGIN"
+        );
 
-            name TEXT NOT NULL,
 
-            email TEXT NOT NULL UNIQUE,
+        // =====================================================
+        // USERS
+        // =====================================================
 
-            phone TEXT,
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS users (
 
-            password_hash TEXT NOT NULL,
+                id BIGSERIAL PRIMARY KEY,
 
-            role TEXT NOT NULL DEFAULT 'customer'
+                name TEXT NOT NULL,
+
+                email TEXT NOT NULL UNIQUE,
+
+                phone TEXT,
+
+                password_hash TEXT NOT NULL,
+
+                role TEXT NOT NULL DEFAULT 'customer',
+
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+                CONSTRAINT users_role_check
                 CHECK (
-                    role IN ('customer', 'admin')
-                ),
+                    role IN (
+                        'customer',
+                        'admin'
+                    )
+                )
 
-            created_at TIMESTAMPTZ
-                NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            );
+        `);
 
-            updated_at TIMESTAMPTZ
-                NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-    `);
 
-    // -----------------------------------------------------
-    // SESSIONS
-    // -----------------------------------------------------
+        // =====================================================
+        // APPLICATIONS
+        // =====================================================
 
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS sessions (
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS applications (
 
-            id BIGSERIAL PRIMARY KEY,
+                id BIGSERIAL PRIMARY KEY,
 
-            user_id BIGINT NOT NULL
-                REFERENCES users(id)
-                ON DELETE CASCADE,
+                user_id BIGINT,
 
-            token_hash TEXT NOT NULL UNIQUE,
+                application_data TEXT NOT NULL,
 
-            expires_at BIGINT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
 
-            created_at TIMESTAMPTZ
-                NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-    `);
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
-    // -----------------------------------------------------
-    // PASSWORD RESETS
-    // -----------------------------------------------------
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS password_resets (
-
-            id BIGSERIAL PRIMARY KEY,
-
-            user_id BIGINT NOT NULL
-                REFERENCES users(id)
-                ON DELETE CASCADE,
-
-            token_hash TEXT NOT NULL UNIQUE,
-
-            expires_at BIGINT NOT NULL,
-
-            used_at BIGINT,
-
-            created_at TIMESTAMPTZ
-                NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-    `);
-
-    // -----------------------------------------------------
-    // APPLICATIONS
-    // -----------------------------------------------------
-
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS applications (
-
-            id BIGSERIAL PRIMARY KEY,
-
-            user_id BIGINT
-                REFERENCES users(id)
-                ON DELETE SET NULL,
-
-            application_data TEXT NOT NULL,
-
-            status TEXT NOT NULL DEFAULT 'pending'
+                CONSTRAINT applications_status_check
                 CHECK (
                     status IN (
                         'pending',
@@ -185,28 +204,41 @@ async function initializeDatabase() {
                     )
                 ),
 
-            created_at TIMESTAMPTZ
-                NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT applications_user_fk
+                FOREIGN KEY (user_id)
+                REFERENCES users(id)
+                ON DELETE SET NULL
 
-            updated_at TIMESTAMPTZ
-                NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-    `);
+            );
+        `);
 
-    // -----------------------------------------------------
-    // PAYMENTS
-    // -----------------------------------------------------
 
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS payments (
+        // =====================================================
+        // PAYMENTS
+        // =====================================================
 
-            id BIGSERIAL PRIMARY KEY,
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS payments (
 
-            application_id BIGINT NOT NULL
-                REFERENCES applications(id)
-                ON DELETE CASCADE,
+                id BIGSERIAL PRIMARY KEY,
 
-            payment_method TEXT NOT NULL
+                application_id BIGINT NOT NULL,
+
+                payment_method TEXT NOT NULL,
+
+                payment_reference TEXT NOT NULL,
+
+                message TEXT,
+
+                proof_file TEXT,
+
+                status TEXT NOT NULL DEFAULT 'pending',
+
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+                CONSTRAINT payments_method_check
                 CHECK (
                     payment_method IN (
                         'bitcoin',
@@ -214,13 +246,7 @@ async function initializeDatabase() {
                     )
                 ),
 
-            payment_reference TEXT NOT NULL,
-
-            message TEXT,
-
-            proof_file TEXT,
-
-            status TEXT NOT NULL DEFAULT 'pending'
+                CONSTRAINT payments_status_check
                 CHECK (
                     status IN (
                         'pending',
@@ -229,28 +255,35 @@ async function initializeDatabase() {
                     )
                 ),
 
-            created_at TIMESTAMPTZ
-                NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT payments_application_fk
+                FOREIGN KEY (application_id)
+                REFERENCES applications(id)
+                ON DELETE CASCADE
 
-            updated_at TIMESTAMPTZ
-                NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-    `);
+            );
+        `);
 
-    // -----------------------------------------------------
-    // CHAT
-    // -----------------------------------------------------
 
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS support_chat_messages (
+        // =====================================================
+        // SUPPORT CHAT MESSAGES
+        // =====================================================
 
-            id BIGSERIAL PRIMARY KEY,
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS support_chat_messages (
 
-            user_id BIGINT NOT NULL
-                REFERENCES users(id)
-                ON DELETE CASCADE,
+                id BIGSERIAL PRIMARY KEY,
 
-            sender_type TEXT NOT NULL
+                user_id BIGINT NOT NULL,
+
+                sender_type TEXT NOT NULL,
+
+                message TEXT NOT NULL,
+
+                is_read INTEGER NOT NULL DEFAULT 0,
+
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+                CONSTRAINT support_chat_sender_check
                 CHECK (
                     sender_type IN (
                         'customer',
@@ -258,39 +291,45 @@ async function initializeDatabase() {
                     )
                 ),
 
-            message TEXT NOT NULL,
+                CONSTRAINT support_chat_user_fk
+                FOREIGN KEY (user_id)
+                REFERENCES users(id)
+                ON DELETE CASCADE
 
-            is_read INTEGER NOT NULL DEFAULT 0,
+            );
+        `);
 
-            created_at TIMESTAMPTZ
-                NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-    `);
 
-    // -----------------------------------------------------
-    // CONTACT MESSAGES
-    // -----------------------------------------------------
+        // =====================================================
+        // CONTACT MESSAGES
+        // =====================================================
 
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS contact_messages (
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS contact_messages (
 
-            id BIGSERIAL PRIMARY KEY,
+                id BIGSERIAL PRIMARY KEY,
 
-            name TEXT NOT NULL,
+                name TEXT NOT NULL,
 
-            email TEXT NOT NULL,
+                email TEXT NOT NULL,
 
-            phone TEXT,
+                phone TEXT NOT NULL,
 
-            service TEXT,
+                service TEXT NOT NULL,
 
-            subject TEXT,
+                subject TEXT,
 
-            message TEXT NOT NULL,
+                message TEXT NOT NULL,
 
-            consent INTEGER DEFAULT 0,
+                consent INTEGER DEFAULT 0,
 
-            status TEXT NOT NULL DEFAULT 'new'
+                status TEXT NOT NULL DEFAULT 'new',
+
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+                CONSTRAINT contact_status_check
                 CHECK (
                     status IN (
                         'new',
@@ -298,327 +337,360 @@ async function initializeDatabase() {
                         'replied',
                         'closed'
                     )
-                ),
+                )
 
-            created_at TIMESTAMPTZ
-                NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            );
+        `);
 
-            updated_at TIMESTAMPTZ
-                NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-    `);
 
-    // -----------------------------------------------------
-    // JOB APPLICATIONS
-    // -----------------------------------------------------
+        // =====================================================
+        // JOB APPLICATIONS
+        // =====================================================
 
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS job_applications (
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS job_applications (
 
-            id BIGSERIAL PRIMARY KEY,
+                id BIGSERIAL PRIMARY KEY,
 
-            user_id BIGINT
-                REFERENCES users(id)
-                ON DELETE SET NULL,
+                user_id BIGINT,
 
-            job_title TEXT NOT NULL,
+                job_title TEXT NOT NULL,
 
-            name TEXT NOT NULL,
+                name TEXT NOT NULL,
 
-            email TEXT NOT NULL,
+                email TEXT NOT NULL,
 
-            phone TEXT NOT NULL,
+                phone TEXT NOT NULL,
 
-            resume_file TEXT,
+                resume_file TEXT,
 
-            cover_letter TEXT,
+                cover_letter TEXT,
 
-            status TEXT NOT NULL DEFAULT 'new'
+                status TEXT NOT NULL DEFAULT 'new',
+
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+                date_of_birth TEXT,
+
+                country TEXT,
+
+                city TEXT,
+
+                experience TEXT,
+
+                education TEXT,
+
+                CONSTRAINT job_status_check
                 CHECK (
                     status IN (
                         'new',
                         'reviewing',
                         'shortlisted',
-                                               'rejected',
+                        'rejected',
                         'hired'
                     )
                 ),
 
-            date_of_birth TEXT,
+                CONSTRAINT job_user_fk
+                FOREIGN KEY (user_id)
+                REFERENCES users(id)
+                ON DELETE SET NULL
 
-            country TEXT,
-
-            city TEXT,
-
-            experience TEXT,
-
-            education TEXT,
-
-            created_at TIMESTAMPTZ
-                NOT NULL DEFAULT CURRENT_TIMESTAMP,
-
-            updated_at TIMESTAMPTZ
-                NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-    `);
-
-    // =====================================================
-    // MIGRATION COLUMNS FOR EXISTING DATABASES
-    // =====================================================
-
-    await pool.query(`
-        ALTER TABLE applications
-        ADD COLUMN IF NOT EXISTS user_id BIGINT
-        REFERENCES users(id)
-        ON DELETE SET NULL;
-    `);
-
-    await pool.query(`
-        ALTER TABLE job_applications
-        ADD COLUMN IF NOT EXISTS user_id BIGINT
-        REFERENCES users(id)
-        ON DELETE SET NULL;
-    `);
-
-    await pool.query(`
-        ALTER TABLE job_applications
-        ADD COLUMN IF NOT EXISTS date_of_birth TEXT;
-    `);
-
-    await pool.query(`
-        ALTER TABLE job_applications
-        ADD COLUMN IF NOT EXISTS country TEXT;
-    `);
-
-    await pool.query(`
-        ALTER TABLE job_applications
-        ADD COLUMN IF NOT EXISTS city TEXT;
-    `);
-
-    await pool.query(`
-        ALTER TABLE job_applications
-        ADD COLUMN IF NOT EXISTS experience TEXT;
-    `);
-
-    await pool.query(`
-        ALTER TABLE job_applications
-        ADD COLUMN IF NOT EXISTS education TEXT;
-    `);
-
-    // =====================================================
-    // INDEXES
-    // =====================================================
-
-    await pool.query(`
-        CREATE INDEX IF NOT EXISTS idx_users_email
-        ON users(email);
-    `);
-
-    await pool.query(`
-        CREATE INDEX IF NOT EXISTS idx_sessions_token_hash
-        ON sessions(token_hash);
-    `);
-
-    await pool.query(`
-        CREATE INDEX IF NOT EXISTS idx_sessions_user
-        ON sessions(user_id);
-    `);
-
-    await pool.query(`
-        CREATE INDEX IF NOT EXISTS idx_sessions_expires
-        ON sessions(expires_at);
-    `);
-
-    await pool.query(`
-        CREATE INDEX IF NOT EXISTS idx_password_resets_token
-        ON password_resets(token_hash);
-    `);
-
-    await pool.query(`
-        CREATE INDEX IF NOT EXISTS idx_password_resets_user
-        ON password_resets(user_id);
-    `);
-
-    await pool.query(`
-        CREATE INDEX IF NOT EXISTS idx_applications_user
-        ON applications(user_id);
-    `);
-
-    await pool.query(`
-        CREATE INDEX IF NOT EXISTS idx_applications_status
-        ON applications(status);
-    `);
-
-    await pool.query(`
-        CREATE INDEX IF NOT EXISTS idx_payments_application
-        ON payments(application_id);
-    `);
-
-    await pool.query(`
-        CREATE INDEX IF NOT EXISTS idx_payments_status
-        ON payments(status);
-    `);
-
-    await pool.query(`
-        CREATE INDEX IF NOT EXISTS idx_support_chat_user
-        ON support_chat_messages(user_id);
-    `);
-
-    await pool.query(`
-        CREATE INDEX IF NOT EXISTS idx_support_chat_created
-        ON support_chat_messages(created_at);
-    `);
-
-    await pool.query(`
-        CREATE INDEX IF NOT EXISTS idx_support_chat_unread
-        ON support_chat_messages(
-            user_id,
-            sender_type,
-            is_read
-        );
-    `);
-
-    await pool.query(`
-        CREATE INDEX IF NOT EXISTS idx_contact_created
-        ON contact_messages(created_at);
-    `);
-
-    await pool.query(`
-        CREATE INDEX IF NOT EXISTS idx_contact_status
-        ON contact_messages(status);
-    `);
-
-    await pool.query(`
-        CREATE INDEX IF NOT EXISTS idx_job_created
-        ON job_applications(created_at);
-    `);
-
-    await pool.query(`
-        CREATE INDEX IF NOT EXISTS idx_job_user
-        ON job_applications(user_id);
-    `);
-
-    console.log(
-        "DATABASE: All PostgreSQL tables and indexes are ready."
-    );
-}
-
-// =========================================================
-// START DATABASE
-// =========================================================
-
-const databaseReady =
-    initializeDatabase()
-        .then(() => testDatabase())
-        .catch(error => {
-
-            console.error(
-                "DATABASE INITIALIZATION ERROR:",
-                error
             );
+        `);
 
-            throw error;
 
-        });
+        // =====================================================
+        // PASSWORD RESETS
+        // =====================================================
 
-// =========================================================
-// QUERY HELPERS
-// =========================================================
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS password_resets (
 
-async function query(
-    text,
-    params = []
-) {
+                id BIGSERIAL PRIMARY KEY,
 
-    await databaseReady;
+                user_id BIGINT NOT NULL,
 
-    return pool.query(
-        text,
-        params
-    );
-}
+                token_hash TEXT NOT NULL UNIQUE,
 
-// =========================================================
-// GET SINGLE ROW
-// =========================================================
+                expires_at BIGINT NOT NULL,
 
-async function get(
-    text,
-    params = []
-) {
+                used_at BIGINT,
 
-    const result =
-        await query(
-            text,
-            params
-        );
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
-    return result.rows[0] || null;
-}
+                CONSTRAINT password_reset_user_fk
+                FOREIGN KEY (user_id)
+                REFERENCES users(id)
+                ON DELETE CASCADE
 
-// =========================================================
-// GET ALL ROWS
-// =========================================================
+            );
+        `);
 
-async function all(
-    text,
-    params = []
-) {
 
-    const result =
-        await query(
-            text,
-            params
-        );
+        // =====================================================
+        // AUTH SESSIONS
+        // =====================================================
+        //
+        // IMPORTANT:
+        // Old system used:
+        //
+        // const sessions = new Map();
+        //
+        // That disappeared whenever Render restarted.
+        //
+        // This table makes sessions persistent.
+        // =====================================================
 
-    return result.rows;
-}
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS auth_sessions (
 
-// =========================================================
-// RUN QUERY
-// =========================================================
+                id BIGSERIAL PRIMARY KEY,
 
-async function run(
-    text,
-    params = []
-) {
+                token_hash TEXT NOT NULL UNIQUE,
 
-    const result =
-        await query(
-            text,
-            params
-        );
+                user_id BIGINT NOT NULL,
 
-    return result;
-}
+                role TEXT NOT NULL,
 
-// =========================================================
-// TRANSACTION
-// =========================================================
+                expires_at BIGINT NOT NULL,
 
-async function transaction(
-    callback
-) {
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
-    await databaseReady;
+                CONSTRAINT auth_session_user_fk
+                FOREIGN KEY (user_id)
+                REFERENCES users(id)
+                ON DELETE CASCADE
 
-    const client =
-        await pool.connect();
+            );
+        `);
 
-    try {
 
-        await client.query(
-            "BEGIN"
-        );
+        // =====================================================
+        // USERS INDEX
+        // =====================================================
 
-        const result =
-            await callback(client);
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS
+            idx_users_email
+            ON users(email);
+        `);
+
+
+        // =====================================================
+        // APPLICATION INDEXES
+        // =====================================================
+
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS
+            idx_applications_user
+            ON applications(user_id);
+        `);
+
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS
+            idx_applications_status
+            ON applications(status);
+        `);
+
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS
+            idx_applications_created
+            ON applications(created_at);
+        `);
+
+
+        // =====================================================
+        // PAYMENT INDEXES
+        // =====================================================
+
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS
+            idx_payments_application
+            ON payments(application_id);
+        `);
+
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS
+            idx_payments_status
+            ON payments(status);
+        `);
+
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS
+            idx_payments_reference
+            ON payments(payment_reference);
+        `);
+
+
+        // =====================================================
+        // CHAT INDEXES
+        // =====================================================
+
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS
+            idx_chat_user
+            ON support_chat_messages(user_id);
+        `);
+
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS
+            idx_chat_created
+            ON support_chat_messages(created_at);
+        `);
+
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS
+            idx_chat_user_sender_read
+            ON support_chat_messages(
+                user_id,
+                sender_type,
+                is_read
+            );
+        `);
+
+
+        // =====================================================
+        // CONTACT INDEXES
+        // =====================================================
+
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS
+            idx_contact_status
+            ON contact_messages(status);
+        `);
+
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS
+            idx_contact_created
+            ON contact_messages(created_at);
+        `);
+
+
+        // =====================================================
+        // JOB INDEXES
+        // =====================================================
+
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS
+            idx_job_user
+            ON job_applications(user_id);
+        `);
+
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS
+            idx_job_created
+            ON job_applications(created_at);
+        `);
+
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS
+            idx_job_status
+            ON job_applications(status);
+        `);
+
+
+        // =====================================================
+        // PASSWORD RESET INDEXES
+        // =====================================================
+
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS
+            idx_password_resets_user
+            ON password_resets(user_id);
+        `);
+
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS
+            idx_password_resets_expiry
+            ON password_resets(expires_at);
+        `);
+
+
+        // =====================================================
+        // SESSION INDEXES
+        // =====================================================
+
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS
+            idx_auth_sessions_user
+            ON auth_sessions(user_id);
+        `);
+
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS
+            idx_auth_sessions_expiry
+            ON auth_sessions(expires_at);
+        `);
+
+
+        // =====================================================
+        // COMMIT
+        // =====================================================
 
         await client.query(
             "COMMIT"
         );
 
-        return result;
+
+        console.log(
+            "========================================================="
+        );
+
+        console.log(
+            "U.S TRAVEL & TOURS DATABASE"
+        );
+
+        console.log(
+            "========================================================="
+        );
+
+        console.log(
+            "Database: PostgreSQL / Supabase"
+        );
+
+        console.log(
+            "Tables initialized successfully."
+        );
+
+        console.log(
+            "Users: ready"
+        );
+
+        console.log(
+            "Applications: ready"
+        );
+
+        console.log(
+            "Payments: ready"
+        );
+
+        console.log(
+            "Support Chat: ready"
+        );
+
+        console.log(
+            "Contact Messages: ready"
+        );
+
+        console.log(
+            "Job Applications: ready"
+        );
+
+        console.log(
+            "Password Resets: ready"
+        );
+
+        console.log(
+            "Persistent Sessions: ready"
+        );
+
+        console.log(
+            "========================================================="
+        );
+
 
     } catch (error) {
 
@@ -628,14 +700,32 @@ async function transaction(
                 "ROLLBACK"
             );
 
-        } catch (rollbackError) {
+        } catch (
+            rollbackError
+        ) {
 
             console.error(
-                "DATABASE ROLLBACK ERROR:",
+                "Database rollback error:",
                 rollbackError
             );
 
         }
+
+        console.error(
+            "========================================================="
+        );
+
+        console.error(
+            "DATABASE INITIALIZATION ERROR"
+        );
+
+        console.error(
+            error
+        );
+
+        console.error(
+            "========================================================="
+        );
 
         throw error;
 
@@ -644,17 +734,47 @@ async function transaction(
         client.release();
 
     }
+
 }
 
+
 // =========================================================
-// DATABASE CLOSE
+// SIMPLE QUERY HELPER
+// =========================================================
+//
+// Other backend modules will use:
+// const { pool } = require("./database");
+// const result = await pool.query(...);
+//
+// =========================================================
+
+async function query(
+    text,
+    params = []
+) {
+
+    return pool.query(
+        text,
+        params
+    );
+
+}
+
+
+// =========================================================
+// CLOSE DATABASE
 // =========================================================
 
 async function closeDatabase() {
 
     await pool.end();
 
+    console.log(
+        "PostgreSQL connection pool closed."
+    );
+
 }
+
 
 // =========================================================
 // EXPORT
@@ -666,22 +786,10 @@ module.exports = {
 
     query,
 
-    get,
-
-    all,
-
-    run,
-
-    transaction,
-
     initializeDatabase,
 
-    databaseReady,
+    testDatabaseConnection,
 
     closeDatabase
 
 };
-
-console.log(
-    "U.S TRAVEL & TOURS PostgreSQL database module loaded."
-);
