@@ -1253,18 +1253,13 @@ router.post(
             // -------------------------------------------------
             // PASSWORD CHECK
             // -------------------------------------------------
-
-          const passwordMatches =
+const passwordMatches =
     await bcrypt.compare(
         password,
         user.password_hash
     );
 
-
-// -------------------------------------------------
-// SAFE LOGIN DIAGNOSTICS
-// IMPORTANT: Never log password or password hash.
-// -------------------------------------------------
+console.log("🔥 LOGIN ROUTE EXECUTED 🔥");
 
 console.log(
     "AUTH LOGIN CHECK:",
