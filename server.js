@@ -2,39 +2,328 @@
 // U.S TRAVEL & TOURS
 // MAIN BACKEND SERVER
 // PRODUCTION API SERVER
+//
+// DATABASE:
+// PostgreSQL / Supabase
+//
+// IMPORTANT:
+// Database initialization MUST complete before routes
+// are loaded because authentication and all API modules
+// depend on the PostgreSQL database.
 // =========================================================
 
 const path = require("path");
 const fs = require("fs");
 
-// ---------------------------------------------------------
-// ENVIRONMENT
-// Backend files are in the project ROOT
-// ---------------------------------------------------------
-
 require("dotenv").config({
     path: path.join(__dirname, ".env")
 });
-
-// ---------------------------------------------------------
-// PACKAGES
-// ---------------------------------------------------------
 
 const express = require("express");
 const cors = require("cors");
 const bcrypt = require("bcryptjs");
 
-// ---------------------------------------------------------
-// DATABASE
-// ---------------------------------------------------------
+const {
+    pool,
+    initializeDatabase,
+    testDatabaseConnection
+} = require("./database");
 
-const { db } = require("./database");
+
+// =========================================================
+// EXPRESS APP
+// =========================================================
+
+const app = express();
+
+const PORT =
+    process.env.PORT || 3000;
+
+
+// =========================================================
+// FRONTEND / BACKEND URLS
+// =========================================================
+
+const FRONTEND_URL =
+    "https://us-travel-tours.netlify.app";
+
+const BACKEND_URL =
+    "https://us-travel.onrender.com";
+
+
+// =========================================================
+// DATA DIRECTORY
+// =========================================================
+//
+// Keep this directory for temporary/local files used by
+// existing modules.
+//
+// IMPORTANT:
+// Payment proofs and job resumes will later be moved to
+// permanent Supabase Storage.
+// =========================================================
+
+const DATA_DIR =
+    path.join(
+        __dirname,
+        "data"
+    );
+
+
+if (
+    !fs.existsSync(
+        DATA_DIR
+    )
+) {
+
+    fs.mkdirSync(
+        DATA_DIR,
+        {
+            recursive: true
+        }
+    );
+
+}
+
+
+// =========================================================
+// CORS
+// =========================================================
+
+const allowedOrigins = [
+
+    FRONTEND_URL,
+
+    "http://localhost:3000",
+
+    "http://127.0.0.1:3000"
+
+];
+
+
+app.use(
+    cors({
+
+        origin:
+            function (
+                origin,
+                callback
+            ) {
+
+                // Allow requests without an Origin header
+                // such as server-to-server requests.
+
+                if (!origin) {
+
+                    return callback(
+                        null,
+                        true
+                    );
+
+                }
+
+
+                if (
+                    allowedOrigins.includes(
+                        origin
+                    )
+                ) {
+
+                    return callback(
+                        null,
+                        true
+                    );
+
+                }
+
+
+                console.warn(
+                    "CORS blocked:",
+                    origin
+                );
+
+
+                return callback(
+                    new Error(
+                        "CORS: Origin not allowed."
+                    )
+                );
+
+            },
+
+        credentials:
+            true
+
+    })
+);
+
+
+// =========================================================
+// BODY PARSERS
+// =========================================================
+
+app.use(
+    express.json({
+
+        limit:
+            "10mb"
+
+    })
+);
+
+
+app.use(
+    express.urlencoded({
+
+        extended:
+            true,
+
+        limit:
+            "10mb"
+
+    })
+);
+
+
+// =========================================================
+// BASIC REQUEST LOG
+// =========================================================
+
+app.use(
+    function (
+        req,
+        res,
+        next
+    ) {
+
+        const startedAt =
+            Date.now();
+
+
+        res.on(
+            "finish",
+            function () {
+
+                const duration =
+                    Date.now() -
+                    startedAt;
+
+
+                console.log(
+                    `${req.method} ${req.originalUrl} ${res.statusCode} ${duration}ms`
+                );
+
+            }
+        );
+
+
+        next();
+
+    }
+);
+
+
+// =========================================================
+// HEALTH CHECK
+// =========================================================
+//
+// GET /api/health
+// =========================================================
+
+app.get(
+    "/api/health",
+    async function (
+        req,
+        res
+    ) {
+
+        try {
+
+            await pool.query(
+                "SELECT 1"
+            );
+
+
+            return res.json({
+
+                success:
+                    true,
+
+                message:
+                    "U.S TRAVEL & TOURS backend is running.",
+
+                database:
+                    "connected",
+
+                databaseType:
+                    "PostgreSQL / Supabase",
+
+                frontend:
+                    FRONTEND_URL,
+
+                backend:
+                    BACKEND_URL,
+
+                time:
+                    new Date().toISOString()
+
+            });
+
+        } catch (error) {
+
+            console.error(
+                "Health database check error:",
+                error
+            );
+
+
+            return res.status(503).json({
+
+                success:
+                    false,
+
+                message:
+                    "Backend is running but database connection is unavailable.",
+
+                database:
+                    "disconnected",
+
+                databaseType:
+                    "PostgreSQL / Supabase",
+
+                frontend:
+                    FRONTEND_URL,
+
+                backend:
+                    BACKEND_URL,
+
+                time:
+                    new Date().toISOString()
+
+            });
+
+        }
+
+    }
+);
+
+
 // =========================================================
 // ADMIN BOOTSTRAP
 // CREATE / RESET PRODUCTION ADMIN
 // =========================================================
+//
+// Environment variables:
+//
+// BOOTSTRAP_ADMIN_NAME
+// BOOTSTRAP_ADMIN_EMAIL
+// BOOTSTRAP_ADMIN_PASSWORD
+//
+// IMPORTANT:
+// This runs AFTER PostgreSQL initialization.
+// =========================================================
 
-function bootstrapAdmin() {
+async function bootstrapAdmin() {
 
     const adminName =
         process.env.BOOTSTRAP_ADMIN_NAME;
@@ -44,6 +333,7 @@ function bootstrapAdmin() {
 
     const adminPassword =
         process.env.BOOTSTRAP_ADMIN_PASSWORD;
+
 
     if (
         !adminName ||
@@ -59,41 +349,81 @@ function bootstrapAdmin() {
 
     }
 
+
     try {
 
         const normalizedEmail =
-            adminEmail.trim().toLowerCase();
+            adminEmail
+                .trim()
+                .toLowerCase();
 
-        const existingAdmin =
-            db.prepare(`
-                SELECT id, role
+
+        const existingResult =
+            await pool.query(
+                `
+                SELECT
+                    id,
+                    role
                 FROM users
-                WHERE email = ?
-            `).get(normalizedEmail);
+                WHERE LOWER(email) = $1
+                LIMIT 1
+                `,
+                [
+                    normalizedEmail
+                ]
+            );
+
 
         const passwordHash =
-            bcrypt.hashSync(
+            await bcrypt.hash(
                 adminPassword,
                 12
             );
 
-        if (!existingAdmin) {
 
-            db.prepare(`
-                INSERT INTO users
-                (
-                    name,
-                    email,
-                    password_hash,
-                    role
-                )
-                VALUES
-                (?, ?, ?, 'admin')
-            `).run(
-                adminName.trim(),
-                normalizedEmail,
-                passwordHash
-            );
+        if (
+            existingResult.rows.length ===
+            0
+        ) {
+
+            const insertResult =
+                await pool.query(
+                    `
+                    INSERT INTO users
+                    (
+                        name,
+                        email,
+                        password_hash,
+                        role,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES
+                    (
+                        $1,
+                        $2,
+                        $3,
+                        'admin',
+                        CURRENT_TIMESTAMP,
+                        CURRENT_TIMESTAMP
+                    )
+                    RETURNING
+                        id,
+                        name,
+                        email,
+                        role
+                    `,
+                    [
+                        adminName.trim(),
+                        normalizedEmail,
+                        passwordHash
+                    ]
+                );
+
+
+            const admin =
+                insertResult.rows[0];
+
 
             console.log("");
             console.log(
@@ -109,55 +439,16 @@ function bootstrapAdmin() {
                 "Admin account created successfully."
             );
             console.log(
-                "Admin Email:",
-                normalizedEmail
-            );
-            console.log(
-                "Admin Role: admin"
-            );
-            console.log(
-                "=============================================="
-            );
-            console.log("");
-
-        } else if (
-            existingAdmin.role === "admin"
-        ) {
-
-            db.prepare(`
-    UPDATE users
-    SET
-        name = ?,
-        password_hash = ?,
-        role = 'admin',
-        updated_at = CURRENT_TIMESTAMP
-    WHERE id = ?
-`).run(
-
-                adminName.trim(),
-                passwordHash,
-                existingAdmin.id
-            );
-
-            console.log("");
-            console.log(
-                "=============================================="
-            );
-            console.log(
-                "ADMIN BOOTSTRAP"
-            );
-            console.log(
-                "=============================================="
-            );
-            console.log(
-                "Existing admin password reset successfully."
+                "Admin ID:",
+                admin.id
             );
             console.log(
                 "Admin Email:",
-                normalizedEmail
+                admin.email
             );
             console.log(
-                "Admin Role: admin"
+                "Admin Role:",
+                admin.role
             );
             console.log(
                 "=============================================="
@@ -166,9 +457,81 @@ function bootstrapAdmin() {
 
         } else {
 
-            console.error(
-                "ADMIN BOOTSTRAP ERROR: Email already belongs to a non-admin user."
-            );
+            const existingAdmin =
+                existingResult.rows[0];
+
+
+            if (
+                existingAdmin.role ===
+                "admin"
+            ) {
+
+                await pool.query(
+                    `
+                    UPDATE users
+
+                    SET
+                        name = $1,
+                        password_hash = $2,
+                        role = 'admin',
+                        updated_at = CURRENT_TIMESTAMP
+
+                    WHERE id = $3
+                    `,
+                    [
+                        adminName.trim(),
+                        passwordHash,
+                        existingAdmin.id
+                    ]
+                );
+
+
+                // Password reset means old sessions should
+                // no longer remain valid.
+
+                await pool.query(
+                    `
+                    DELETE FROM auth_sessions
+                    WHERE user_id = $1
+                    `,
+                    [
+                        existingAdmin.id
+                    ]
+                );
+
+
+                console.log("");
+                console.log(
+                    "=============================================="
+                );
+                console.log(
+                    "ADMIN BOOTSTRAP"
+                );
+                console.log(
+                    "=============================================="
+                );
+                console.log(
+                    "Existing admin password reset successfully."
+                );
+                console.log(
+                    "Admin Email:",
+                    normalizedEmail
+                );
+                console.log(
+                    "Admin Role: admin"
+                );
+                console.log(
+                    "=============================================="
+                );
+                console.log("");
+
+            } else {
+
+                console.error(
+                    "ADMIN BOOTSTRAP ERROR: Email already belongs to a non-admin user."
+                );
+
+            }
 
         }
 
@@ -183,207 +546,72 @@ function bootstrapAdmin() {
 
 }
 
-// ---------------------------------------------------------
-// EXPRESS
-// ---------------------------------------------------------
-
-const app = express();
-
-const PORT =
-    process.env.PORT || 3000;
-
-// ---------------------------------------------------------
-// DATA DIRECTORY
-// ---------------------------------------------------------
-
-const DATA_DIR =
-    path.join(__dirname, "data");
-
-// ---------------------------------------------------------
-// CREATE DATA DIRECTORY
-// ---------------------------------------------------------
-
-if (!fs.existsSync(DATA_DIR)) {
-
-    fs.mkdirSync(DATA_DIR, {
-        recursive: true
-    });
-
-}
 
 // =========================================================
-// CORS
-// FRONTEND = NETLIFY
-// BACKEND = RENDER
-// =========================================================
-
-const allowedOrigins = [
-
-    "https://us-travel-tours.netlify.app",
-
-    "http://localhost:3000",
-
-    "http://127.0.0.1:3000"
-
-];
-
-app.use(
-    cors({
-
-        origin: function (
-            origin,
-            callback
-        ) {
-
-            // Allow requests without Origin
-            // such as server-to-server requests
-
-            if (!origin) {
-
-                return callback(
-                    null,
-                    true
-                );
-
-            }
-
-            if (
-                allowedOrigins.includes(
-                    origin
-                )
-            ) {
-
-                return callback(
-                    null,
-                    true
-                );
-
-            }
-
-            console.warn(
-                "CORS blocked:",
-                origin
-            );
-
-            return callback(
-                new Error(
-                    "CORS: Origin not allowed."
-                )
-            );
-
-        },
-
-        credentials: true
-
-    })
-);
-
-// =========================================================
-// BODY PARSERS
-// =========================================================
-
-app.use(
-    express.json({
-        limit: "10mb"
-    })
-);
-
-app.use(
-    express.urlencoded({
-        extended: true,
-        limit: "10mb"
-    })
-);
-
-// =========================================================
-// AUTHENTICATION
+// AUTHENTICATION ROUTES
 // =========================================================
 
 const authRoutes =
     require("./auth");
+
 
 app.use(
     "/api/auth",
     authRoutes
 );
 
+
 console.log(
     "Authentication routes loaded."
 );
 
-// =========================================================
-// HEALTH CHECK
-// =========================================================
-
-app.get(
-    "/api/health",
-    (req, res) => {
-
-        res.json({
-
-            success: true,
-
-            message:
-                "U.S TRAVEL & TOURS backend is running.",
-
-            database:
-                db.open
-                    ? "connected"
-                    : "disconnected",
-
-            frontend:
-                "https://us-travel-tours.netlify.app",
-
-            backend:
-    "https://u-s-travel-tours-1.onrender.com",
-
-            time:
-                new Date().toISOString()
-
-        });
-
-    }
-);
 
 // =========================================================
-// APPLICATIONS
+// APPLICATION ROUTES
 // =========================================================
 
 const applicationsRoutes =
     require("./applications");
+
 
 app.use(
     "/api/applications",
     applicationsRoutes
 );
 
+
 console.log(
     "Application routes loaded."
 );
 
+
 // =========================================================
-// PAYMENTS
+// PAYMENT ROUTES
 // =========================================================
 
 const paymentsRoutes =
     require("./payments");
+
 
 app.use(
     "/api/payments",
     paymentsRoutes
 );
 
+
 app.use(
     "/api/application-payment",
     paymentsRoutes
 );
 
+
 console.log(
     "Payment routes loaded."
 );
 
+
 // =========================================================
-// CHAT
+// CHAT ROUTES
 // =========================================================
 
 const chatPath =
@@ -392,23 +620,31 @@ const chatPath =
         "chat.js"
     );
 
+
 if (
-    fs.existsSync(chatPath)
+    fs.existsSync(
+        chatPath
+    )
 ) {
 
     try {
 
         const chatRoutes =
-            require(chatPath);
+            require(
+                chatPath
+            );
+
 
         app.use(
             "/api/chat",
             chatRoutes
         );
 
+
         console.log(
             "Chat routes loaded successfully."
         );
+
 
         console.log(
             "Chat API: /api/chat"
@@ -431,8 +667,9 @@ if (
 
 }
 
+
 // =========================================================
-// CONTACT
+// CONTACT ROUTES
 // =========================================================
 
 const contactPath =
@@ -441,24 +678,33 @@ const contactPath =
         "contact.js"
     );
 
+
 if (
-    fs.existsSync(contactPath)
+    fs.existsSync(
+        contactPath
+    )
 ) {
 
     try {
 
         const contactRoutes =
-            require(contactPath);
+            require(
+                contactPath
+            );
+
 
         if (
             typeof contactRoutes ===
-            "function"
+            "function" ||
+            typeof contactRoutes ===
+            "object"
         ) {
 
             app.use(
                 "/api/contact",
                 contactRoutes
             );
+
 
             console.log(
                 "Contact routes loaded."
@@ -483,8 +729,9 @@ if (
 
 }
 
+
 // =========================================================
-// JOB APPLICATIONS
+// JOB ROUTES
 // =========================================================
 
 const jobsPath =
@@ -493,28 +740,33 @@ const jobsPath =
         "jobs.js"
     );
 
+
 if (
-    fs.existsSync(jobsPath)
+    fs.existsSync(
+        jobsPath
+    )
 ) {
 
     try {
 
         const jobsRoutes =
-            require(jobsPath);
+            require(
+                jobsPath
+            );
+
 
         if (
             typeof jobsRoutes ===
-            "function"
+            "function" ||
+            typeof jobsRoutes ===
+            "object"
         ) {
-
-            // Main jobs API
 
             app.use(
                 "/api/jobs",
                 jobsRoutes
             );
 
-            // Existing frontend compatibility API
 
             app.use(
                 "/api/job-applications",
@@ -522,6 +774,7 @@ if (
             );
 
         }
+
 
         console.log(
             "Job routes loaded."
@@ -544,17 +797,22 @@ if (
 
 }
 
+
 // =========================================================
-// API 404
+// UNKNOWN API ENDPOINT
 // =========================================================
 
 app.use(
     "/api",
-    (req, res) => {
+    function (
+        req,
+        res
+    ) {
 
-        res.status(404).json({
+        return res.status(404).json({
 
-            success: false,
+            success:
+                false,
 
             message:
                 "API endpoint not found."
@@ -564,34 +822,40 @@ app.use(
     }
 );
 
+
 // =========================================================
 // GLOBAL ERROR HANDLER
 // =========================================================
 
 app.use(
-    (
+    function (
         error,
         req,
         res,
         next
-    ) => {
+    ) {
 
         console.error(
             "GLOBAL SERVER ERROR:",
             error
         );
 
+
         if (
             res.headersSent
         ) {
 
-            return next(error);
+            return next(
+                error
+            );
 
         }
 
-        res.status(500).json({
 
-            success: false,
+        return res.status(500).json({
+
+            success:
+                false,
 
             message:
                 "An internal server error occurred."
@@ -601,84 +865,280 @@ app.use(
     }
 );
 
+
 // =========================================================
 // DATABASE USER CHECK
 // =========================================================
 
-try {
+async function databaseUserCheck() {
 
-    const userCount = db.prepare(
-        "SELECT COUNT(*) AS count FROM users"
-    ).get();
+    try {
 
-    console.log("");
-    console.log(
-        "DATABASE USER CHECK"
-    );
-    console.log(
-        "Database path:",
-        require("./database").DB_PATH
-    );
-    console.log(
-        "Total users:",
-        userCount.count
-    );
-    console.log("");
+        const result =
+            await pool.query(
+                `
+                SELECT
+                    COUNT(*) AS count
+                FROM users
+                `
+            );
 
-} catch (error) {
 
-    console.error(
-        "DATABASE USER CHECK ERROR:",
-        error
-    );
+        const count =
+            Number(
+                result.rows[0]?.count ||
+                0
+            );
+
+
+        console.log("");
+        console.log(
+            "DATABASE USER CHECK"
+        );
+        console.log(
+            "Database:",
+            "PostgreSQL / Supabase"
+        );
+        console.log(
+            "Total users:",
+            count
+        );
+        console.log("");
+
+    } catch (error) {
+
+        console.error(
+            "DATABASE USER CHECK ERROR:",
+            error
+        );
+
+    }
 
 }
 
-bootstrapAdmin();
 
 // =========================================================
 // START SERVER
-// RENDER
+// =========================================================
+//
+// IMPORTANT:
+// 1. Connect to PostgreSQL
+// 2. Create/verify tables
+// 3. Load routes
+// 4. Bootstrap admin
+// 5. Start HTTP server
+//
+// This prevents routes from trying to use a database
+// before the PostgreSQL schema exists.
 // =========================================================
 
-app.listen(
-    PORT,
-    "0.0.0.0",
-    () => {
+async function startServer() {
+
+    try {
 
         console.log("");
-
+        console.log(
+            "=============================================="
+        );
+        console.log(
+            "U.S TRAVEL & TOURS SERVER STARTING"
+        );
         console.log(
             "=============================================="
         );
 
-        console.log(
-            "       U.S TRAVEL & TOURS API SERVER"
-        );
+
+        // -------------------------------------------------
+        // TEST CONNECTION
+        // -------------------------------------------------
 
         console.log(
+            "Testing PostgreSQL / Supabase connection..."
+        );
+
+
+        await testDatabaseConnection();
+
+
+        // -------------------------------------------------
+        // INITIALIZE DATABASE
+        // -------------------------------------------------
+
+        console.log(
+            "Initializing PostgreSQL database..."
+        );
+
+
+        await initializeDatabase();
+
+
+        console.log(
+            "PostgreSQL database initialization completed."
+        );
+
+
+        // -------------------------------------------------
+        // USER CHECK
+        // -------------------------------------------------
+
+        await databaseUserCheck();
+
+
+        // -------------------------------------------------
+        // ADMIN BOOTSTRAP
+        // -------------------------------------------------
+
+        await bootstrapAdmin();
+
+
+        // -------------------------------------------------
+        // START HTTP SERVER
+        // -------------------------------------------------
+
+        app.listen(
+            PORT,
+            "0.0.0.0",
+            function () {
+
+                console.log("");
+                console.log(
+                    "=============================================="
+                );
+                console.log(
+                    "       U.S TRAVEL & TOURS API SERVER"
+                );
+                console.log(
+                    "=============================================="
+                );
+                console.log(
+                    `Server running on port ${PORT}`
+                );
+                console.log(
+                    "Database: PostgreSQL / Supabase"
+                );
+                console.log(
+                    "Health:",
+                    `${BACKEND_URL}/api/health`
+                );
+                console.log(
+                    "Frontend:",
+                    FRONTEND_URL
+                );
+                console.log(
+                    "Backend:",
+                    BACKEND_URL
+                );
+                console.log(
+                    "Persistent sessions: ENABLED"
+                );
+                console.log(
+                    "=============================================="
+                );
+                console.log("");
+
+            }
+        );
+
+    } catch (error) {
+
+        console.error("");
+        console.error(
             "=============================================="
         );
-
-        console.log(
-            `Server running on port ${PORT}`
+        console.error(
+            "SERVER STARTUP FAILED"
         );
-
-        console.log(
-            "Health: /api/health"
-        );
-
-        console.log(
-            "Frontend: https://us-travel-tours.netlify.app"
-        );
-
-        console.log(
-    "Backend: https://u-s-travel-tours-1.onrender.com"
-);
-
-        console.log(
+        console.error(
             "=============================================="
+        );
+        console.error(
+            error
+        );
+        console.error(
+            "=============================================="
+        );
+        console.error("");
+
+
+        process.exit(
+            1
+        );
+
+    }
+
+}
+
+
+// =========================================================
+// GRACEFUL SHUTDOWN
+// =========================================================
+
+async function shutdown(
+    signal
+) {
+
+    console.log(
+        `${signal} received. Shutting down server...`
+    );
+
+
+    try {
+
+        await pool.end();
+
+
+        console.log(
+            "PostgreSQL connection pool closed."
+        );
+
+
+        process.exit(
+            0
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Shutdown error:",
+            error
+        );
+
+
+        process.exit(
+            1
+        );
+
+    }
+
+}
+
+
+process.on(
+    "SIGTERM",
+    function () {
+
+        shutdown(
+            "SIGTERM"
         );
 
     }
 );
+
+
+process.on(
+    "SIGINT",
+    function () {
+
+        shutdown(
+            "SIGINT"
+        );
+
+    }
+);
+
+
+// =========================================================
+// START
+// =========================================================
+
+startServer();
