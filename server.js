@@ -54,14 +54,6 @@ const BACKEND_URL =
 // =========================================================
 // DATA DIRECTORY
 // =========================================================
-//
-// Keep this directory for temporary/local files used by
-// existing modules.
-//
-// IMPORTANT:
-// Payment proofs and job resumes will later be moved to
-// permanent Supabase Storage.
-// =========================================================
 
 const DATA_DIR =
     path.join(
@@ -109,9 +101,6 @@ app.use(
                 origin,
                 callback
             ) {
-
-                // Allow requests without an Origin header
-                // such as server-to-server requests.
 
                 if (!origin) {
 
@@ -226,9 +215,6 @@ app.use(
 // =========================================================
 // HEALTH CHECK
 // =========================================================
-//
-// GET /api/health
-// =========================================================
 
 app.get(
     "/api/health",
@@ -321,6 +307,12 @@ app.get(
 //
 // IMPORTANT:
 // This runs AFTER PostgreSQL initialization.
+//
+// IMPORTANT ADMIN SESSION FIX:
+// Existing auth_sessions are NOT deleted during startup.
+// This allows an already authenticated admin session to
+// survive Render restarts/redeploys until its normal
+// expiration time.
 // =========================================================
 
 async function bootstrapAdmin() {
@@ -451,6 +443,9 @@ async function bootstrapAdmin() {
                 admin.role
             );
             console.log(
+                "Admin sessions: PRESERVED"
+            );
+            console.log(
                 "=============================================="
             );
             console.log("");
@@ -486,18 +481,22 @@ async function bootstrapAdmin() {
                 );
 
 
-                // Password reset means old sessions should
-                // no longer remain valid.
-
-                await pool.query(
-                    `
-                    DELETE FROM auth_sessions
-                    WHERE user_id = $1
-                    `,
-                    [
-                        existingAdmin.id
-                    ]
-                );
+                // =================================================
+                // IMPORTANT:
+                // DO NOT DELETE AUTH SESSIONS HERE.
+                //
+                // Previously this code deleted all admin sessions
+                // every time Render restarted/redeployed the server.
+                //
+                // That caused the browser to still contain a token
+                // while PostgreSQL no longer contained its session,
+                // resulting in:
+                //
+                // 401 Unauthorized
+                //
+                // Admin sessions are now allowed to remain valid
+                // until their normal expiration time.
+                // =================================================
 
 
                 console.log("");
@@ -511,7 +510,7 @@ async function bootstrapAdmin() {
                     "=============================================="
                 );
                 console.log(
-                    "Existing admin password reset successfully."
+                    "Existing admin account verified successfully."
                 );
                 console.log(
                     "Admin Email:",
@@ -519,6 +518,9 @@ async function bootstrapAdmin() {
                 );
                 console.log(
                     "Admin Role: admin"
+                );
+                console.log(
+                    "Admin sessions: PRESERVED"
                 );
                 console.log(
                     "=============================================="
@@ -920,17 +922,6 @@ async function databaseUserCheck() {
 // =========================================================
 // START SERVER
 // =========================================================
-//
-// IMPORTANT:
-// 1. Connect to PostgreSQL
-// 2. Create/verify tables
-// 3. Load routes
-// 4. Bootstrap admin
-// 5. Start HTTP server
-//
-// This prevents routes from trying to use a database
-// before the PostgreSQL schema exists.
-// =========================================================
 
 async function startServer() {
 
@@ -1030,6 +1021,9 @@ async function startServer() {
                 );
                 console.log(
                     "Persistent sessions: ENABLED"
+                );
+                console.log(
+                    "Admin sessions survive restart: ENABLED"
                 );
                 console.log(
                     "=============================================="
