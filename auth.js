@@ -739,61 +739,58 @@ async function requireAdmin(
 
     try {
 
-        // -------------------------------------------------
-        // IF USER IS NOT ALREADY AUTHENTICATED,
-        // VERIFY THE BEARER TOKEN NOW.
-        // -------------------------------------------------
+        // =================================================
+        // ALWAYS VERIFY THE CURRENT BEARER TOKEN
+        // =================================================
 
-        if (!req.user) {
-
-            const authenticated =
-                await getAuthenticatedUser(
-                    req
-                );
+        const authenticated =
+            await getAuthenticatedUser(
+                req
+            );
 
 
-            if (!authenticated) {
+        if (!authenticated) {
 
-                return res.status(401).json({
+            return res.status(401).json({
 
-                    success:
-                        false,
+                success:
+                    false,
 
-                    message:
-                        "Authentication required."
+                message:
+                    "Authentication required."
 
-                });
-
-            }
-
-
-            // -------------------------------------------------
-            // ATTACH AUTHENTICATED USER
-            // -------------------------------------------------
-
-            req.user =
-                publicUser(
-                    authenticated.user
-                );
-
-            req.authUser =
-                authenticated.user;
-
-            req.session =
-                authenticated.session;
-
-            req.authToken =
-                authenticated.token;
+            });
 
         }
 
 
-        // -------------------------------------------------
+        // =================================================
+        // ATTACH AUTHENTICATED USER
+        // =================================================
+
+        req.user =
+            publicUser(
+                authenticated.user
+            );
+
+        req.authUser =
+            authenticated.user;
+
+        req.session =
+            authenticated.session;
+
+        req.authToken =
+            authenticated.token;
+
+
+        // =================================================
         // ADMIN ROLE CHECK
-        // -------------------------------------------------
+        // =================================================
 
         if (
-            req.user.role !==
+            String(
+                req.user.role || ""
+            ).toLowerCase() !==
             "admin"
         ) {
 
@@ -810,9 +807,9 @@ async function requireAdmin(
         }
 
 
-        // -------------------------------------------------
+        // =================================================
         // ADMIN AUTHENTICATION SUCCESSFUL
-        // -------------------------------------------------
+        // =================================================
 
         return next();
 
@@ -823,7 +820,6 @@ async function requireAdmin(
             "Admin authentication error:",
             error
         );
-
 
         return res.status(500).json({
 
