@@ -48,7 +48,7 @@ const FRONTEND_URL =
     "https://us-travel-tours.netlify.app";
 
 const BACKEND_URL =
-    "https://us-travel.onrender.com";
+    "https://u-s-travel-tours-1.onrender.com";
 
 
 // =========================================================
