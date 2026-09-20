@@ -1,7 +1,7 @@
 /* =========================================================
    U.S TRAVEL & TOURS
    JOB APPLICATION ROUTES
-   PostgreSQL / Supabase Version
+   PostgreSQL / Supabase Storage Version
 
    CUSTOMER:
    - Submit job application
@@ -14,17 +14,22 @@
    - Update status
    - Delete application
 
+   STORAGE:
+   - Supabase Storage
+   - Private bucket: job-resumes
+
    IMPORTANT:
    - SQLite removed
    - PostgreSQL / Supabase database
+   - Render local resume storage removed
    - Existing API endpoints preserved
 ========================================================= */
 
 const express = require("express");
-const fs = require("fs");
-const path = require("path");
 const multer = require("multer");
 const nodemailer = require("nodemailer");
+const crypto = require("crypto");
+const path = require("path");
 
 const {
     pool
@@ -65,24 +70,51 @@ const SMTP_PASS =
 
 
 /* =========================================================
+   SUPABASE STORAGE
+========================================================= */
+
+const SUPABASE_URL =
+    process.env.SUPABASE_URL;
+
+const SUPABASE_SERVICE_ROLE_KEY =
+    process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+const JOB_RESUME_BUCKET =
+    "job-resumes";
+
+
+function storageConfigured() {
+
+    return Boolean(
+        SUPABASE_URL &&
+        SUPABASE_SERVICE_ROLE_KEY
+    );
+}
+
+
+/* =========================================================
    SMTP
 ========================================================= */
 
 const transporter =
     nodemailer.createTransport({
 
-        host: SMTP_HOST,
+        host:
+            SMTP_HOST,
 
-        port: SMTP_PORT,
+        port:
+            SMTP_PORT,
 
         secure:
             SMTP_PORT === 465,
 
         auth: {
 
-            user: SMTP_USER,
+            user:
+                SMTP_USER,
 
-            pass: SMTP_PASS
+            pass:
+                SMTP_PASS
         }
     });
 
@@ -169,79 +201,20 @@ function normalizeId(value) {
 
 
 /* =========================================================
-   RESUME DIRECTORY
+   MULTER MEMORY STORAGE
 ========================================================= */
 
-const resumeDirectory =
-    path.join(
-        __dirname,
-        "data",
-        "job-resumes"
-    );
+/*
+   IMPORTANT:
 
+   Resume is temporarily held in server memory and then
+   uploaded directly to Supabase Storage.
 
-if (
-    !fs.existsSync(
-        resumeDirectory
-    )
-) {
-
-    fs.mkdirSync(
-        resumeDirectory,
-        {
-            recursive: true
-        }
-    );
-}
-
-
-/* =========================================================
-   MULTER STORAGE
-========================================================= */
+   No resume is stored inside Render's local filesystem.
+*/
 
 const resumeStorage =
-    multer.diskStorage({
-
-        destination:
-            function (
-                req,
-                file,
-                cb
-            ) {
-
-                cb(
-                    null,
-                    resumeDirectory
-                );
-            },
-
-        filename:
-            function (
-                req,
-                file,
-                cb
-            ) {
-
-                const extension =
-                    path.extname(
-                        file.originalname
-                    ).toLowerCase();
-
-                const filename =
-                    "resume-" +
-                    Date.now() +
-                    "-" +
-                    Math.random()
-                        .toString(36)
-                        .substring(2, 10) +
-                    extension;
-
-                cb(
-                    null,
-                    filename
-                );
-            }
-    });
+    multer.memoryStorage();
 
 
 /* =========================================================
@@ -307,6 +280,342 @@ const uploadResume =
 
 
 /* =========================================================
+   CREATE STORAGE FILE NAME
+========================================================= */
+
+function createResumeFileName(
+    originalName
+) {
+
+    const extensionMatch =
+        cleanString(
+            originalName
+        ).match(
+            /\.[a-zA-Z0-9]+$/
+        );
+
+
+    const extension =
+        extensionMatch
+            ? extensionMatch[0].toLowerCase()
+            : "";
+
+
+    const randomPart =
+        crypto
+            .randomBytes(16)
+            .toString("hex");
+
+
+    return (
+        "resume-" +
+        Date.now() +
+        "-" +
+        randomPart +
+        extension
+    );
+}
+
+
+/* =========================================================
+   UPLOAD RESUME TO SUPABASE
+========================================================= */
+
+async function uploadResumeToSupabase(
+    file
+) {
+
+    if (
+        !storageConfigured()
+    ) {
+
+        throw new Error(
+            "Supabase Storage is not configured."
+        );
+    }
+
+
+    const fileName =
+        createResumeFileName(
+            file.originalname
+        );
+
+
+    const storagePath =
+        "applications/" +
+        fileName;
+
+
+    const baseUrl =
+        SUPABASE_URL.replace(
+            /\/$/,
+            ""
+        );
+
+
+    const uploadUrl =
+        baseUrl +
+        "/storage/v1/object/" +
+        encodeURIComponent(
+            JOB_RESUME_BUCKET
+        ) +
+        "/" +
+        storagePath
+            .split("/")
+            .map(
+                encodeURIComponent
+            )
+            .join("/");
+
+
+    const response =
+        await fetch(
+            uploadUrl,
+            {
+
+                method:
+                    "POST",
+
+                headers: {
+
+                    "Authorization":
+                        "Bearer " +
+                        SUPABASE_SERVICE_ROLE_KEY,
+
+                    "apikey":
+                        SUPABASE_SERVICE_ROLE_KEY,
+
+                    "Content-Type":
+                        file.mimetype,
+
+                    "x-upsert":
+                        "false"
+                },
+
+                body:
+                    file.buffer
+            }
+        );
+
+
+    if (
+        !response.ok
+    ) {
+
+        let errorText =
+            "";
+
+        try {
+
+            errorText =
+                await response.text();
+
+        } catch (
+            readError
+        ) {
+
+            errorText =
+                "Unknown Supabase Storage error.";
+        }
+
+
+        throw new Error(
+            "Supabase Storage upload failed: " +
+            errorText
+        );
+    }
+
+
+    return {
+        storagePath,
+        fileName
+    };
+}
+
+
+/* =========================================================
+   DELETE RESUME FROM SUPABASE
+========================================================= */
+
+async function deleteResumeFromSupabase(
+    storagePath
+) {
+
+    if (
+        !storageConfigured() ||
+        !storagePath
+    ) {
+        return;
+    }
+
+
+    try {
+
+        const deleteUrl =
+            SUPABASE_URL.replace(
+                /\/$/,
+                ""
+            ) +
+            "/storage/v1/object/" +
+            encodeURIComponent(
+                JOB_RESUME_BUCKET
+            ) +
+            "/" +
+            storagePath
+                .split("/")
+                .map(
+                    encodeURIComponent
+                )
+                .join("/");
+
+
+        const response =
+            await fetch(
+                deleteUrl,
+                {
+
+                    method:
+                        "DELETE",
+
+                    headers: {
+
+                        "Authorization":
+                            "Bearer " +
+                            SUPABASE_SERVICE_ROLE_KEY,
+
+                        "apikey":
+                            SUPABASE_SERVICE_ROLE_KEY
+                    }
+                }
+            );
+
+
+        if (
+            !response.ok
+        ) {
+
+            console.error(
+                "SUPABASE RESUME DELETE FAILED:",
+                await response.text()
+            );
+        }
+
+    } catch (
+        error
+    ) {
+
+        console.error(
+            "SUPABASE RESUME DELETE ERROR:",
+            error
+        );
+    }
+}
+
+
+/* =========================================================
+   CREATE SIGNED RESUME URL
+========================================================= */
+
+async function createResumeSignedUrl(
+    storagePath,
+    expiresIn = 300
+) {
+
+    if (
+        !storageConfigured()
+    ) {
+
+        throw new Error(
+            "Supabase Storage is not configured."
+        );
+    }
+
+
+    const signUrl =
+        SUPABASE_URL.replace(
+            /\/$/,
+            ""
+        ) +
+        "/storage/v1/object/sign/" +
+        encodeURIComponent(
+            JOB_RESUME_BUCKET
+        ) +
+        "/" +
+        storagePath
+            .split("/")
+            .map(
+                encodeURIComponent
+            )
+            .join("/");
+
+
+    const response =
+        await fetch(
+            signUrl,
+            {
+
+                method:
+                    "POST",
+
+                headers: {
+
+                    "Authorization":
+                        "Bearer " +
+                        SUPABASE_SERVICE_ROLE_KEY,
+
+                    "apikey":
+                        SUPABASE_SERVICE_ROLE_KEY,
+
+                    "Content-Type":
+                        "application/json"
+                },
+
+                body:
+                    JSON.stringify({
+                        expiresIn:
+                            expiresIn
+                    })
+            }
+        );
+
+
+    if (
+        !response.ok
+    ) {
+
+        throw new Error(
+            "Unable to create resume URL: " +
+            await response.text()
+        );
+    }
+
+
+    const data =
+        await response.json();
+
+
+    if (
+        !data.signedURL
+    ) {
+
+        throw new Error(
+            "Supabase did not return a signed resume URL."
+        );
+    }
+
+
+    return (
+        SUPABASE_URL.replace(
+            /\/$/,
+            ""
+        ) +
+        "/storage/v1" +
+        data.signedURL
+    );
+}
+
+
+/* =========================================================
    POST /api/jobs/applications
    CUSTOMER - SUBMIT JOB APPLICATION
 ========================================================= */
@@ -320,10 +629,28 @@ router.post(
         res
     ) => {
 
-        let uploadedFile =
-            req.file || null;
+        let uploadedStoragePath =
+            null;
 
         try {
+
+            /* -------------------------------------------------
+               STORAGE CONFIG
+            ------------------------------------------------- */
+
+            if (
+                !storageConfigured()
+            ) {
+
+                return res.status(500).json({
+
+                    success: false,
+
+                    message:
+                        "Resume storage is not configured on the server."
+                });
+            }
+
 
             /* -------------------------------------------------
                CUSTOMER ONLY
@@ -429,12 +756,6 @@ router.post(
                 !jobTitle
             ) {
 
-                if (uploadedFile) {
-                    removeFile(
-                        uploadedFile.path
-                    );
-                }
-
                 return res.status(400).json({
 
                     success: false,
@@ -446,7 +767,7 @@ router.post(
 
 
             /* -------------------------------------------------
-               SUPPORT BOTH JOB SLUG AND DISPLAY NAME
+               SUPPORT JOB SLUG + DISPLAY NAME
             ------------------------------------------------- */
 
             const jobKey =
@@ -466,12 +787,6 @@ router.post(
 
 
             if (!jobKey) {
-
-                if (uploadedFile) {
-                    removeFile(
-                        uploadedFile.path
-                    );
-                }
 
                 return res.status(400).json({
 
@@ -529,12 +844,6 @@ router.post(
                 missingFields.length > 0
             ) {
 
-                if (uploadedFile) {
-                    removeFile(
-                        uploadedFile.path
-                    );
-                }
-
                 return res.status(400).json({
 
                     success: false,
@@ -561,12 +870,6 @@ router.post(
                 )
             ) {
 
-                if (uploadedFile) {
-                    removeFile(
-                        uploadedFile.path
-                    );
-                }
-
                 return res.status(400).json({
 
                     success: false,
@@ -589,12 +892,6 @@ router.post(
                 city.length > 150
             ) {
 
-                if (uploadedFile) {
-                    removeFile(
-                        uploadedFile.path
-                    );
-                }
-
                 return res.status(400).json({
 
                     success: false,
@@ -611,12 +908,6 @@ router.post(
                 coverLetter.length > 10000
             ) {
 
-                if (uploadedFile) {
-                    removeFile(
-                        uploadedFile.path
-                    );
-                }
-
                 return res.status(400).json({
 
                     success: false,
@@ -631,7 +922,9 @@ router.post(
                RESUME
             ------------------------------------------------- */
 
-            if (!uploadedFile) {
+            if (
+                !req.file
+            ) {
 
                 return res.status(400).json({
 
@@ -643,12 +936,18 @@ router.post(
             }
 
 
-            const resumeFile =
-                path.join(
-                    "data",
-                    "job-resumes",
-                    uploadedFile.filename
+            /* -------------------------------------------------
+               UPLOAD RESUME TO SUPABASE
+            ------------------------------------------------- */
+
+            const uploaded =
+                await uploadResumeToSupabase(
+                    req.file
                 );
+
+
+            uploadedStoragePath =
+                uploaded.storagePath;
 
 
             /* -------------------------------------------------
@@ -718,7 +1017,7 @@ router.post(
                         name,
                         email,
                         phone,
-                        resumeFile,
+                        uploadedStoragePath,
                         coverLetter,
                         dateOfBirth,
                         country,
@@ -785,7 +1084,9 @@ router.post(
                     });
                 }
 
-            } catch (mailError) {
+            } catch (
+                mailError
+            ) {
 
                 console.error(
                     "JOB OWNER EMAIL ERROR:",
@@ -835,7 +1136,9 @@ router.post(
                     });
                 }
 
-            } catch (mailError) {
+            } catch (
+                mailError
+            ) {
 
                 console.error(
                     "JOB APPLICANT EMAIL ERROR:",
@@ -911,16 +1214,20 @@ router.post(
                 }
             });
 
-        } catch (error) {
+        } catch (
+            error
+        ) {
 
             /* -------------------------------------------------
-               DELETE FILE IF DATABASE INSERT FAILED
+               DELETE SUPABASE FILE IF DATABASE FAILED
             ------------------------------------------------- */
 
-            if (uploadedFile) {
+            if (
+                uploadedStoragePath
+            ) {
 
-                removeFile(
-                    uploadedFile.path
+                await deleteResumeFromSupabase(
+                    uploadedStoragePath
                 );
             }
 
@@ -1006,20 +1313,19 @@ router.get(
                 );
 
 
-            const applications =
-                result.rows.map(
-                    formatApplication
-                );
-
-
             return res.json({
 
                 success: true,
 
-                applications
+                applications:
+                    result.rows.map(
+                        formatApplication
+                    )
             });
 
-        } catch (error) {
+        } catch (
+            error
+        ) {
 
             console.error(
                 "GET MY JOB APPLICATIONS ERROR:",
@@ -1111,7 +1417,9 @@ router.get(
                     )
             });
 
-        } catch (error) {
+        } catch (
+            error
+        ) {
 
             console.error(
                 "GET /MY JOB APPLICATIONS ERROR:",
@@ -1183,7 +1491,9 @@ router.get(
                     )
             });
 
-        } catch (error) {
+        } catch (
+            error
+        ) {
 
             console.error(
                 "GET ALL JOB APPLICATIONS ERROR:",
@@ -1204,7 +1514,7 @@ router.get(
 
 /* =========================================================
    GET /api/jobs/applications/:id
-   ADMIN - SINGLE APPLICATION
+   CUSTOMER / ADMIN - SINGLE APPLICATION
 ========================================================= */
 
 router.get(
@@ -1315,7 +1625,9 @@ router.get(
                     )
             });
 
-        } catch (error) {
+        } catch (
+            error
+        ) {
 
             console.error(
                 "GET JOB APPLICATION ERROR:",
@@ -1462,7 +1774,9 @@ router.patch(
                     application.updated_at
             });
 
-        } catch (error) {
+        } catch (
+            error
+        ) {
 
             console.error(
                 "UPDATE JOB APPLICATION STATUS ERROR:",
@@ -1562,81 +1876,30 @@ router.get(
             }
 
 
-            const filename =
-                path.basename(
-                    application.resume_file
+            /* -------------------------------------------------
+               CREATE TEMPORARY SIGNED URL
+            ------------------------------------------------- */
+
+            const signedUrl =
+                await createResumeSignedUrl(
+                    application.resume_file,
+                    300
                 );
 
 
-            const filePath =
-                path.join(
-                    resumeDirectory,
-                    filename
-                );
+            /*
+               Redirect to a 5-minute signed URL.
 
+               Resume remains private in Supabase Storage.
+            */
 
-            if (
-                !fs.existsSync(
-                    filePath
-                )
-            ) {
-
-                return res.status(404).json({
-
-                    success: false,
-
-                    message:
-                        "Resume file is no longer available on the server."
-                });
-            }
-
-
-            const extension =
-                path.extname(
-                    filename
-                ).toLowerCase();
-
-
-            const contentTypes = {
-
-                ".pdf":
-                    "application/pdf",
-
-                ".doc":
-                    "application/msword",
-
-                ".docx":
-                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-
-                ".jpg":
-                    "image/jpeg",
-
-                ".jpeg":
-                    "image/jpeg",
-
-                ".png":
-                    "image/png"
-            };
-
-
-            res.setHeader(
-                "Content-Type",
-                contentTypes[extension] ||
-                    "application/octet-stream"
+            return res.redirect(
+                signedUrl
             );
 
-
-            res.setHeader(
-                "Content-Disposition",
-                `inline; filename="${filename}"`
-            );
-
-
-            return res.sendFile(
-                filePath
-            );
-
-        } catch (error) {
+        } catch (
+            error
+        ) {
 
             console.error(
                 "GET JOB RESUME ERROR:",
@@ -1689,7 +1952,7 @@ router.delete(
 
 
             /* -------------------------------------------------
-               GET RESUME FIRST
+               GET RESUME PATH FIRST
             ------------------------------------------------- */
 
             const existing =
@@ -1741,24 +2004,15 @@ router.delete(
 
 
             /* -------------------------------------------------
-               DELETE LOCAL RESUME
+               DELETE RESUME FROM SUPABASE STORAGE
             ------------------------------------------------- */
 
-            if (resumeFile) {
+            if (
+                resumeFile
+            ) {
 
-                const filename =
-                    path.basename(
-                        resumeFile
-                    );
-
-                const filePath =
-                    path.join(
-                        resumeDirectory,
-                        filename
-                    );
-
-                removeFile(
-                    filePath
+                await deleteResumeFromSupabase(
+                    resumeFile
                 );
             }
 
@@ -1776,7 +2030,9 @@ router.delete(
                     )
             });
 
-        } catch (error) {
+        } catch (
+            error
+        ) {
 
             console.error(
                 "DELETE JOB APPLICATION ERROR:",
@@ -1793,38 +2049,6 @@ router.delete(
         }
     }
 );
-
-
-/* =========================================================
-   FILE CLEANUP HELPER
-========================================================= */
-
-function removeFile(
-    filePath
-) {
-
-    try {
-
-        if (
-            filePath &&
-            fs.existsSync(
-                filePath
-            )
-        ) {
-
-            fs.unlinkSync(
-                filePath
-            );
-        }
-
-    } catch (error) {
-
-        console.error(
-            "FILE CLEANUP ERROR:",
-            error
-        );
-    }
-}
 
 
 /* =========================================================
@@ -1960,21 +2184,8 @@ router.use(
 
 
 /* =========================================================
-   FRONTEND COMPATIBILITY
-========================================================= */
-
-/*
-   server.js mounts this same router at:
-
-   /api/jobs
-   /api/job-applications
-
-   Therefore both existing API prefixes continue working.
-*/
-
-
-/* =========================================================
    EXPORT
 ========================================================= */
 
-module.exports = router;
+module.exports =
+    router;
