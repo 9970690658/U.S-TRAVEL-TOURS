@@ -1,23 +1,28 @@
 /* =========================================================
    U.S TRAVEL & TOURS
    PAYMENT ROUTES
-   PostgreSQL / Supabase Version
+   PostgreSQL / Supabase Storage Version
 
    CUSTOMER:
    - Submit payment details
    - Upload payment proof
    - View own payment
+   - View own payment proof
 
    ADMIN:
    - View all payments
    - View payment by application
    - Update payment status
+   - View payment proof
+
+   STORAGE:
+   - Supabase Storage
+   - Private bucket: payment-proofs
 ========================================================= */
 
 const express = require("express");
-const fs = require("fs");
-const path = require("path");
 const multer = require("multer");
+const crypto = require("crypto");
 
 const {
     pool
@@ -32,57 +37,61 @@ const router = express.Router();
 
 
 /* =========================================================
-   PAYMENT PROOF STORAGE
+   SUPABASE STORAGE CONFIGURATION
 ========================================================= */
 
-const paymentProofDir = path.join(
-    __dirname,
-    "data",
-    "payment-proofs"
-);
+const SUPABASE_URL =
+    process.env.SUPABASE_URL;
 
-if (!fs.existsSync(paymentProofDir)) {
-    fs.mkdirSync(paymentProofDir, {
-        recursive: true
-    });
+const SUPABASE_SERVICE_ROLE_KEY =
+    process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+const PAYMENT_PROOF_BUCKET =
+    "payment-proofs";
+
+
+/* =========================================================
+   SUPABASE STORAGE CONFIG CHECK
+========================================================= */
+
+function storageConfigured() {
+
+    return Boolean(
+        SUPABASE_URL &&
+        SUPABASE_SERVICE_ROLE_KEY
+    );
 }
 
 
 /* =========================================================
-   MULTER STORAGE
+   MULTER MEMORY STORAGE
 ========================================================= */
 
-const storage = multer.diskStorage({
+/*
+   IMPORTANT:
 
-    destination: function (req, file, cb) {
-        cb(null, paymentProofDir);
-    },
+   We do NOT use diskStorage anymore.
 
-    filename: function (req, file, cb) {
+   The uploaded file stays temporarily in memory and is
+   immediately uploaded to Supabase Storage.
 
-        const extension =
-            path.extname(file.originalname)
-                .toLowerCase();
+   This prevents payment proofs from being lost when
+   Render restarts or redeploys.
+*/
 
-        const uniqueName =
-            "payment-" +
-            Date.now() +
-            "-" +
-            Math.random()
-                .toString(36)
-                .substring(2, 10) +
-            extension;
-
-        cb(null, uniqueName);
-    }
-});
+const storage =
+    multer.memoryStorage();
 
 
 /* =========================================================
    FILE FILTER
 ========================================================= */
 
-function fileFilter(req, file, cb) {
+function fileFilter(
+    req,
+    file,
+    cb
+) {
 
     const allowedTypes = [
         "image/jpeg",
@@ -90,7 +99,12 @@ function fileFilter(req, file, cb) {
         "application/pdf"
     ];
 
-    if (!allowedTypes.includes(file.mimetype)) {
+
+    if (
+        !allowedTypes.includes(
+            file.mimetype
+        )
+    ) {
 
         return cb(
             new Error(
@@ -99,20 +113,23 @@ function fileFilter(req, file, cb) {
         );
     }
 
+
     cb(null, true);
 }
 
 
-const upload = multer({
+const upload =
+    multer({
 
-    storage,
+        storage,
 
-    fileFilter,
+        fileFilter,
 
-    limits: {
-        fileSize: 5 * 1024 * 1024
-    }
-});
+        limits: {
+            fileSize:
+                5 * 1024 * 1024
+        }
+    });
 
 
 /* =========================================================
@@ -134,7 +151,8 @@ function cleanString(value) {
 
 function normalizeId(value) {
 
-    const id = Number(value);
+    const id =
+        Number(value);
 
     if (
         !Number.isSafeInteger(id) ||
@@ -145,6 +163,464 @@ function normalizeId(value) {
 
     return id;
 }
+
+
+/* =========================================================
+   STORAGE FILE NAME
+========================================================= */
+
+function createStorageFileName(
+    originalName
+) {
+
+    const original =
+        cleanString(
+            originalName
+        );
+
+    const extensionMatch =
+        original.match(
+            /\.[a-zA-Z0-9]+$/
+        );
+
+    const extension =
+        extensionMatch
+            ? extensionMatch[0].toLowerCase()
+            : "";
+
+
+    const randomPart =
+        crypto
+            .randomBytes(16)
+            .toString("hex");
+
+
+    return (
+        "payment-" +
+        Date.now() +
+        "-" +
+        randomPart +
+        extension
+    );
+}
+
+
+/* =========================================================
+   SUPABASE STORAGE UPLOAD
+========================================================= */
+
+async function uploadToSupabaseStorage(
+    file
+) {
+
+    if (!storageConfigured()) {
+
+        throw new Error(
+            "Supabase Storage is not configured."
+        );
+    }
+
+
+    const fileName =
+        createStorageFileName(
+            file.originalname
+        );
+
+
+    const storagePath =
+        "payments/" +
+        fileName;
+
+
+    const uploadUrl =
+        SUPABASE_URL.replace(
+            /\/$/,
+            ""
+        ) +
+        "/storage/v1/object/" +
+        encodeURIComponent(
+            PAYMENT_PROOF_BUCKET
+        ) +
+        "/" +
+        storagePath
+            .split("/")
+            .map(
+                encodeURIComponent
+            )
+            .join("/");
+
+
+    const response =
+        await fetch(
+            uploadUrl,
+            {
+                method: "POST",
+
+                headers: {
+
+                    "Authorization":
+                        "Bearer " +
+                        SUPABASE_SERVICE_ROLE_KEY,
+
+                    "apikey":
+                        SUPABASE_SERVICE_ROLE_KEY,
+
+                    "Content-Type":
+                        file.mimetype,
+
+                    "x-upsert":
+                        "false"
+                },
+
+                body:
+                    file.buffer
+            }
+        );
+
+
+    if (!response.ok) {
+
+        let errorText = "";
+
+        try {
+
+            errorText =
+                await response.text();
+
+        } catch (error) {
+
+            errorText =
+                "Unknown Supabase Storage error.";
+        }
+
+
+        throw new Error(
+            "Supabase Storage upload failed: " +
+            errorText
+        );
+    }
+
+
+    return {
+        storagePath,
+        fileName
+    };
+}
+
+
+/* =========================================================
+   SUPABASE STORAGE DELETE
+========================================================= */
+
+async function deleteFromSupabaseStorage(
+    storagePath
+) {
+
+    if (
+        !storageConfigured() ||
+        !storagePath
+    ) {
+        return;
+    }
+
+
+    try {
+
+        const deleteUrl =
+            SUPABASE_URL.replace(
+                /\/$/,
+                ""
+            ) +
+            "/storage/v1/object/remove";
+
+
+        const response =
+            await fetch(
+                deleteUrl,
+                {
+                    method: "POST",
+
+                    headers: {
+
+                        "Authorization":
+                            "Bearer " +
+                            SUPABASE_SERVICE_ROLE_KEY,
+
+                        "apikey":
+                            SUPABASE_SERVICE_ROLE_KEY,
+
+                        "Content-Type":
+                            "application/json"
+                    },
+
+                    body:
+                        JSON.stringify({
+                            prefixes: [
+                                PAYMENT_PROOF_BUCKET +
+                                "/" +
+                                storagePath
+                            ]
+                        })
+                }
+            );
+
+
+        if (!response.ok) {
+
+            console.error(
+                "SUPABASE STORAGE DELETE FAILED:",
+                await response.text()
+            );
+        }
+
+    } catch (error) {
+
+        console.error(
+            "SUPABASE STORAGE DELETE ERROR:",
+            error
+        );
+    }
+}
+
+
+/* =========================================================
+   SUPABASE STORAGE SIGNED URL
+========================================================= */
+
+async function createSignedUrl(
+    storagePath,
+    expiresIn = 300
+) {
+
+    if (
+        !storageConfigured() ||
+        !storagePath
+    ) {
+
+        throw new Error(
+            "Supabase Storage is not configured."
+        );
+    }
+
+
+    const signUrl =
+        SUPABASE_URL.replace(
+            /\/$/,
+            ""
+        ) +
+        "/storage/v1/object/sign/" +
+        encodeURIComponent(
+            PAYMENT_PROOF_BUCKET
+        ) +
+        "/" +
+        storagePath
+            .split("/")
+            .map(
+                encodeURIComponent
+            )
+            .join("/");
+
+
+    const response =
+        await fetch(
+            signUrl,
+            {
+                method: "POST",
+
+                headers: {
+
+                    "Authorization":
+                        "Bearer " +
+                        SUPABASE_SERVICE_ROLE_KEY,
+
+                    "apikey":
+                        SUPABASE_SERVICE_ROLE_KEY,
+
+                    "Content-Type":
+                        "application/json"
+                },
+
+                body:
+                    JSON.stringify({
+                        expiresIn:
+                            expiresIn
+                    })
+            }
+        );
+
+
+    if (!response.ok) {
+
+        throw new Error(
+            "Unable to create payment proof URL: " +
+            await response.text()
+        );
+    }
+
+
+    const data =
+        await response.json();
+
+
+    if (!data.signedURL) {
+
+        throw new Error(
+            "Supabase did not return a signed URL."
+        );
+    }
+
+
+    return (
+        SUPABASE_URL.replace(
+            /\/$/,
+            ""
+        ) +
+        "/storage/v1" +
+        data.signedURL
+    );
+}
+
+
+/* =========================================================
+   GET /api/application-payment/proof/:id
+   CUSTOMER / ADMIN
+   OPEN PAYMENT PROOF
+========================================================= */
+
+router.get(
+    "/proof/:id",
+    requireAuth,
+    async (req, res) => {
+
+        try {
+
+            const paymentId =
+                normalizeId(
+                    req.params.id
+                );
+
+
+            if (!paymentId) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "Invalid payment ID."
+                });
+            }
+
+
+            /* -------------------------------------------------
+               PAYMENT + OWNER
+            ------------------------------------------------- */
+
+            const result =
+                await pool.query(
+                    `
+                    SELECT
+                        p.id,
+                        p.proof_file,
+                        a.user_id
+                    FROM payments p
+                    INNER JOIN applications a
+                        ON a.id = p.application_id
+                    WHERE p.id = $1
+                    LIMIT 1
+                    `,
+                    [paymentId]
+                );
+
+
+            if (
+                result.rows.length === 0
+            ) {
+
+                return res.status(404).json({
+
+                    success: false,
+
+                    message:
+                        "Payment not found."
+                });
+            }
+
+
+            const row =
+                result.rows[0];
+
+
+            /* -------------------------------------------------
+               OWNERSHIP
+            ------------------------------------------------- */
+
+            if (
+                req.user.role !== "admin" &&
+                Number(row.user_id) !==
+                    Number(req.user.id)
+            ) {
+
+                return res.status(403).json({
+
+                    success: false,
+
+                    message:
+                        "You are not authorized to view this payment proof."
+                });
+            }
+
+
+            if (!row.proof_file) {
+
+                return res.status(404).json({
+
+                    success: false,
+
+                    message:
+                        "Payment proof not found."
+                });
+            }
+
+
+            /* -------------------------------------------------
+               CREATE TEMPORARY SIGNED URL
+            ------------------------------------------------- */
+
+            const signedUrl =
+                await createSignedUrl(
+                    row.proof_file,
+                    300
+                );
+
+
+            /*
+               Redirecting keeps this endpoint easy to use
+               from an existing frontend/admin link.
+            */
+
+            return res.redirect(
+                signedUrl
+            );
+
+        } catch (error) {
+
+            console.error(
+                "PAYMENT PROOF ERROR:",
+                error
+            );
+
+
+            return res.status(500).json({
+
+                success: false,
+
+                message:
+                    "Unable to open payment proof."
+            });
+        }
+    }
+);
 
 
 /* =========================================================
@@ -159,18 +635,40 @@ router.post(
     async (req, res) => {
 
         let client = null;
-        let uploadedFile = null;
+        let uploadedStoragePath = null;
+
 
         try {
+
+            /* -------------------------------------------------
+               STORAGE CONFIG
+            ------------------------------------------------- */
+
+            if (!storageConfigured()) {
+
+                return res.status(500).json({
+
+                    success: false,
+
+                    message:
+                        "Payment storage is not configured on the server."
+                });
+            }
+
 
             /* -------------------------------------------------
                CUSTOMER ONLY
             ------------------------------------------------- */
 
-            if (req.user.role !== "customer") {
+            if (
+                req.user.role !==
+                "customer"
+            ) {
 
                 return res.status(403).json({
+
                     success: false,
+
                     message:
                         "Only customer accounts can submit payments."
                 });
@@ -191,7 +689,9 @@ router.post(
             if (!applicationId) {
 
                 return res.status(400).json({
+
                     success: false,
+
                     message:
                         "Valid Application ID is required."
                 });
@@ -222,7 +722,9 @@ router.post(
             ) {
 
                 return res.status(400).json({
+
                     success: false,
+
                     message:
                         "Invalid payment method."
                 });
@@ -245,7 +747,9 @@ router.post(
             if (!paymentReference) {
 
                 return res.status(400).json({
+
                     success: false,
+
                     message:
                         "Payment reference is required."
                 });
@@ -269,15 +773,13 @@ router.post(
             if (!req.file) {
 
                 return res.status(400).json({
+
                     success: false,
+
                     message:
                         "Payment proof is required."
                 });
             }
-
-
-            uploadedFile =
-                req.file;
 
 
             /* -------------------------------------------------
@@ -382,15 +884,17 @@ router.post(
 
 
             /* -------------------------------------------------
-               PAYMENT PROOF PATH
+               UPLOAD TO SUPABASE STORAGE
             ------------------------------------------------- */
 
-            const proofFile =
-                path.join(
-                    "data",
-                    "payment-proofs",
-                    req.file.filename
+            const uploaded =
+                await uploadToSupabaseStorage(
+                    req.file
                 );
+
+
+            uploadedStoragePath =
+                uploaded.storagePath;
 
 
             /* -------------------------------------------------
@@ -451,7 +955,7 @@ router.post(
                         paymentMethod,
                         paymentReference,
                         message,
-                        proofFile
+                        uploadedStoragePath
                     ]
                 );
 
@@ -509,8 +1013,14 @@ router.post(
                     message:
                         payment.message,
 
+                    /*
+                       This is now a backend proof endpoint,
+                       not a Render local file path.
+                    */
+
                     proofFile:
-                        payment.proof_file,
+                        "/api/application-payment/proof/" +
+                        Number(payment.id),
 
                     status:
                         payment.status,
@@ -532,9 +1042,11 @@ router.post(
             if (client) {
 
                 try {
+
                     await client.query(
                         "ROLLBACK"
                     );
+
                 } catch (rollbackError) {
 
                     console.error(
@@ -546,31 +1058,14 @@ router.post(
 
 
             /* -------------------------------------------------
-               DELETE UPLOADED FILE IF DB FAILED
+               DELETE SUPABASE FILE IF DB FAILED
             ------------------------------------------------- */
 
-            if (uploadedFile) {
+            if (uploadedStoragePath) {
 
-                try {
-
-                    if (
-                        fs.existsSync(
-                            uploadedFile.path
-                        )
-                    ) {
-
-                        fs.unlinkSync(
-                            uploadedFile.path
-                        );
-                    }
-
-                } catch (fileError) {
-
-                    console.error(
-                        "PAYMENT FILE CLEANUP ERROR:",
-                        fileError
-                    );
-                }
+                await deleteFromSupabaseStorage(
+                    uploadedStoragePath
+                );
             }
 
 
@@ -591,6 +1086,7 @@ router.post(
         } finally {
 
             if (client) {
+
                 client.release();
             }
         }
@@ -619,7 +1115,9 @@ router.get(
             if (!paymentId) {
 
                 return res.status(400).json({
+
                     success: false,
+
                     message:
                         "Invalid payment ID."
                 });
@@ -650,10 +1148,14 @@ router.get(
                 );
 
 
-            if (result.rows.length === 0) {
+            if (
+                result.rows.length === 0
+            ) {
 
                 return res.status(404).json({
+
                     success: false,
+
                     message:
                         "Payment not found."
                 });
@@ -675,7 +1177,9 @@ router.get(
             ) {
 
                 return res.status(403).json({
+
                     success: false,
+
                     message:
                         "You are not authorized to view this payment."
                 });
@@ -704,7 +1208,8 @@ router.get(
                         row.message,
 
                     proofFile:
-                        row.proof_file,
+                        "/api/application-payment/proof/" +
+                        Number(row.id),
 
                     status:
                         row.status,
@@ -724,8 +1229,11 @@ router.get(
                 error
             );
 
+
             return res.status(500).json({
+
                 success: false,
+
                 message:
                     "Unable to load payment."
             });
@@ -755,7 +1263,9 @@ router.get(
             if (!applicationId) {
 
                 return res.status(400).json({
+
                     success: false,
+
                     message:
                         "Invalid Application ID."
                 });
@@ -785,7 +1295,9 @@ router.get(
             ) {
 
                 return res.status(404).json({
+
                     success: false,
+
                     message:
                         "Application not found."
                 });
@@ -803,7 +1315,9 @@ router.get(
             ) {
 
                 return res.status(403).json({
+
                     success: false,
+
                     message:
                         "You are not authorized to view these payments."
                 });
@@ -836,35 +1350,38 @@ router.get(
 
 
             const payments =
-                result.rows.map(row => ({
+                result.rows.map(
+                    row => ({
 
-                    id:
-                        Number(row.id),
+                        id:
+                            Number(row.id),
 
-                    applicationId:
-                        Number(row.application_id),
+                        applicationId:
+                            Number(row.application_id),
 
-                    paymentMethod:
-                        row.payment_method,
+                        paymentMethod:
+                            row.payment_method,
 
-                    paymentReference:
-                        row.payment_reference,
+                        paymentReference:
+                            row.payment_reference,
 
-                    message:
-                        row.message,
+                        message:
+                            row.message,
 
-                    proofFile:
-                        row.proof_file,
+                        proofFile:
+                            "/api/application-payment/proof/" +
+                            Number(row.id),
 
-                    status:
-                        row.status,
+                        status:
+                            row.status,
 
-                    createdAt:
-                        row.created_at,
+                        createdAt:
+                            row.created_at,
 
-                    updatedAt:
-                        row.updated_at
-                }));
+                        updatedAt:
+                            row.updated_at
+                    })
+                );
 
 
             return res.json({
@@ -881,8 +1398,11 @@ router.get(
                 error
             );
 
+
             return res.status(500).json({
+
                 success: false,
+
                 message:
                     "Unable to load application payments."
             });
@@ -926,40 +1446,43 @@ router.get(
 
 
             const payments =
-                result.rows.map(row => ({
+                result.rows.map(
+                    row => ({
 
-                    id:
-                        Number(row.id),
+                        id:
+                            Number(row.id),
 
-                    applicationId:
-                        Number(row.application_id),
+                        applicationId:
+                            Number(row.application_id),
 
-                    userId:
-                        row.user_id !== null
-                            ? Number(row.user_id)
-                            : null,
+                        userId:
+                            row.user_id !== null
+                                ? Number(row.user_id)
+                                : null,
 
-                    paymentMethod:
-                        row.payment_method,
+                        paymentMethod:
+                            row.payment_method,
 
-                    paymentReference:
-                        row.payment_reference,
+                        paymentReference:
+                            row.payment_reference,
 
-                    message:
-                        row.message,
+                        message:
+                            row.message,
 
-                    proofFile:
-                        row.proof_file,
+                        proofFile:
+                            "/api/application-payment/proof/" +
+                            Number(row.id),
 
-                    status:
-                        row.status,
+                        status:
+                            row.status,
 
-                    createdAt:
-                        row.created_at,
+                        createdAt:
+                            row.created_at,
 
-                    updatedAt:
-                        row.updated_at
-                }));
+                        updatedAt:
+                            row.updated_at
+                    })
+                );
 
 
             return res.json({
@@ -976,8 +1499,11 @@ router.get(
                 error
             );
 
+
             return res.status(500).json({
+
                 success: false,
+
                 message:
                     "Unable to load payments."
             });
@@ -1007,7 +1533,9 @@ router.patch(
             if (!paymentId) {
 
                 return res.status(400).json({
+
                     success: false,
+
                     message:
                         "Invalid payment ID."
                 });
@@ -1069,10 +1597,14 @@ router.patch(
                 );
 
 
-            if (result.rows.length === 0) {
+            if (
+                result.rows.length === 0
+            ) {
 
                 return res.status(404).json({
+
                     success: false,
+
                     message:
                         "Payment not found."
                 });
@@ -1110,8 +1642,11 @@ router.patch(
                 error
             );
 
+
             return res.status(500).json({
+
                 success: false,
+
                 message:
                     "Unable to update payment status."
             });
@@ -1128,7 +1663,8 @@ router.use(
     (error, req, res, next) => {
 
         if (
-            error instanceof multer.MulterError
+            error instanceof
+            multer.MulterError
         ) {
 
             if (
@@ -1137,7 +1673,9 @@ router.use(
             ) {
 
                 return res.status(400).json({
+
                     success: false,
+
                     message:
                         "Payment proof must be 5MB or smaller."
                 });
@@ -1145,7 +1683,9 @@ router.use(
 
 
             return res.status(400).json({
+
                 success: false,
+
                 message:
                     error.message
             });
@@ -1161,7 +1701,9 @@ router.use(
         ) {
 
             return res.status(400).json({
+
                 success: false,
+
                 message:
                     error.message
             });
@@ -1177,4 +1719,5 @@ router.use(
    EXPORT
 ========================================================= */
 
-module.exports = router;
+module.exports =
+    router;
