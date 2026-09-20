@@ -1254,28 +1254,52 @@ router.post(
             // PASSWORD CHECK
             // -------------------------------------------------
 
-            const passwordMatches =
-                await bcrypt.compare(
-                    password,
-                    user.password_hash
-                );
+          const passwordMatches =
+    await bcrypt.compare(
+        password,
+        user.password_hash
+    );
 
 
-            if (
-                !passwordMatches
-            ) {
+// -------------------------------------------------
+// SAFE LOGIN DIAGNOSTICS
+// IMPORTANT: Never log password or password hash.
+// -------------------------------------------------
 
-                return res.status(401).json({
+console.log(
+    "AUTH LOGIN CHECK:",
+    {
+        emailFound: true,
+        normalizedEmail: email,
+        userId: Number(user.id),
+        role: user.role,
+        passwordHashExists:
+            Boolean(user.password_hash),
+        passwordHashLength:
+            typeof user.password_hash === "string"
+                ? user.password_hash.length
+                : 0,
+        passwordMatches:
+            passwordMatches
+    }
+);
 
-                    success:
-                        false,
 
-                    message:
-                        "Invalid email or password."
+if (
+    !passwordMatches
+) {
 
-                });
+    return res.status(401).json({
 
-            }
+        success:
+            false,
+
+        message:
+            "Invalid email or password."
+
+    });
+
+}
 
 
             // -------------------------------------------------
