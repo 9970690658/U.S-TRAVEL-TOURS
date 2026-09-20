@@ -1,181 +1,248 @@
-const PAYMENT_ENDPOINT =
-    "https://u-s-travel-tours-1.onrender.com/api/application-payment";
-const express = require("express");
-const router = express.Router();
-const multer = require("multer");
-const path = require("path");
-const fs = require("fs");
+/* =========================================================
+   U.S TRAVEL & TOURS
+   PAYMENT ROUTES
+   PostgreSQL / Supabase Version
 
-const { db } = require("./database");
+   CUSTOMER:
+   - Submit payment details
+   - Upload payment proof
+   - View own payment
+
+   ADMIN:
+   - View all payments
+   - View payment by application
+   - Update payment status
+========================================================= */
+
+const express = require("express");
+const fs = require("fs");
+const path = require("path");
+const multer = require("multer");
+
+const {
+    pool
+} = require("./database");
+
 const {
     requireAuth,
     requireAdmin
 } = require("./auth");
 
-// =========================================================
-// U.S TRAVEL & TOURS
-// PAYMENT BACKEND
-// Bitcoin + PayPal
-// =========================================================
+const router = express.Router();
 
-// ---------------------------------------------------------
-// PAYMENT PROOF UPLOAD DIRECTORY
-// ---------------------------------------------------------
 
-const ROOT_DIR = path.join(__dirname, "..");
-const DATA_DIR = path.join(ROOT_DIR, "data");
-const UPLOAD_DIR = path.join(DATA_DIR, "payment-proofs");
+/* =========================================================
+   PAYMENT PROOF STORAGE
+========================================================= */
 
-if (!fs.existsSync(UPLOAD_DIR)) {
-    fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+const paymentProofDir = path.join(
+    __dirname,
+    "data",
+    "payment-proofs"
+);
+
+if (!fs.existsSync(paymentProofDir)) {
+    fs.mkdirSync(paymentProofDir, {
+        recursive: true
+    });
 }
 
-// ---------------------------------------------------------
-// MULTER STORAGE
-// ---------------------------------------------------------
+
+/* =========================================================
+   MULTER STORAGE
+========================================================= */
 
 const storage = multer.diskStorage({
+
     destination: function (req, file, cb) {
-        cb(null, UPLOAD_DIR);
+        cb(null, paymentProofDir);
     },
 
     filename: function (req, file, cb) {
-        const extension = path.extname(file.originalname).toLowerCase();
+
+        const extension =
+            path.extname(file.originalname)
+                .toLowerCase();
 
         const uniqueName =
-            `payment-${Date.now()}-${Math.round(Math.random() * 1e9)}${extension}`;
+            "payment-" +
+            Date.now() +
+            "-" +
+            Math.random()
+                .toString(36)
+                .substring(2, 10) +
+            extension;
 
         cb(null, uniqueName);
     }
 });
 
-// ---------------------------------------------------------
-// FILE VALIDATION
-// ---------------------------------------------------------
+
+/* =========================================================
+   FILE FILTER
+========================================================= */
+
+function fileFilter(req, file, cb) {
+
+    const allowedTypes = [
+        "image/jpeg",
+        "image/png",
+        "application/pdf"
+    ];
+
+    if (!allowedTypes.includes(file.mimetype)) {
+
+        return cb(
+            new Error(
+                "Only JPG, JPEG, PNG and PDF files are allowed."
+            )
+        );
+    }
+
+    cb(null, true);
+}
+
 
 const upload = multer({
-    storage: storage,
+
+    storage,
+
+    fileFilter,
 
     limits: {
         fileSize: 5 * 1024 * 1024
-    },
-
-    fileFilter: function (req, file, cb) {
-        const allowedExtensions = [
-            ".jpg",
-            ".jpeg",
-            ".png",
-            ".pdf"
-        ];
-
-        const extension =
-            path.extname(file.originalname).toLowerCase();
-
-        if (!allowedExtensions.includes(extension)) {
-            return cb(
-                new Error(
-                    "Only JPG, JPEG, PNG and PDF files are allowed."
-                )
-            );
-        }
-
-        cb(null, true);
     }
 });
 
-// =========================================================
-// SAVE PAYMENT
-// POST /api/application-payment
-// =========================================================
+
+/* =========================================================
+   HELPERS
+========================================================= */
+
+function cleanString(value) {
+
+    if (
+        value === undefined ||
+        value === null
+    ) {
+        return "";
+    }
+
+    return String(value).trim();
+}
+
+
+function normalizeId(value) {
+
+    const id = Number(value);
+
+    if (
+        !Number.isSafeInteger(id) ||
+        id <= 0
+    ) {
+        return null;
+    }
+
+    return id;
+}
+
+
+/* =========================================================
+   POST /api/application-payment
+   CUSTOMER PAYMENT SUBMISSION
+========================================================= */
 
 router.post(
     "/",
     requireAuth,
     upload.single("paymentProof"),
-    (req, res) => {
+    async (req, res) => {
+
+        let client = null;
+        let uploadedFile = null;
 
         try {
 
-            const {
-                application,
-                paymentMethod,
-                paymentReference,
-                message
-            } = req.body;
+            /* -------------------------------------------------
+               CUSTOMER ONLY
+            ------------------------------------------------- */
 
-            // -------------------------------------------------
-            // APPLICATION VALIDATION
-            // -------------------------------------------------
+            if (req.user.role !== "customer") {
 
-            if (!application) {
+                return res.status(403).json({
+                    success: false,
+                    message:
+                        "Only customer accounts can submit payments."
+                });
+            }
 
-                if (req.file) {
-                    fs.unlinkSync(req.file.path);
-                }
+
+            /* -------------------------------------------------
+               APPLICATION ID
+            ------------------------------------------------- */
+
+            const applicationId =
+                normalizeId(
+                    req.body?.applicationId ||
+                    req.body?.application_id
+                );
+
+
+            if (!applicationId) {
 
                 return res.status(400).json({
                     success: false,
                     message:
-                        "Application information is required."
+                        "Valid Application ID is required."
                 });
             }
 
-            let applicationData;
 
-            try {
+            /* -------------------------------------------------
+               PAYMENT METHOD
+            ------------------------------------------------- */
 
-                applicationData =
-                    typeof application === "string"
-                        ? JSON.parse(application)
-                        : application;
+            const paymentMethod =
+                cleanString(
+                    req.body?.paymentMethod ||
+                    req.body?.payment_method
+                ).toLowerCase();
 
-            } catch (error) {
-
-                if (req.file) {
-                    fs.unlinkSync(req.file.path);
-                }
-
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        "Invalid application information."
-                });
-            }
-
-            // -------------------------------------------------
-            // PAYMENT METHOD
-            // -------------------------------------------------
 
             const allowedMethods = [
                 "bitcoin",
                 "paypal"
             ];
 
-            if (!allowedMethods.includes(paymentMethod)) {
 
-                if (req.file) {
-                    fs.unlinkSync(req.file.path);
-                }
+            if (
+                !allowedMethods.includes(
+                    paymentMethod
+                )
+            ) {
 
                 return res.status(400).json({
                     success: false,
                     message:
-                        "Invalid payment method. Use Bitcoin or PayPal."
+                        "Invalid payment method."
                 });
             }
 
-            // -------------------------------------------------
-            // PAYMENT REFERENCE
-            // -------------------------------------------------
 
-            if (
-                !paymentReference ||
-                String(paymentReference).trim() === ""
-            ) {
+            /* -------------------------------------------------
+               PAYMENT REFERENCE
+            ------------------------------------------------- */
 
-                if (req.file) {
-                    fs.unlinkSync(req.file.path);
-                }
+            const paymentReference =
+                cleanString(
+                    req.body?.paymentReference ||
+                    req.body?.payment_reference ||
+                    req.body?.transactionId ||
+                    req.body?.transaction_id
+                );
+
+
+            if (!paymentReference) {
 
                 return res.status(400).json({
                     success: false,
@@ -184,473 +251,372 @@ router.post(
                 });
             }
 
-            const cleanReference =
-                String(paymentReference).trim();
 
-            // -------------------------------------------------
-            // FIND APPLICATION
-            // -------------------------------------------------
+            /* -------------------------------------------------
+               OPTIONAL MESSAGE
+            ------------------------------------------------- */
 
-            let applicationId = null;
+            const message =
+                cleanString(
+                    req.body?.message
+                );
 
-            // Frontend may send applicationId
-            if (applicationData.applicationId) {
 
-                const possibleId =
-                    Number(applicationData.applicationId);
+            /* -------------------------------------------------
+               PAYMENT PROOF
+            ------------------------------------------------- */
 
-                if (
-                    Number.isInteger(possibleId) &&
-                    possibleId > 0
-                ) {
-                    applicationId = possibleId;
-                }
-            }
+            if (!req.file) {
 
-            // -------------------------------------------------
-            // IF NO ID, MATCH USING PASSPORT NUMBER
-            // -------------------------------------------------
-
-            if (!applicationId) {
-
-                const submittedPassport =
-                    String(
-                        applicationData.passportNumber || ""
-                    )
-                    .trim()
-                    .toLowerCase();
-
-                if (submittedPassport) {
-
-                    const applications = db.prepare(`
-                        SELECT
-                            id,
-                            application_data
-                        FROM applications
-                        ORDER BY id DESC
-                    `).all();
-
-                    for (const item of applications) {
-
-                        try {
-
-                            const savedData =
-                                JSON.parse(
-                                    item.application_data
-                                );
-
-                            const savedPassport =
-                                String(
-                                    savedData.passportNumber || ""
-                                )
-                                .trim()
-                                .toLowerCase();
-
-                            if (
-                                savedPassport &&
-                                savedPassport ===
-                                submittedPassport
-                            ) {
-
-                                applicationId = item.id;
-                                break;
-                            }
-
-                        } catch (error) {
-                            // Ignore invalid application JSON
-                        }
-                    }
-                }
-            }
-
-            // -------------------------------------------------
-            // APPLICATION MUST EXIST
-            // -------------------------------------------------
-
-            if (!applicationId) {
-
-                if (req.file) {
-                    fs.unlinkSync(req.file.path);
-                }
-
-                return res.status(404).json({
+                return res.status(400).json({
                     success: false,
                     message:
-                        "Application was not found. Please submit the application again."
+                        "Payment proof is required."
                 });
             }
 
-            const existingApplication = db.prepare(`
-    SELECT
-        id,
-        user_id
-    FROM applications
-    WHERE id = ?
-`).get(applicationId);
 
-if (!existingApplication) {
+            uploadedFile =
+                req.file;
 
-    if (req.file) {
-        fs.unlinkSync(req.file.path);
-    }
 
-    return res.status(404).json({
-        success: false,
-        message: "Application not found."
-    });
-}
+            /* -------------------------------------------------
+               CHECK APPLICATION OWNERSHIP
+            ------------------------------------------------- */
 
-if (
-    req.user.role !== "admin" &&
-    Number(existingApplication.user_id) !== Number(req.user.id)
-) {
+            const applicationResult =
+                await pool.query(
+                    `
+                    SELECT
+                        id,
+                        user_id,
+                        status
+                    FROM applications
+                    WHERE id = $1
+                    LIMIT 1
+                    `,
+                    [applicationId]
+                );
 
-    if (req.file) {
-        fs.unlinkSync(req.file.path);
-    }
 
-    return res.status(403).json({
-        success: false,
-        message:
-            "You are not authorized to submit payment for this application."
-    });
-}
-
-            if (!existingApplication) {
-
-                if (req.file) {
-                    fs.unlinkSync(req.file.path);
-                }
+            if (
+                applicationResult.rows.length === 0
+            ) {
 
                 return res.status(404).json({
+
                     success: false,
+
                     message:
                         "Application not found."
                 });
             }
 
-            // -------------------------------------------------
-            // DUPLICATE PAYMENT REFERENCE CHECK
-            // -------------------------------------------------
 
-            const duplicatePayment = db.prepare(`
-                SELECT
-                    id
-                FROM payments
-                WHERE payment_reference = ?
-            `).get(cleanReference);
+            const application =
+                applicationResult.rows[0];
 
-            if (duplicatePayment) {
 
-                if (req.file) {
-                    fs.unlinkSync(req.file.path);
-                }
+            if (
+                Number(application.user_id) !==
+                Number(req.user.id)
+            ) {
+
+                return res.status(403).json({
+
+                    success: false,
+
+                    message:
+                        "You are not authorized to make payment for this application."
+                });
+            }
+
+
+            /* -------------------------------------------------
+               PREVENT PAYMENT FOR REJECTED APPLICATION
+            ------------------------------------------------- */
+
+            if (
+                application.status ===
+                "rejected"
+            ) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "Payment cannot be submitted for a rejected application."
+                });
+            }
+
+
+            /* -------------------------------------------------
+               CHECK DUPLICATE PAYMENT REFERENCE
+            ------------------------------------------------- */
+
+            const duplicateResult =
+                await pool.query(
+                    `
+                    SELECT id
+                    FROM payments
+                    WHERE payment_reference = $1
+                    LIMIT 1
+                    `,
+                    [paymentReference]
+                );
+
+
+            if (
+                duplicateResult.rows.length > 0
+            ) {
 
                 return res.status(409).json({
+
                     success: false,
+
                     message:
                         "This payment reference has already been submitted."
                 });
             }
 
-            // -------------------------------------------------
-            // PAYMENT PROOF FILE
-            // -------------------------------------------------
 
-            let proofFile = null;
+            /* -------------------------------------------------
+               PAYMENT PROOF PATH
+            ------------------------------------------------- */
 
-            if (req.file) {
-                proofFile = req.file.filename;
-            }
+            const proofFile =
+                path.join(
+                    "data",
+                    "payment-proofs",
+                    req.file.filename
+                );
 
-            // -------------------------------------------------
-            // DATABASE TRANSACTION
-            // -------------------------------------------------
 
-            const savePayment = db.transaction(() => {
+            /* -------------------------------------------------
+               TRANSACTION
+            ------------------------------------------------- */
 
-                const insertPayment = db.prepare(`
-                    INSERT INTO payments (
+            client =
+                await pool.connect();
+
+
+            await client.query(
+                "BEGIN"
+            );
+
+
+            /* -------------------------------------------------
+               INSERT PAYMENT
+            ------------------------------------------------- */
+
+            const paymentResult =
+                await client.query(
+                    `
+                    INSERT INTO payments
+                    (
                         application_id,
                         payment_method,
                         payment_reference,
                         message,
                         proof_file,
-                        status
+                        status,
+                        created_at,
+                        updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?)
-                `);
-
-                const paymentResult =
-                    insertPayment.run(
+                    VALUES
+                    (
+                        $1,
+                        $2,
+                        $3,
+                        $4,
+                        $5,
+                        'pending',
+                        CURRENT_TIMESTAMP,
+                        CURRENT_TIMESTAMP
+                    )
+                    RETURNING
+                        id,
+                        application_id,
+                        payment_method,
+                        payment_reference,
+                        message,
+                        proof_file,
+                        status,
+                        created_at,
+                        updated_at
+                    `,
+                    [
                         applicationId,
                         paymentMethod,
-                        cleanReference,
-                        message
-                            ? String(message).trim()
-                            : null,
-                        proofFile,
-                        "pending"
-                    );
-
-                const paymentId =
-                    paymentResult.lastInsertRowid;
-
-                db.prepare(`
-                    UPDATE applications
-                    SET
-                        status = ?,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                `).run(
-                    "payment_submitted",
-                    applicationId
+                        paymentReference,
+                        message,
+                        proofFile
+                    ]
                 );
 
-                return paymentId;
-            });
 
-            const paymentId = savePayment();
+            const payment =
+                paymentResult.rows[0];
 
-            // -------------------------------------------------
-            // SUCCESS LOG
-            // -------------------------------------------------
 
-            console.log(
-                "----------------------------------------------"
+            /* -------------------------------------------------
+               UPDATE APPLICATION STATUS
+            ------------------------------------------------- */
+
+            await client.query(
+                `
+                UPDATE applications
+                SET
+                    status = 'payment_submitted',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = $1
+                `,
+                [applicationId]
             );
 
-            console.log(
-                `Payment submitted successfully.`
+
+            await client.query(
+                "COMMIT"
             );
 
-            console.log(
-                `Payment ID: ${paymentId}`
-            );
 
-            console.log(
-                `Application ID: ${applicationId}`
-            );
-
-            console.log(
-                `Payment Method: ${paymentMethod}`
-            );
-
-            console.log(
-                "----------------------------------------------"
-            );
-
-            // -------------------------------------------------
-            // RESPONSE
-            // -------------------------------------------------
+            /* -------------------------------------------------
+               SUCCESS
+            ------------------------------------------------- */
 
             return res.status(201).json({
 
                 success: true,
 
                 message:
-    "Payment details submitted successfully. Your payment is pending verification.",
+                    "Payment details submitted successfully.",
 
-                paymentId: paymentId,
+                payment: {
 
-                applicationId: applicationId,
+                    id:
+                        Number(payment.id),
 
-                paymentMethod: paymentMethod,
+                    applicationId:
+                        Number(payment.application_id),
 
-                status: "pending"
+                    paymentMethod:
+                        payment.payment_method,
+
+                    paymentReference:
+                        payment.payment_reference,
+
+                    message:
+                        payment.message,
+
+                    proofFile:
+                        payment.proof_file,
+
+                    status:
+                        payment.status,
+
+                    createdAt:
+                        payment.created_at,
+
+                    updatedAt:
+                        payment.updated_at
+                }
             });
 
         } catch (error) {
 
-            console.error(
-                "Payment submission error:",
-                error
-            );
+            /* -------------------------------------------------
+               ROLLBACK
+            ------------------------------------------------- */
 
-            // Remove uploaded file if database operation fails
-            if (req.file) {
+            if (client) {
 
                 try {
-                    if (fs.existsSync(req.file.path)) {
-                        fs.unlinkSync(req.file.path);
-                    }
-                } catch (fileError) {
+                    await client.query(
+                        "ROLLBACK"
+                    );
+                } catch (rollbackError) {
+
                     console.error(
-                        "Unable to remove uploaded payment proof:",
+                        "PAYMENT ROLLBACK ERROR:",
+                        rollbackError
+                    );
+                }
+            }
+
+
+            /* -------------------------------------------------
+               DELETE UPLOADED FILE IF DB FAILED
+            ------------------------------------------------- */
+
+            if (uploadedFile) {
+
+                try {
+
+                    if (
+                        fs.existsSync(
+                            uploadedFile.path
+                        )
+                    ) {
+
+                        fs.unlinkSync(
+                            uploadedFile.path
+                        );
+                    }
+
+                } catch (fileError) {
+
+                    console.error(
+                        "PAYMENT FILE CLEANUP ERROR:",
                         fileError
                     );
                 }
             }
 
-            return res.status(500).json({
-                success: false,
-                message:
-                    "Unable to submit payment details. Please try again."
-            });
-        }
-    }
-);
-
-// =========================================================
-// GET PAYMENT BY ID
-// GET /api/payments/:id
-// =========================================================
-
-router.get("/:id", requireAuth, (req, res) => {
-
-    try {
-
-        const paymentId =
-            Number(req.params.id);
-
-        if (
-            !Number.isInteger(paymentId) ||
-            paymentId <= 0
-        ) {
-
-            return res.status(400).json({
-                success: false,
-                message:
-                    "Invalid payment ID."
-            });
-        }
-
-        const payment = db.prepare(`
-            SELECT
-                id,
-                application_id,
-                payment_method,
-                payment_reference,
-                message,
-                proof_file,
-                status,
-                created_at,
-                updated_at
-            FROM payments
-            WHERE id = ?
-        `).get(paymentId);
-
-        if (!payment) {
-
-            return res.status(404).json({
-                success: false,
-                message:
-                    "Payment not found."
-            });
-        }
-
-        return res.json({
-            success: true,
-            payment: payment
-        });
-
-    } catch (error) {
-
-        console.error(
-            "Get payment error:",
-            error
-        );
-
-        return res.status(500).json({
-            success: false,
-            message:
-                "Unable to retrieve payment."
-        });
-    }
-});
-
-// =========================================================
-// GET PAYMENTS FOR APPLICATION
-// GET /api/payments/application/:applicationId
-// =========================================================
-
-router.get(
-    "/application/:applicationId",
-    requireAuth,
-    (req, res) => {
-
-        try {
-
-            const applicationId =
-                Number(req.params.applicationId);
-
-            if (
-                !Number.isInteger(applicationId) ||
-                applicationId <= 0
-            ) {
-
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        "Invalid application ID."
-                });
-            }
-
-            const payments = db.prepare(`
-                SELECT
-                    id,
-                    application_id,
-                    payment_method,
-                    payment_reference,
-                    message,
-                    proof_file,
-                    status,
-                    created_at,
-                    updated_at
-                FROM payments
-                WHERE application_id = ?
-                ORDER BY created_at DESC
-            `).all(applicationId);
-
-            return res.json({
-                success: true,
-                count: payments.length,
-                payments: payments
-            });
-
-        } catch (error) {
 
             console.error(
-                "Get application payments error:",
+                "PAYMENT SUBMISSION ERROR:",
                 error
             );
 
+
             return res.status(500).json({
+
                 success: false,
+
                 message:
-                    "Unable to retrieve application payments."
+                    "Unable to submit payment details."
             });
+
+        } finally {
+
+            if (client) {
+                client.release();
+            }
         }
     }
 );
 
-// =========================================================
-// UPDATE PAYMENT STATUS
-// PATCH /api/payments/:id/status
-// =========================================================
 
-router.patch(
-    "/:id/status",
-    requireAdmin,
-    (req, res) => {
+/* =========================================================
+   GET /api/application-payment/:id
+   CUSTOMER / ADMIN - SINGLE PAYMENT
+========================================================= */
+
+router.get(
+    "/:id",
+    requireAuth,
+    async (req, res) => {
 
         try {
 
             const paymentId =
-                Number(req.params.id);
+                normalizeId(
+                    req.params.id
+                );
 
-            const { status } = req.body;
 
-            const allowedStatuses = [
-                "pending",
-                "verified",
-                "rejected"
-            ];
-
-            if (
-                !Number.isInteger(paymentId) ||
-                paymentId <= 0
-            ) {
+            if (!paymentId) {
 
                 return res.status(400).json({
                     success: false,
@@ -659,23 +625,32 @@ router.patch(
                 });
             }
 
-            if (!allowedStatuses.includes(status)) {
 
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        "Invalid payment status."
-                });
-            }
+            const result =
+                await pool.query(
+                    `
+                    SELECT
+                        p.id,
+                        p.application_id,
+                        p.payment_method,
+                        p.payment_reference,
+                        p.message,
+                        p.proof_file,
+                        p.status,
+                        p.created_at,
+                        p.updated_at,
+                        a.user_id
+                    FROM payments p
+                    INNER JOIN applications a
+                        ON a.id = p.application_id
+                    WHERE p.id = $1
+                    LIMIT 1
+                    `,
+                    [paymentId]
+                );
 
-            const payment = db.prepare(`
-                SELECT
-                    application_id
-                FROM payments
-                WHERE id = ?
-            `).get(paymentId);
 
-            if (!payment) {
+            if (result.rows.length === 0) {
 
                 return res.status(404).json({
                     success: false,
@@ -684,61 +659,454 @@ router.patch(
                 });
             }
 
-            let applicationStatus =
-                "payment_submitted";
 
-            if (status === "verified") {
-                applicationStatus =
-                    "under_review";
-            }
+            const row =
+                result.rows[0];
 
-            if (status === "rejected") {
-                applicationStatus =
-                    "payment_pending";
-            }
 
-            const updatePayment =
-                db.transaction(() => {
+            /* -------------------------------------------------
+               OWNERSHIP
+            ------------------------------------------------- */
 
-                    db.prepare(`
-                        UPDATE payments
-                        SET
-                            status = ?,
-                            updated_at = CURRENT_TIMESTAMP
-                        WHERE id = ?
-                    `).run(
-                        status,
-                        paymentId
-                    );
+            if (
+                req.user.role !== "admin" &&
+                Number(row.user_id) !==
+                    Number(req.user.id)
+            ) {
 
-                    db.prepare(`
-                        UPDATE applications
-                        SET
-                            status = ?,
-                            updated_at = CURRENT_TIMESTAMP
-                        WHERE id = ?
-                    `).run(
-                        applicationStatus,
-                        payment.application_id
-                    );
+                return res.status(403).json({
+                    success: false,
+                    message:
+                        "You are not authorized to view this payment."
                 });
+            }
 
-            updatePayment();
 
             return res.json({
+
                 success: true,
-                message:
-                    "Payment status updated successfully.",
-                paymentId: paymentId,
-                status: status,
-                applicationStatus:
-                    applicationStatus
+
+                payment: {
+
+                    id:
+                        Number(row.id),
+
+                    applicationId:
+                        Number(row.application_id),
+
+                    paymentMethod:
+                        row.payment_method,
+
+                    paymentReference:
+                        row.payment_reference,
+
+                    message:
+                        row.message,
+
+                    proofFile:
+                        row.proof_file,
+
+                    status:
+                        row.status,
+
+                    createdAt:
+                        row.created_at,
+
+                    updatedAt:
+                        row.updated_at
+                }
             });
 
         } catch (error) {
 
             console.error(
-                "Update payment status error:",
+                "GET PAYMENT ERROR:",
+                error
+            );
+
+            return res.status(500).json({
+                success: false,
+                message:
+                    "Unable to load payment."
+            });
+        }
+    }
+);
+
+
+/* =========================================================
+   GET /api/application-payment/application/:id
+   CUSTOMER / ADMIN - PAYMENTS FOR APPLICATION
+========================================================= */
+
+router.get(
+    "/application/:id",
+    requireAuth,
+    async (req, res) => {
+
+        try {
+
+            const applicationId =
+                normalizeId(
+                    req.params.id
+                );
+
+
+            if (!applicationId) {
+
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        "Invalid Application ID."
+                });
+            }
+
+
+            /* -------------------------------------------------
+               APPLICATION
+            ------------------------------------------------- */
+
+            const applicationResult =
+                await pool.query(
+                    `
+                    SELECT
+                        id,
+                        user_id
+                    FROM applications
+                    WHERE id = $1
+                    LIMIT 1
+                    `,
+                    [applicationId]
+                );
+
+
+            if (
+                applicationResult.rows.length === 0
+            ) {
+
+                return res.status(404).json({
+                    success: false,
+                    message:
+                        "Application not found."
+                });
+            }
+
+
+            const application =
+                applicationResult.rows[0];
+
+
+            if (
+                req.user.role !== "admin" &&
+                Number(application.user_id) !==
+                    Number(req.user.id)
+            ) {
+
+                return res.status(403).json({
+                    success: false,
+                    message:
+                        "You are not authorized to view these payments."
+                });
+            }
+
+
+            /* -------------------------------------------------
+               PAYMENTS
+            ------------------------------------------------- */
+
+            const result =
+                await pool.query(
+                    `
+                    SELECT
+                        id,
+                        application_id,
+                        payment_method,
+                        payment_reference,
+                        message,
+                        proof_file,
+                        status,
+                        created_at,
+                        updated_at
+                    FROM payments
+                    WHERE application_id = $1
+                    ORDER BY created_at DESC
+                    `,
+                    [applicationId]
+                );
+
+
+            const payments =
+                result.rows.map(row => ({
+
+                    id:
+                        Number(row.id),
+
+                    applicationId:
+                        Number(row.application_id),
+
+                    paymentMethod:
+                        row.payment_method,
+
+                    paymentReference:
+                        row.payment_reference,
+
+                    message:
+                        row.message,
+
+                    proofFile:
+                        row.proof_file,
+
+                    status:
+                        row.status,
+
+                    createdAt:
+                        row.created_at,
+
+                    updatedAt:
+                        row.updated_at
+                }));
+
+
+            return res.json({
+
+                success: true,
+
+                payments
+            });
+
+        } catch (error) {
+
+            console.error(
+                "GET APPLICATION PAYMENTS ERROR:",
+                error
+            );
+
+            return res.status(500).json({
+                success: false,
+                message:
+                    "Unable to load application payments."
+            });
+        }
+    }
+);
+
+
+/* =========================================================
+   GET /api/application-payment
+   ADMIN - ALL PAYMENTS
+========================================================= */
+
+router.get(
+    "/",
+    requireAdmin,
+    async (req, res) => {
+
+        try {
+
+            const result =
+                await pool.query(
+                    `
+                    SELECT
+                        p.id,
+                        p.application_id,
+                        p.payment_method,
+                        p.payment_reference,
+                        p.message,
+                        p.proof_file,
+                        p.status,
+                        p.created_at,
+                        p.updated_at,
+                        a.user_id
+                    FROM payments p
+                    LEFT JOIN applications a
+                        ON a.id = p.application_id
+                    ORDER BY p.created_at DESC
+                    `
+                );
+
+
+            const payments =
+                result.rows.map(row => ({
+
+                    id:
+                        Number(row.id),
+
+                    applicationId:
+                        Number(row.application_id),
+
+                    userId:
+                        row.user_id !== null
+                            ? Number(row.user_id)
+                            : null,
+
+                    paymentMethod:
+                        row.payment_method,
+
+                    paymentReference:
+                        row.payment_reference,
+
+                    message:
+                        row.message,
+
+                    proofFile:
+                        row.proof_file,
+
+                    status:
+                        row.status,
+
+                    createdAt:
+                        row.created_at,
+
+                    updatedAt:
+                        row.updated_at
+                }));
+
+
+            return res.json({
+
+                success: true,
+
+                payments
+            });
+
+        } catch (error) {
+
+            console.error(
+                "GET ALL PAYMENTS ERROR:",
+                error
+            );
+
+            return res.status(500).json({
+                success: false,
+                message:
+                    "Unable to load payments."
+            });
+        }
+    }
+);
+
+
+/* =========================================================
+   PATCH /api/application-payment/:id/status
+   ADMIN - UPDATE PAYMENT STATUS
+========================================================= */
+
+router.patch(
+    "/:id/status",
+    requireAdmin,
+    async (req, res) => {
+
+        try {
+
+            const paymentId =
+                normalizeId(
+                    req.params.id
+                );
+
+
+            if (!paymentId) {
+
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        "Invalid payment ID."
+                });
+            }
+
+
+            const status =
+                cleanString(
+                    req.body?.status
+                ).toLowerCase();
+
+
+            const allowedStatuses = [
+                "pending",
+                "submitted",
+                "under_review",
+                "approved",
+                "rejected",
+                "completed"
+            ];
+
+
+            if (
+                !allowedStatuses.includes(
+                    status
+                )
+            ) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    message:
+                        "Invalid payment status.",
+
+                    allowedStatuses
+                });
+            }
+
+
+            const result =
+                await pool.query(
+                    `
+                    UPDATE payments
+                    SET
+                        status = $1,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = $2
+                    RETURNING
+                        id,
+                        application_id,
+                        status,
+                        updated_at
+                    `,
+                    [
+                        status,
+                        paymentId
+                    ]
+                );
+
+
+            if (result.rows.length === 0) {
+
+                return res.status(404).json({
+                    success: false,
+                    message:
+                        "Payment not found."
+                });
+            }
+
+
+            const payment =
+                result.rows[0];
+
+
+            return res.json({
+
+                success: true,
+
+                message:
+                    "Payment status updated successfully.",
+
+                paymentId:
+                    Number(payment.id),
+
+                applicationId:
+                    Number(payment.application_id),
+
+                status:
+                    payment.status,
+
+                updatedAt:
+                    payment.updated_at
+            });
+
+        } catch (error) {
+
+            console.error(
+                "UPDATE PAYMENT STATUS ERROR:",
                 error
             );
 
@@ -751,90 +1119,62 @@ router.patch(
     }
 );
 
-// =========================================================
-// GET ALL PAYMENTS
-// GET /api/payments
-// =========================================================
 
-router.get("/", requireAdmin, (req, res) => {
+/* =========================================================
+   ERROR HANDLER FOR MULTER
+========================================================= */
 
-    try {
+router.use(
+    (error, req, res, next) => {
 
-        const payments = db.prepare(`
-            SELECT
-                p.id,
-                p.application_id,
-                p.payment_method,
-                p.payment_reference,
-                p.message,
-                p.proof_file,
-                p.status,
-                p.created_at,
-                p.updated_at
-            FROM payments p
-            ORDER BY p.created_at DESC
-        `).all();
+        if (
+            error instanceof multer.MulterError
+        ) {
 
-        return res.json({
-            success: true,
-            count: payments.length,
-            payments: payments
-        });
+            if (
+                error.code ===
+                "LIMIT_FILE_SIZE"
+            ) {
 
-    } catch (error) {
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        "Payment proof must be 5MB or smaller."
+                });
+            }
 
-        console.error(
-            "Get payments error:",
-            error
-        );
-
-        return res.status(500).json({
-            success: false,
-            message:
-                "Unable to retrieve payments."
-        });
-    }
-});
-
-// =========================================================
-// MULTER ERROR HANDLER
-// =========================================================
-
-router.use((error, req, res, next) => {
-
-    if (error instanceof multer.MulterError) {
-
-        if (error.code === "LIMIT_FILE_SIZE") {
 
             return res.status(400).json({
                 success: false,
                 message:
-                    "Payment proof must be 5MB or smaller."
+                    error.message
             });
         }
 
-        return res.status(400).json({
-            success: false,
-            message:
-                "Payment proof upload failed."
-        });
+
+        if (
+            error &&
+            error.message &&
+            error.message.includes(
+                "Only JPG"
+            )
+        ) {
+
+            return res.status(400).json({
+                success: false,
+                message:
+                    error.message
+            });
+        }
+
+
+        next(error);
     }
+);
 
-    if (error) {
 
-        return res.status(400).json({
-            success: false,
-            message:
-                error.message ||
-                "Payment request failed."
-        });
-    }
-
-    next();
-});
-
-// =========================================================
-// EXPORT
-// =========================================================
+/* =========================================================
+   EXPORT
+========================================================= */
 
 module.exports = router;
