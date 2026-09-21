@@ -58,6 +58,10 @@ const SMTP_PASS =
     process.env.SMTP_PASS ||
     "";
 
+    const FROM_EMAIL =
+    process.env.FROM_EMAIL ||
+    OWNER_EMAIL;
+
 
 /* =========================================================
    SMTP TRANSPORTER
