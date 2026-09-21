@@ -1,29 +1,32 @@
 /* =========================================================
    U.S TRAVEL & TOURS
-   CONTACT MESSAGE ROUTES
-   PostgreSQL / Supabase Version
+   CONTACT MESSAGE MODULE
 
-   PUBLIC:
-   - Submit contact message
+   FLOW:
 
-   ADMIN:
-   - View all contact messages
-   - View single message
-   - Change message status
-   - Reply to customer
-   - Delete message
-
-   IMPORTANT:
-   - No SQLite
-   - Contact messages permanently stored in PostgreSQL
+   CUSTOMER
+      ↓
+   POST /api/contact
+      ↓
+   PostgreSQL contact_messages
+      ↓
+   ADMIN DASHBOARD
+      ↓
+   GET /api/contact/messages
+      ↓
+   ADMIN REPLY
+      ↓
+   POST /api/contact/messages/:id/reply
+      ↓
+   BREVO SMTP
+      ↓
+   CUSTOMER EMAIL
 ========================================================= */
 
 const express = require("express");
 const nodemailer = require("nodemailer");
 
-const {
-    pool
-} = require("./database");
+const { pool } = require("./database");
 
 const {
     requireAuth,
@@ -33,9 +36,9 @@ const {
 const router = express.Router();
 
 
-/* =========================================================
-   CONFIGURATION
-========================================================= */
+// =========================================================
+// CONFIGURATION
+// =========================================================
 
 const OWNER_EMAIL =
     process.env.OWNER_EMAIL ||
@@ -50,6 +53,11 @@ const SMTP_PORT =
         process.env.SMTP_PORT || 587
     );
 
+const SMTP_SECURE =
+    String(
+        process.env.SMTP_SECURE || ""
+    ).toLowerCase() === "true";
+
 const SMTP_USER =
     process.env.SMTP_USER ||
     "";
@@ -58,285 +66,672 @@ const SMTP_PASS =
     process.env.SMTP_PASS ||
     "";
 
-    const FROM_EMAIL =
-    process.env.FROM_EMAIL ||
+
+/*
+   IMPORTANT:
+
+   Use the same MAIL_FROM pattern that was working
+   in the previous contact module.
+
+   If MAIL_FROM is not present in Render,
+   SMTP_USER will be used automatically.
+*/
+
+const MAIL_FROM =
+    process.env.MAIL_FROM ||
+    SMTP_USER ||
     OWNER_EMAIL;
 
 
-/* =========================================================
-   SMTP TRANSPORTER
-========================================================= */
+// =========================================================
+// SMTP LOGGING
+// =========================================================
 
-const transporter =
-    nodemailer.createTransport({
+console.log(
+    "========================================================="
+);
 
-        host: SMTP_HOST,
+console.log(
+    "CONTACT MODULE SMTP CONFIG"
+);
 
-        port: SMTP_PORT,
+console.log(
+    "SMTP_HOST:",
+    SMTP_HOST
+);
 
-        secure:
-            SMTP_PORT === 465,
+console.log(
+    "SMTP_PORT:",
+    SMTP_PORT
+);
 
-        auth: {
+console.log(
+    "SMTP_SECURE:",
+    SMTP_SECURE
+);
 
-            user: SMTP_USER,
+console.log(
+    "SMTP_USER:",
+    SMTP_USER
+        ? "Configured"
+        : "MISSING"
+);
 
-            pass: SMTP_PASS
+console.log(
+    "SMTP_PASS:",
+    SMTP_PASS
+        ? "Configured"
+        : "MISSING"
+);
+
+console.log(
+    "MAIL_FROM:",
+    MAIL_FROM
+);
+
+console.log(
+    "OWNER_EMAIL:",
+    OWNER_EMAIL
+);
+
+console.log(
+    "========================================================="
+);
+
+
+// =========================================================
+// SMTP TRANSPORTER
+// =========================================================
+
+let transporter = null;
+
+if (
+    SMTP_USER &&
+    SMTP_PASS
+) {
+
+    transporter =
+        nodemailer.createTransport({
+
+            host:
+                SMTP_HOST,
+
+            port:
+                SMTP_PORT,
+
+            secure:
+                SMTP_SECURE,
+
+            auth: {
+
+                user:
+                    SMTP_USER,
+
+                pass:
+                    SMTP_PASS
+
+            },
+
+            connectionTimeout:
+                15000,
+
+            greetingTimeout:
+                15000,
+
+            socketTimeout:
+                30000
+
+        });
+
+
+    transporter.verify(
+        function (
+            error,
+            success
+        ) {
+
+            if (error) {
+
+                console.error(
+                    "========================================================="
+                );
+
+                console.error(
+                    "SMTP VERIFICATION FAILED"
+                );
+
+                console.error(
+                    "Error name:",
+                    error?.name
+                );
+
+                console.error(
+                    "Error code:",
+                    error?.code
+                );
+
+                console.error(
+                    "Error command:",
+                    error?.command
+                );
+
+                console.error(
+                    "Error response:",
+                    error?.response
+                );
+
+                console.error(
+                    "Error message:",
+                    error?.message
+                );
+
+                console.error(
+                    "========================================================="
+                );
+
+            } else {
+
+                console.log(
+                    "Brevo SMTP connection verified successfully."
+                );
+
+            }
+
         }
-    });
+    );
 
+} else {
 
-/* =========================================================
-   HELPERS
-========================================================= */
+    console.error(
+        "========================================================="
+    );
 
-function cleanString(value) {
+    console.error(
+        "SMTP NOT CONFIGURED"
+    );
 
-    if (
-        value === undefined ||
-        value === null
-    ) {
-        return "";
-    }
+    console.error(
+        "SMTP_USER or SMTP_PASS is missing."
+    );
 
-    return String(value).trim();
+    console.error(
+        "Contact replies cannot be sent until SMTP is configured."
+    );
+
+    console.error(
+        "========================================================="
+    );
+
 }
 
 
-function normalizeId(value) {
+// =========================================================
+// HELPERS
+// =========================================================
+
+function cleanString(
+    value,
+    maxLength
+) {
+
+    return String(
+        value ?? ""
+    )
+        .replace(/\0/g, "")
+        .trim()
+        .slice(
+            0,
+            maxLength
+        );
+}
+
+
+function normalizeId(
+    value
+) {
 
     const id =
         Number(value);
 
     if (
-        !Number.isSafeInteger(id) ||
+        !Number.isInteger(id) ||
         id <= 0
     ) {
+
         return null;
+
     }
 
     return id;
 }
 
 
-/* =========================================================
-   POST /api/contact
-   PUBLIC CONTACT FORM
-========================================================= */
+function isValidEmail(
+    email
+) {
+
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(
+        email
+    );
+
+}
+
+
+function escapeHtml(
+    value
+) {
+
+    return String(
+        value ?? ""
+    )
+        .replace(
+            /&/g,
+            "&amp;"
+        )
+        .replace(
+            /</g,
+            "&lt;"
+        )
+        .replace(
+            />/g,
+            "&gt;"
+        )
+        .replace(
+            /"/g,
+            "&quot;"
+        )
+        .replace(
+            /'/g,
+            "&#039;"
+        );
+
+}
+
+
+function formatDate(
+    value
+) {
+
+    if (!value) {
+
+        return "";
+
+    }
+
+    try {
+
+        return new Date(
+            value
+        ).toLocaleString(
+            "en-IN",
+            {
+                dateStyle:
+                    "medium",
+                timeStyle:
+                    "short"
+            }
+        );
+
+    } catch {
+
+        return String(
+            value
+        );
+
+    }
+
+}
+
+
+// =========================================================
+// SEND NEW CONTACT MESSAGE TO OWNER
+// =========================================================
+
+async function sendOwnerEmail(
+    contact
+) {
+
+    if (!transporter) {
+
+        throw new Error(
+            "SMTP transporter is not configured."
+        );
+
+    }
+
+
+    const subject =
+        contact.subject
+            ? `New Contact Enquiry: ${contact.subject}`
+            : "New Contact Enquiry - U.S TRAVEL & TOURS";
+
+
+    const text =
+`New Contact Enquiry
+
+Name: ${contact.name}
+
+Email: ${contact.email}
+
+Phone: ${contact.phone}
+
+Service: ${contact.service}
+
+Subject: ${contact.subject || "—"}
+
+Message:
+${contact.message}
+
+Received:
+${formatDate(contact.created_at)}
+`;
+
+
+    const html =
+`
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta charset="UTF-8">
+
+<title>New Contact Enquiry</title>
+
+</head>
+
+<body
+    style="
+        margin:0;
+        padding:30px;
+        background:#f5f6f8;
+        font-family:Arial,sans-serif;
+        color:#182235;
+    "
+>
+
+<div
+    style="
+        max-width:700px;
+        margin:0 auto;
+        background:#ffffff;
+        border-radius:12px;
+        padding:30px;
+        border:1px solid #e5e7eb;
+    "
+>
+
+<h2
+    style="
+        margin-top:0;
+        color:#182235;
+    "
+>
+New Contact Enquiry
+</h2>
+
+<p>
+<strong>Name:</strong>
+${escapeHtml(contact.name)}
+</p>
+
+<p>
+<strong>Email:</strong>
+${escapeHtml(contact.email)}
+</p>
+
+<p>
+<strong>Phone:</strong>
+${escapeHtml(contact.phone)}
+</p>
+
+<p>
+<strong>Service:</strong>
+${escapeHtml(contact.service)}
+</p>
+
+<p>
+<strong>Subject:</strong>
+${escapeHtml(contact.subject || "—")}
+</p>
+
+<div
+    style="
+        margin-top:20px;
+        padding:18px;
+        background:#f7f8fa;
+        border-radius:8px;
+        line-height:1.7;
+    "
+>
+
+<strong>Message</strong>
+
+<p>
+${escapeHtml(
+    contact.message
+).replace(
+    /\n/g,
+    "<br>"
+)}
+</p>
+
+</div>
+
+<p
+    style="
+        margin-top:25px;
+        color:#777;
+        font-size:13px;
+    "
+>
+Received:
+${escapeHtml(
+    formatDate(contact.created_at)
+)}
+</p>
+
+</div>
+
+</body>
+
+</html>
+`;
+
+
+    return transporter.sendMail({
+
+        from:
+            MAIL_FROM,
+
+        to:
+            OWNER_EMAIL,
+
+        replyTo:
+            contact.email,
+
+        subject:
+            subject,
+
+        text:
+            text,
+
+        html:
+            html
+
+    });
+
+}
+
+
+// =========================================================
+// CUSTOMER CONTACT FORM
+//
+// POST /api/contact
+// =========================================================
 
 router.post(
     "/",
-    async (req, res) => {
+    async function (
+        req,
+        res
+    ) {
 
         try {
 
-            /* -------------------------------------------------
-               READ FORM DATA
-            ------------------------------------------------- */
-
             const name =
                 cleanString(
-                    req.body?.name
+                    req.body?.name,
+                    120
                 );
 
             const email =
                 cleanString(
-                    req.body?.email
-                );
+                    req.body?.email,
+                    180
+                ).toLowerCase();
 
             const phone =
                 cleanString(
-                    req.body?.phone
+                    req.body?.phone,
+                    30
                 );
 
             const service =
                 cleanString(
-                    req.body?.service
+                    req.body?.service,
+                    150
                 );
 
             const subject =
                 cleanString(
-                    req.body?.subject
+                    req.body?.subject,
+                    250
                 );
 
             const message =
                 cleanString(
-                    req.body?.message
+                    req.body?.message,
+                    5000
                 );
 
             const consent =
-                req.body?.consent === true ||
-                req.body?.consent === "true" ||
-                req.body?.consent === "1" ||
-                req.body?.consent === 1;
+                Boolean(
+                    req.body?.consent
+                );
 
 
-            /* -------------------------------------------------
-               REQUIRED FIELD VALIDATION
-            ------------------------------------------------- */
-
-            const missingFields = [];
-
+            // -------------------------------------------------
+            // VALIDATION
+            // -------------------------------------------------
 
             if (!name) {
-                missingFields.push("name");
-            }
-
-            if (!email) {
-                missingFields.push("email");
-            }
-
-            if (!phone) {
-                missingFields.push("phone");
-            }
-
-            if (!service) {
-                missingFields.push("service");
-            }
-
-            if (!message) {
-                missingFields.push("message");
-            }
-
-
-            if (missingFields.length > 0) {
 
                 return res.status(400).json({
 
-                    success: false,
+                    success:
+                        false,
 
                     message:
-                        "Please complete all required fields.",
+                        "Please enter your name."
 
-                    missingFields
                 });
+
             }
 
 
-            /* -------------------------------------------------
-               EMAIL VALIDATION
-            ------------------------------------------------- */
-
-            const emailPattern =
-                /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
-
             if (
-                !emailPattern.test(email)
+                !email ||
+                !isValidEmail(email)
             ) {
 
                 return res.status(400).json({
 
-                    success: false,
+                    success:
+                        false,
 
                     message:
                         "Please enter a valid email address."
+
                 });
+
             }
 
 
-            /* -------------------------------------------------
-               CONSENT VALIDATION
-            ------------------------------------------------- */
+            const phoneDigits =
+                phone.replace(
+                    /\D/g,
+                    ""
+                );
+
+
+            if (
+                phoneDigits.length < 7 ||
+                phoneDigits.length > 15
+            ) {
+
+                return res.status(400).json({
+
+                    success:
+                        false,
+
+                    message:
+                        "Please enter a valid phone number."
+
+                });
+
+            }
+
+
+            if (!service) {
+
+                return res.status(400).json({
+
+                    success:
+                        false,
+
+                    message:
+                        "Please select a service."
+
+                });
+
+            }
+
+
+            if (!message) {
+
+                return res.status(400).json({
+
+                    success:
+                        false,
+
+                    message:
+                        "Please enter your message."
+
+                });
+
+            }
+
 
             if (!consent) {
 
                 return res.status(400).json({
 
-                    success: false,
+                    success:
+                        false,
 
                     message:
-                        "Please provide your consent before submitting the form."
+                        "Please accept the consent checkbox."
+
                 });
+
             }
 
 
-            /* -------------------------------------------------
-               LENGTH VALIDATION
-            ------------------------------------------------- */
-
-            if (name.length > 200) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Name is too long."
-                });
-            }
-
-
-            if (email.length > 320) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Email address is too long."
-                });
-            }
-
-
-            if (phone.length > 50) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Phone number is too long."
-                });
-            }
-
-
-            if (service.length > 200) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Service value is too long."
-                });
-            }
-
-
-            if (subject.length > 300) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Subject is too long."
-                });
-            }
-
-
-            if (message.length > 10000) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Message is too long. Maximum 10000 characters."
-                });
-            }
-
-
-            /* -------------------------------------------------
-               SAVE CONTACT MESSAGE
-            -------------------------------------------------
-
-               IMPORTANT:
-               Database save happens BEFORE email notification.
-
-               Therefore even if SMTP/Brevo fails,
-               the customer's message remains saved.
-            ------------------------------------------------- */
+            // -------------------------------------------------
+            // SAVE TO POSTGRESQL
+            // -------------------------------------------------
 
             const result =
                 await pool.query(
@@ -367,18 +762,7 @@ router.post(
                         CURRENT_TIMESTAMP,
                         CURRENT_TIMESTAMP
                     )
-                    RETURNING
-                        id,
-                        name,
-                        email,
-                        phone,
-                        service,
-                        subject,
-                        message,
-                        consent,
-                        status,
-                        created_at,
-                        updated_at
+                    RETURNING *
                     `,
                     [
                         name,
@@ -387,314 +771,261 @@ router.post(
                         service,
                         subject,
                         message,
-                        consent ? 1 : 0
+                        consent
                     ]
                 );
 
 
-            const contact =
+            const savedContact =
                 result.rows[0];
 
 
-            /* -------------------------------------------------
-               SEND OWNER EMAIL
-            ------------------------------------------------- */
+            const contactId =
+                savedContact.id;
+
+
+            // -------------------------------------------------
+            // SEND OWNER EMAIL
+            //
+            // Database save must remain successful even if
+            // owner notification email fails.
+            // -------------------------------------------------
+
+            let ownerEmailSent =
+                false;
+
 
             try {
 
-                if (
-                    SMTP_USER &&
-                    SMTP_PASS
-                ) {
+                const mailResult =
+                    await sendOwnerEmail(
+                        savedContact
+                    );
 
-                    await transporter.sendMail({
+                ownerEmailSent =
+                    true;
 
-                        from:
-                            `"U.S TRAVEL & TOURS" <${SMTP_USER}>`,
 
-                        to:
-                            OWNER_EMAIL,
+                console.log(
+                    "CONTACT OWNER EMAIL SENT"
+                );
 
-                        replyTo:
-                            email,
+                console.log(
+                    "Contact ID:",
+                    contactId
+                );
 
-                        subject:
-                            `New Contact Message${subject ? " - " + subject : ""}`,
+                console.log(
+                    "Message ID:",
+                    mailResult?.messageId ||
+                    "N/A"
+                );
 
-                        text:
-                            `A new contact message has been received.\n\n` +
 
-                            `Name: ${name}\n` +
-
-                            `Email: ${email}\n` +
-
-                            `Phone: ${phone}\n` +
-
-                            `Service: ${service}\n` +
-
-                            `Subject: ${subject || "N/A"}\n\n` +
-
-                            `Message:\n${message}\n\n` +
-
-                            `Contact Message ID: ${contact.id}`
-                    });
-                }
-
-            } catch (mailError) {
-
-                /* -------------------------------------------------
-                   IMPORTANT:
-                   DO NOT FAIL THE CONTACT SUBMISSION.
-
-                   The message is already permanently stored.
-                ------------------------------------------------- */
+            } catch (emailError) {
 
                 console.error(
-                    "CONTACT OWNER EMAIL ERROR:",
-                    mailError
+                    "CONTACT OWNER EMAIL FAILED"
                 );
+
+                console.error(
+                    "Contact ID:",
+                    contactId
+                );
+
+                console.error(
+                    "Error name:",
+                    emailError?.name
+                );
+
+                console.error(
+                    "Error code:",
+                    emailError?.code
+                );
+
+                console.error(
+                    "Error response:",
+                    emailError?.response
+                );
+
+                console.error(
+                    "Error message:",
+                    emailError?.message
+                );
+
             }
 
 
-            /* -------------------------------------------------
-               SUCCESS
-            ------------------------------------------------- */
-
             return res.status(201).json({
 
-                success: true,
+                success:
+                    true,
 
                 message:
-                    "Your message has been sent successfully.",
+                    "Your message has been submitted successfully.",
 
-                contactMessage: {
+                contactId:
+                    contactId,
 
-                    id:
-                        Number(contact.id),
+                ownerEmailSent:
+                    ownerEmailSent
 
-                    name:
-                        contact.name,
-
-                    email:
-                        contact.email,
-
-                    phone:
-                        contact.phone,
-
-                    service:
-                        contact.service,
-
-                    subject:
-                        contact.subject,
-
-                    message:
-                        contact.message,
-
-                    consent:
-                        Boolean(
-                            Number(
-                                contact.consent
-                            )
-                        ),
-
-                    status:
-                        contact.status,
-
-                    createdAt:
-                        contact.created_at,
-
-                    updatedAt:
-                        contact.updated_at
-                }
             });
+
 
         } catch (error) {
 
             console.error(
-                "CONTACT SUBMISSION ERROR:",
+                "Contact form error:",
                 error
             );
 
             return res.status(500).json({
 
-                success: false,
+                success:
+                    false,
 
                 message:
-                    "Unable to send your message at this time."
+                    "Unable to submit your message right now. Please try again later."
+
             });
+
         }
+
     }
 );
 
 
-/* =========================================================
-   GET /api/contact/messages
-   ADMIN - ALL CONTACT MESSAGES
-========================================================= */
+// =========================================================
+// GET ALL CONTACT MESSAGES
+// ADMIN ONLY
+//
+// GET /api/contact/messages
+// =========================================================
 
 router.get(
     "/messages",
+    requireAuth,
     requireAdmin,
-    async (req, res) => {
+    async function (
+        req,
+        res
+    ) {
 
         try {
 
             const result =
                 await pool.query(
                     `
-                    SELECT
-                        id,
-                        name,
-                        email,
-                        phone,
-                        service,
-                        subject,
-                        message,
-                        consent,
-                        status,
-                        created_at,
-                        updated_at
+                    SELECT *
                     FROM contact_messages
-
                     ORDER BY
                         CASE
                             WHEN status = 'new'
-                                THEN 0
+                            THEN 0
 
                             WHEN status = 'read'
-                                THEN 1
+                            THEN 1
 
                             WHEN status = 'replied'
-                                THEN 2
+                            THEN 2
 
-                            ELSE 3
+                            WHEN status = 'closed'
+                            THEN 3
+
+                            ELSE 4
                         END,
 
-                        created_at DESC
+                        created_at DESC,
+                        id DESC
                     `
-                );
-
-
-            const messages =
-                result.rows.map(
-                    row => ({
-
-                        id:
-                            Number(row.id),
-
-                        name:
-                            row.name,
-
-                        email:
-                            row.email,
-
-                        phone:
-                            row.phone,
-
-                        service:
-                            row.service,
-
-                        subject:
-                            row.subject,
-
-                        message:
-                            row.message,
-
-                        consent:
-                            Boolean(
-                                Number(
-                                    row.consent
-                                )
-                            ),
-
-                        status:
-                            row.status,
-
-                        createdAt:
-                            row.created_at,
-
-                        updatedAt:
-                            row.updated_at
-                    })
                 );
 
 
             return res.json({
 
-                success: true,
+                success:
+                    true,
 
-                messages
+                messages:
+                    result.rows
+
             });
+
 
         } catch (error) {
 
             console.error(
-                "GET CONTACT MESSAGES ERROR:",
+                "Load contact messages error:",
                 error
             );
 
             return res.status(500).json({
 
-                success: false,
+                success:
+                    false,
 
                 message:
                     "Unable to load contact messages."
+
             });
+
         }
+
     }
 );
 
 
-/* =========================================================
-   GET /api/contact/messages/:id
-   ADMIN - SINGLE CONTACT MESSAGE
-========================================================= */
+// =========================================================
+// GET SINGLE CONTACT MESSAGE
+// ADMIN ONLY
+//
+// GET /api/contact/messages/:id
+// =========================================================
 
 router.get(
     "/messages/:id",
+    requireAuth,
     requireAdmin,
-    async (req, res) => {
+    async function (
+        req,
+        res
+    ) {
 
         try {
 
-            const messageId =
+            const id =
                 normalizeId(
                     req.params.id
                 );
 
 
-            if (!messageId) {
+            if (!id) {
 
                 return res.status(400).json({
 
-                    success: false,
+                    success:
+                        false,
 
                     message:
                         "Invalid contact message ID."
+
                 });
+
             }
 
 
             const result =
                 await pool.query(
                     `
-                    SELECT
-                        id,
-                        name,
-                        email,
-                        phone,
-                        service,
-                        subject,
-                        message,
-                        consent,
-                        status,
-                        created_at,
-                        updated_at
+                    SELECT *
                     FROM contact_messages
                     WHERE id = $1
                     LIMIT 1
                     `,
-                    [messageId]
+                    [
+                        id
+                    ]
                 );
 
 
@@ -704,123 +1035,108 @@ router.get(
 
                 return res.status(404).json({
 
-                    success: false,
+                    success:
+                        false,
 
                     message:
                         "Contact message not found."
+
                 });
+
             }
-
-
-            const row =
-                result.rows[0];
 
 
             return res.json({
 
-                success: true,
+                success:
+                    true,
 
-                contactMessage: {
+                message:
+                    result.rows[0]
 
-                    id:
-                        Number(row.id),
-
-                    name:
-                        row.name,
-
-                    email:
-                        row.email,
-
-                    phone:
-                        row.phone,
-
-                    service:
-                        row.service,
-
-                    subject:
-                        row.subject,
-
-                    message:
-                        row.message,
-
-                    consent:
-                        Boolean(
-                            Number(
-                                row.consent
-                            )
-                        ),
-
-                    status:
-                        row.status,
-
-                    createdAt:
-                        row.created_at,
-
-                    updatedAt:
-                        row.updated_at
-                }
             });
+
 
         } catch (error) {
 
             console.error(
-                "GET SINGLE CONTACT MESSAGE ERROR:",
+                "Get contact message error:",
                 error
             );
 
             return res.status(500).json({
 
-                success: false,
+                success:
+                    false,
 
                 message:
                     "Unable to load contact message."
+
             });
+
         }
+
     }
 );
 
 
-/* =========================================================
-   PATCH /api/contact/messages/:id/status
-   ADMIN - UPDATE STATUS
-========================================================= */
+// =========================================================
+// UPDATE CONTACT MESSAGE STATUS
+// ADMIN ONLY
+//
+// PATCH /api/contact/messages/:id/status
+// =========================================================
 
 router.patch(
     "/messages/:id/status",
+    requireAuth,
     requireAdmin,
-    async (req, res) => {
+    async function (
+        req,
+        res
+    ) {
 
         try {
 
-            const messageId =
+            const id =
                 normalizeId(
                     req.params.id
                 );
 
 
-            if (!messageId) {
+            const status =
+                String(
+                    req.body?.status || ""
+                )
+                    .trim()
+                    .toLowerCase();
+
+
+            if (!id) {
 
                 return res.status(400).json({
 
-                    success: false,
+                    success:
+                        false,
 
                     message:
                         "Invalid contact message ID."
+
                 });
+
             }
 
 
-            const status =
-                cleanString(
-                    req.body?.status
-                ).toLowerCase();
-
-
             const allowedStatuses = [
+
                 "new",
+
                 "read",
+
                 "replied",
+
                 "closed"
+
             ];
 
 
@@ -832,35 +1148,251 @@ router.patch(
 
                 return res.status(400).json({
 
-                    success: false,
+                    success:
+                        false,
 
                     message:
-                        "Invalid contact message status.",
+                        "Invalid contact message status."
 
-                    allowedStatuses
                 });
+
             }
 
+
+            const existing =
+                await pool.query(
+                    `
+                    SELECT id
+                    FROM contact_messages
+                    WHERE id = $1
+                    LIMIT 1
+                    `,
+                    [
+                        id
+                    ]
+                );
+
+
+            if (
+                existing.rows.length === 0
+            ) {
+
+                return res.status(404).json({
+
+                    success:
+                        false,
+
+                    message:
+                        "Contact message not found."
+
+                });
+
+            }
+
+
+            await pool.query(
+                `
+                UPDATE contact_messages
+                SET
+                    status = $1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = $2
+                `,
+                [
+                    status,
+                    id
+                ]
+            );
+
+
+            return res.json({
+
+                success:
+                    true,
+
+                message:
+                    "Contact message status updated successfully.",
+
+                status:
+                    status
+
+            });
+
+
+        } catch (error) {
+
+            console.error(
+                "Contact message status update error:",
+                error
+            );
+
+            return res.status(500).json({
+
+                success:
+                    false,
+
+                message:
+                    "Unable to update contact message."
+
+            });
+
+        }
+
+    }
+);
+
+
+// =========================================================
+// ADMIN REPLY TO CUSTOMER
+//
+// POST /api/contact/messages/:id/reply
+//
+// IMPORTANT FLOW:
+//
+// Admin Dashboard
+//       ↓
+// This route
+//       ↓
+// PostgreSQL
+//       ↓
+// Brevo SMTP
+//       ↓
+// Customer Email
+// =========================================================
+
+router.post(
+    "/messages/:id/reply",
+    requireAuth,
+    requireAdmin,
+    async function (
+        req,
+        res
+    ) {
+
+        const id =
+            normalizeId(
+                req.params.id
+            );
+
+
+        const reply =
+            cleanString(
+                req.body?.reply,
+                5000
+            );
+
+
+        console.log(
+            "========================================================="
+        );
+
+        console.log(
+            "ADMIN CONTACT REPLY REQUEST"
+        );
+
+        console.log(
+            "Message ID:",
+            id
+        );
+
+        console.log(
+            "Reply length:",
+            reply.length
+        );
+
+        console.log(
+            "SMTP configured:",
+            Boolean(
+                transporter
+            )
+        );
+
+        console.log(
+            "MAIL_FROM:",
+            MAIL_FROM
+        );
+
+        console.log(
+            "=========================================================");
+
+
+        try {
+
+            // -------------------------------------------------
+            // VALIDATE ID
+            // -------------------------------------------------
+
+            if (!id) {
+
+                return res.status(400).json({
+
+                    success:
+                        false,
+
+                    message:
+                        "Invalid contact message ID."
+
+                });
+
+            }
+
+
+            // -------------------------------------------------
+            // VALIDATE REPLY
+            // -------------------------------------------------
+
+            if (!reply) {
+
+                return res.status(400).json({
+
+                    success:
+                        false,
+
+                    message:
+                        "Please enter a reply message."
+
+                });
+
+            }
+
+
+            // -------------------------------------------------
+            // CHECK SMTP
+            // -------------------------------------------------
+
+            if (!transporter) {
+
+                console.error(
+                    "Contact reply blocked: SMTP transporter is not configured."
+                );
+
+                return res.status(500).json({
+
+                    success:
+                        false,
+
+                    message:
+                        "Email service is not configured on the server. Please check SMTP_USER and SMTP_PASS in Render environment variables."
+
+                });
+
+            }
+
+
+            // -------------------------------------------------
+            // GET ORIGINAL CUSTOMER MESSAGE
+            // -------------------------------------------------
 
             const result =
                 await pool.query(
                     `
-                    UPDATE contact_messages
-
-                    SET
-                        status = $1,
-                        updated_at = CURRENT_TIMESTAMP
-
-                    WHERE id = $2
-
-                    RETURNING
-                        id,
-                        status,
-                        updated_at
+                    SELECT *
+                    FROM contact_messages
+                    WHERE id = $1
+                    LIMIT 1
                     `,
                     [
-                        status,
-                        messageId
+                        id
                     ]
                 );
 
@@ -871,147 +1403,14 @@ router.patch(
 
                 return res.status(404).json({
 
-                    success: false,
+                    success:
+                        false,
 
                     message:
                         "Contact message not found."
+
                 });
-            }
 
-
-            const updated =
-                result.rows[0];
-
-
-            return res.json({
-
-                success: true,
-
-                message:
-                    "Contact message status updated successfully.",
-
-                contactMessageId:
-                    Number(updated.id),
-
-                status:
-                    updated.status,
-
-                updatedAt:
-                    updated.updated_at
-            });
-
-        } catch (error) {
-
-            console.error(
-                "UPDATE CONTACT STATUS ERROR:",
-                error
-            );
-
-            return res.status(500).json({
-
-                success: false,
-
-                message:
-                    "Unable to update contact message status."
-            });
-        }
-    }
-);
-
-
-/* =========================================================
-   POST /api/contact/messages/:id/reply
-   ADMIN - REPLY TO CUSTOMER
-========================================================= */
-
-router.post(
-    "/messages/:id/reply",
-    requireAdmin,
-    async (req, res) => {
-
-        try {
-
-            const messageId =
-                normalizeId(
-                    req.params.id
-                );
-
-
-            if (!messageId) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Invalid contact message ID."
-                });
-            }
-
-
-            const reply =
-                cleanString(
-                    req.body?.reply ||
-                    req.body?.message
-                );
-
-
-            if (!reply) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Reply message cannot be empty."
-                });
-            }
-
-
-            if (reply.length > 10000) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Reply is too long. Maximum 10000 characters."
-                });
-            }
-
-
-            /* -------------------------------------------------
-               GET CUSTOMER CONTACT MESSAGE
-            ------------------------------------------------- */
-
-            const result =
-                await pool.query(
-                    `
-                    SELECT
-                        id,
-                        name,
-                        email,
-                        subject,
-                        status
-                    FROM contact_messages
-                    WHERE id = $1
-                    LIMIT 1
-                    `,
-                    [messageId]
-                );
-
-
-            if (
-                result.rows.length === 0
-            ) {
-
-                return res.status(404).json({
-
-                    success: false,
-
-                    message:
-                        "Contact message not found."
-                });
             }
 
 
@@ -1019,209 +1418,628 @@ router.post(
                 result.rows[0];
 
 
-            /* -------------------------------------------------
-               SEND EMAIL
-            ------------------------------------------------- */
+            // -------------------------------------------------
+            // VALIDATE CUSTOMER EMAIL
+            // -------------------------------------------------
+
+            const customerEmail =
+                String(
+                    contact.email || ""
+                )
+                    .trim()
+                    .toLowerCase();
+
 
             if (
-                !SMTP_USER ||
-                !SMTP_PASS
+                !customerEmail ||
+                !isValidEmail(
+                    customerEmail
+                )
             ) {
 
-                return res.status(500).json({
+                return res.status(400).json({
 
-                    success: false,
+                    success:
+                        false,
 
                     message:
-                        "Email service is not configured."
+                        "The customer email address stored with this message is invalid."
+
                 });
+
             }
 
 
-            await transporter.sendMail({
-
-    from:
-    `"U.S TRAVEL & TOURS" <${OWNER_EMAIL}>`,
-
-    to:
-        contact.email,
-
-    replyTo:
-        OWNER_EMAIL,
-
-    subject:
-        contact.subject
-            ? `Re: ${contact.subject}`
-            : "Reply from U.S TRAVEL & TOURS",
-
-    text:
-        `Hello ${contact.name || "Customer"},\n\n` +
-
-        `${reply}\n\n` +
-
-        `Regards,\n` +
-
-        `U.S TRAVEL & TOURS\n` +
-
-        `${OWNER_EMAIL}`
-});
+            console.log(
+                "Sending contact reply to:",
+                customerEmail
+            );
 
 
-            /* -------------------------------------------------
-               MARK AS REPLIED
-            ------------------------------------------------- */
+            // -------------------------------------------------
+            // SUBJECT
+            // -------------------------------------------------
 
-            const updateResult =
-                await pool.query(
-                    `
-                    UPDATE contact_messages
-
-                    SET
-                        status = 'replied',
-                        updated_at = CURRENT_TIMESTAMP
-
-                    WHERE id = $1
-
-                    RETURNING
-                        id,
-                        status,
-                        updated_at
-                    `,
-                    [messageId]
-                );
+            const originalSubject =
+                String(
+                    contact.subject || ""
+                ).trim();
 
 
-            const updated =
-                updateResult.rows[0];
+            let replySubject =
+                "Re: Your enquiry - U.S TRAVEL & TOURS";
+
+
+            if (originalSubject) {
+
+                replySubject =
+                    originalSubject
+                        .toLowerCase()
+                        .startsWith("re:")
+                        ? originalSubject
+                        : `Re: ${originalSubject}`;
+
+            }
+
+
+            // -------------------------------------------------
+            // PLAIN TEXT EMAIL
+            // -------------------------------------------------
+
+            const text =
+`Dear ${contact.name || "Customer"},
+
+${reply}
+
+--------------------------------------------------
+
+This is a reply from U.S TRAVEL & TOURS.
+
+Original enquiry:
+${contact.message || ""}
+
+--------------------------------------------------
+
+U.S TRAVEL & TOURS
+${OWNER_EMAIL}
+`;
+
+
+            // -------------------------------------------------
+            // HTML EMAIL
+            // -------------------------------------------------
+
+            const html =
+`
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta charset="UTF-8">
+
+<title>
+${escapeHtml(replySubject)}
+</title>
+
+</head>
+
+<body
+    style="
+        margin:0;
+        padding:30px;
+        background:#f5f6f8;
+        font-family:Arial,Helvetica,sans-serif;
+        color:#182235;
+    "
+>
+
+<table
+    width="100%"
+    cellpadding="0"
+    cellspacing="0"
+    style="
+        max-width:700px;
+        margin:0 auto;
+    "
+>
+
+<tr>
+
+<td>
+
+<table
+    width="100%"
+    cellpadding="0"
+    cellspacing="0"
+    style="
+        background:#ffffff;
+        border:1px solid #e5e7eb;
+        border-radius:12px;
+        overflow:hidden;
+    "
+>
+
+<tr>
+
+<td
+    style="
+        padding:28px 30px;
+        background:#061426;
+        color:#ffffff;
+    "
+>
+
+<h2
+    style="
+        margin:0;
+        font-size:22px;
+    "
+>
+U.S TRAVEL & TOURS
+</h2>
+
+<p
+    style="
+        margin:8px 0 0;
+        color:#d8d8d8;
+        font-size:14px;
+    "
+>
+Reply to your enquiry
+</p>
+
+</td>
+
+</tr>
+
+
+<tr>
+
+<td
+    style="
+        padding:30px;
+    "
+>
+
+<p
+    style="
+        margin-top:0;
+        font-size:16px;
+    "
+>
+Dear
+<strong>
+${escapeHtml(
+    contact.name || "Customer"
+)}
+</strong>,
+</p>
+
+
+<div
+    style="
+        margin:20px 0;
+        padding:20px;
+        background:#f7f8fa;
+        border-left:4px solid #c9a052;
+        border-radius:6px;
+        line-height:1.7;
+        white-space:normal;
+    "
+>
+
+${escapeHtml(
+    reply
+).replace(
+    /\n/g,
+    "<br>"
+)}
+
+</div>
+
+
+<p
+    style="
+        margin-top:28px;
+        font-size:14px;
+        color:#555;
+    "
+>
+<strong>
+Original enquiry:
+</strong>
+</p>
+
+
+<div
+    style="
+        padding:16px;
+        background:#f8f9fa;
+        border:1px solid #eeeeee;
+        border-radius:6px;
+        color:#666;
+        line-height:1.6;
+        font-size:14px;
+    "
+>
+
+${escapeHtml(
+    contact.message || ""
+).replace(
+    /\n/g,
+    "<br>"
+)}
+
+</div>
+
+
+<p
+    style="
+        margin-top:30px;
+        line-height:1.6;
+    "
+>
+Regards,<br>
+<strong>
+U.S TRAVEL & TOURS
+</strong><br>
+${escapeHtml(OWNER_EMAIL)}
+</p>
+
+</td>
+
+</tr>
+
+
+<tr>
+
+<td
+    style="
+        padding:18px 30px;
+        background:#f8f9fa;
+        border-top:1px solid #e8e8e8;
+        font-size:12px;
+        color:#777;
+    "
+>
+
+This email was sent in response to your enquiry submitted through the U.S TRAVEL & TOURS website.
+
+</td>
+
+</tr>
+
+</table>
+
+</td>
+
+</tr>
+
+</table>
+
+</body>
+
+</html>
+`;
+
+
+            // -------------------------------------------------
+            // SEND EMAIL DIRECTLY TO CUSTOMER
+            //
+            // IMPORTANT:
+            // This uses MAIL_FROM, matching the old working
+            // contact.js implementation.
+            // -------------------------------------------------
+
+            const mailResult =
+                await transporter.sendMail({
+
+                    from:
+                        MAIL_FROM,
+
+                    to:
+                        customerEmail,
+
+                    replyTo:
+                        MAIL_FROM,
+
+                    subject:
+                        replySubject,
+
+                    text:
+                        text,
+
+                    html:
+                        html
+
+                });
+
+
+            // -------------------------------------------------
+            // SMTP RESULT LOGGING
+            // -------------------------------------------------
+
+            console.log(
+                "========================================================="
+            );
+
+            console.log(
+                "CONTACT REPLY EMAIL SENT"
+            );
+
+            console.log(
+                "Database Message ID:",
+                id
+            );
+
+            console.log(
+                "Customer:",
+                customerEmail
+            );
+
+            console.log(
+                "From:",
+                MAIL_FROM
+            );
+
+            console.log(
+                "SMTP Message ID:",
+                mailResult?.messageId ||
+                "N/A"
+            );
+
+            console.log(
+                "Accepted:",
+                mailResult?.accepted ||
+                []
+            );
+
+            console.log(
+                "Rejected:",
+                mailResult?.rejected ||
+                []
+            );
+
+            console.log(
+                "SMTP Response:",
+                mailResult?.response ||
+                "N/A"
+            );
+
+            console.log(
+                "========================================================="
+            );
+
+
+            // -------------------------------------------------
+            // UPDATE STATUS ONLY AFTER EMAIL SUCCESS
+            // -------------------------------------------------
+
+            await pool.query(
+                `
+                UPDATE contact_messages
+                SET
+                    status = 'replied',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = $1
+                `,
+                [
+                    id
+                ]
+            );
 
 
             return res.json({
 
-                success: true,
+                success:
+                    true,
 
                 message:
-                    "Reply sent successfully.",
-
-                contactMessageId:
-                    Number(updated.id),
+                    "Reply sent successfully to the customer.",
 
                 status:
-                    updated.status,
+                    "replied",
 
-                updatedAt:
-                    updated.updated_at
+                email:
+                    customerEmail,
+
+                messageId:
+                    mailResult?.messageId ||
+                    null
+
             });
+
 
         } catch (error) {
 
             console.error(
-                "CONTACT REPLY ERROR:",
+                "========================================================="
+            );
+
+            console.error(
+                "CONTACT REPLY EMAIL FAILED"
+            );
+
+            console.error(
+                "Message ID:",
+                id
+            );
+
+            console.error(
+                "Error name:",
+                error?.name
+            );
+
+            console.error(
+                "Error code:",
+                error?.code
+            );
+
+            console.error(
+                "Error command:",
+                error?.command
+            );
+
+            console.error(
+                "Error response:",
+                error?.response
+            );
+
+            console.error(
+                "Error responseCode:",
+                error?.responseCode
+            );
+
+            console.error(
+                "Error message:",
+                error?.message
+            );
+
+            console.error(
                 error
             );
 
+            console.error(
+                "========================================================="
+            );
+
+
             return res.status(500).json({
 
-                success: false,
+                success:
+                    false,
 
                 message:
-                    "Unable to send reply."
+                    "Unable to send reply right now. Please check the email/SMTP configuration on the server and try again."
+
             });
+
         }
+
     }
 );
 
 
-/* =========================================================
-   DELETE /api/contact/messages/:id
-   ADMIN - DELETE CONTACT MESSAGE
-========================================================= */
+// =========================================================
+// DELETE CONTACT MESSAGE
+// ADMIN ONLY
+//
+// DELETE /api/contact/messages/:id
+// =========================================================
 
 router.delete(
     "/messages/:id",
+    requireAuth,
     requireAdmin,
-    async (req, res) => {
+    async function (
+        req,
+        res
+    ) {
 
         try {
 
-            const messageId =
+            const id =
                 normalizeId(
                     req.params.id
                 );
 
 
-            if (!messageId) {
+            if (!id) {
 
                 return res.status(400).json({
 
-                    success: false,
+                    success:
+                        false,
 
                     message:
                         "Invalid contact message ID."
+
                 });
+
             }
 
 
-            const result =
+            const existing =
                 await pool.query(
                     `
-                    DELETE FROM contact_messages
-
+                    SELECT id
+                    FROM contact_messages
                     WHERE id = $1
-
-                    RETURNING id
+                    LIMIT 1
                     `,
-                    [messageId]
+                    [
+                        id
+                    ]
                 );
 
 
             if (
-                result.rows.length === 0
+                existing.rows.length === 0
             ) {
 
                 return res.status(404).json({
 
-                    success: false,
+                    success:
+                        false,
 
                     message:
                         "Contact message not found."
+
                 });
+
             }
+
+
+            await pool.query(
+                `
+                DELETE FROM contact_messages
+                WHERE id = $1
+                `,
+                [
+                    id
+                ]
+            );
 
 
             return res.json({
 
-                success: true,
+                success:
+                    true,
 
                 message:
-                    "Contact message deleted successfully.",
+                    "Contact message deleted successfully."
 
-                contactMessageId:
-                    Number(
-                        result.rows[0].id
-                    )
             });
+
 
         } catch (error) {
 
             console.error(
-                "DELETE CONTACT MESSAGE ERROR:",
+                "Delete contact message error:",
                 error
             );
 
             return res.status(500).json({
 
-                success: false,
+                success:
+                    false,
 
                 message:
                     "Unable to delete contact message."
+
             });
+
         }
+
     }
 );
 
 
-/* =========================================================
-   EXPORT
-========================================================= */
+// =========================================================
+// EXPORT
+// =========================================================
 
-module.exports = router;
+module.exports =
+    router;
