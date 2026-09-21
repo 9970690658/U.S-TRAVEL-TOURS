@@ -1036,31 +1036,31 @@ router.post(
 
             await transporter.sendMail({
 
-    from:
-        `"U.S TRAVEL & TOURS" <${FROM_EMAIL}>`,
+                from:
+                    `"U.S TRAVEL & TOURS" <${SMTP_USER}>`,
 
-    to:
-        contact.email,
+                to:
+                    contact.email,
 
-    replyTo:
-        OWNER_EMAIL,
+                replyTo:
+                    OWNER_EMAIL,
 
-    subject:
-        contact.subject
-            ? `Re: ${contact.subject}`
-            : "Reply from U.S TRAVEL & TOURS",
+                subject:
+                    contact.subject
+                        ? `Re: ${contact.subject}`
+                        : "Reply from U.S TRAVEL & TOURS",
 
-    text:
-        `Hello ${contact.name || "Customer"},\n\n` +
+                text:
+                    `Hello ${contact.name || "Customer"},\n\n` +
 
-        `${reply}\n\n` +
+                    `${reply}\n\n` +
 
-        `Regards,\n` +
+                    `Regards,\n` +
 
-        `U.S TRAVEL & TOURS\n` +
+                    `U.S TRAVEL & TOURS\n` +
 
-        `${OWNER_EMAIL}`
-});
+                    `${OWNER_EMAIL}`
+            });
 
 
             /* -------------------------------------------------
