@@ -1,1342 +1,578 @@
-/* =========================================================
-   U.S TRAVEL & TOURS
-   APPLICATION ROUTES
-   PostgreSQL / Supabase Version
+// =========================================================
+// U.S TRAVEL & TOURS
+// APPLICATION FORM
+// =========================================================
 
-   CUSTOMER:
-   - Submit application
-   - View own application
+const APPLICATION_ENDPOINT =
+    "https://u-s-travel-tours-1.onrender.com/api/applications";
 
-   ADMIN:
-   - View all applications
-   - Update application status
-   - Delete application
-========================================================= */
+document.addEventListener("DOMContentLoaded", function () {
 
-const express = require("express");
+    const form = document.getElementById("applicationForm");
 
-const {
-    pool
-} = require("./database");
-
-const {
-    requireAuth,
-    requireAdmin
-} = require("./auth");
-
-const router = express.Router();
-
-
-/* =========================================================
-   HELPERS
-========================================================= */
-
-function cleanString(value) {
-
-    if (
-        value === undefined ||
-        value === null
-    ) {
-        return "";
+    if (!form) {
+        return;
     }
 
-    return String(value).trim();
-}
+    const submitBtn =
+        document.getElementById("applicationSubmitBtn");
 
+    // =====================================================
+    // GET AUTH TOKEN
+    // =====================================================
 
-/* ---------------------------------------------------------
-   GET VALUE FROM MULTIPLE POSSIBLE PATHS
---------------------------------------------------------- */
+    function getAuthToken() {
 
-function getValue(source, ...paths) {
+        return (
+            localStorage.getItem("authToken") ||
+            sessionStorage.getItem("authToken") ||
+            ""
+        );
 
-    for (const path of paths) {
+    }
 
-        let current = source;
+    // =====================================================
+    // READ FIELD VALUE
+    // =====================================================
 
-        for (const key of path.split(".")) {
+    function getValue(id) {
 
-            if (
-                current === undefined ||
-                current === null
-            ) {
-                current = undefined;
-                break;
-            }
+        const element = document.getElementById(id);
 
-            current = current[key];
+        if (!element) {
+            return "";
         }
+
+        return String(element.value || "").trim();
+
+    }
+
+    // =====================================================
+    // READ RADIO VALUE
+    // =====================================================
+
+    function getRadioValue(name) {
+
+        const selected =
+            document.querySelector(
+                `input[name="${name}"]:checked`
+            );
+
+        return selected ? selected.value : "";
+
+    }
+
+    // =====================================================
+    // READ APPLICANT PHOTO
+    // =====================================================
+
+    async function getApplicantPhoto() {
+
+        const input =
+            document.getElementById("applicantPhoto");
 
         if (
-            current !== undefined &&
-            current !== null &&
-            String(current).trim() !== ""
+            !input ||
+            !input.files ||
+            !input.files[0]
         ) {
-            return current;
+            return "";
         }
+
+        const file = input.files[0];
+
+        return new Promise((resolve) => {
+
+            const reader = new FileReader();
+
+            reader.onload = function () {
+
+                resolve(reader.result || "");
+
+            };
+
+            reader.onerror = function () {
+
+                resolve("");
+
+            };
+
+            reader.readAsDataURL(file);
+
+        });
+
     }
 
-    return "";
-}
+    // =====================================================
+    // SHOW MESSAGE
+    // =====================================================
 
+    function showMessage(message) {
 
-/* ---------------------------------------------------------
-   PARSE APPLICATION DATA
---------------------------------------------------------- */
+        alert(message);
 
-function parseApplicationData(value) {
-
-    if (!value) {
-        return {};
     }
 
-    if (typeof value === "object") {
-        return value;
-    }
+    // =====================================================
+    // SUBMIT APPLICATION
+    // =====================================================
 
-    try {
+    form.addEventListener("submit", async function (event) {
 
-        return JSON.parse(value);
+        event.preventDefault();
 
-    } catch (error) {
+        const token = getAuthToken();
 
-        return {};
-    }
-}
+        if (!token) {
 
+            showMessage(
+                "Please login before submitting your application."
+            );
 
-/* ---------------------------------------------------------
-   NORMALIZE DATABASE ID
---------------------------------------------------------- */
+            window.location.href = "login.html";
 
-function normalizeId(value) {
+            return;
 
-    const id = Number(value);
+        }
 
-    if (
-        !Number.isSafeInteger(id) ||
-        id <= 0
-    ) {
-        return null;
-    }
+        // =================================================
+        // GET ALL FORM VALUES
+        // =================================================
 
-    return id;
-}
+        const passportNumber =
+            getValue("passportNumber");
 
+        const passportIssuingCountry =
+            getValue("passportIssuingCountry");
 
-/* =========================================================
-   POST /api/applications
-   CUSTOMER - SUBMIT APPLICATION
-========================================================= */
+        const passportIssueDate =
+            getValue("passportIssueDate");
 
-router.post(
-    "/",
-    requireAuth,
-    async (req, res) => {
+        const passportExpiryDate =
+            getValue("passportExpiryDate");
+
+        const surname =
+            getValue("surname");
+
+        const firstMiddleName =
+            getValue("firstMiddleName");
+
+        const otherSurnames =
+            getValue("otherSurnames");
+
+        const otherFirstMiddleNames =
+            getValue("otherFirstMiddleNames");
+
+        const dateOfBirth =
+            getValue("dateOfBirth");
+
+        const birthCity =
+            getValue("birthCity");
+
+        const birthCountry =
+            getValue("birthCountry");
+
+        const birthState =
+            getValue("birthState");
+
+        const nationality =
+            getValue("nationality");
+
+        const sex =
+            getRadioValue("sex");
+
+        const nationalId =
+            getValue("nationalId");
+
+        const homeAddress =
+            getValue("homeAddress");
+
+        const homeCity =
+            getValue("homeCity");
+
+        const homeState =
+            getValue("homeState");
+
+        const postalCode =
+            getValue("postalCode");
+
+        const homeCountry =
+            getValue("homeCountry");
+
+        const homePhone =
+            getValue("homePhone");
+
+        const businessPhone =
+            getValue("businessPhone");
+
+        const mobilePhone =
+            getValue("mobilePhone");
+
+        const faxNumber =
+            getValue("faxNumber");
+
+        const maritalStatus =
+            getRadioValue("maritalStatus");
+
+        const spouseName =
+            getValue("spouseName");
+
+        const spouseDob =
+            getValue("spouseDob");
+
+        const employerSchool =
+            getValue("employerSchool");
+
+        const presentOccupation =
+            getValue("presentOccupation");
+
+        const employerAddress =
+            getValue("employerAddress");
+
+        const usArrivalDate =
+            getValue("usArrivalDate");
+
+        const visaEmail =
+            getValue("visaEmail");
+
+        const usStayAddress =
+            getValue("usStayAddress");
+
+        const usContactName =
+            getValue("usContactName");
+
+        const usContactPhone =
+            getValue("usContactPhone");
+
+        const stayDuration =
+            getValue("stayDuration");
+
+        const tripPurpose =
+            getValue("tripPurpose");
+
+        const usContactBusinessPhone =
+            getValue("usContactBusinessPhone");
+
+        const usContactCellPhone =
+            getValue("usContactCellPhone");
+
+        const tripPaidBy =
+            getValue("tripPaidBy");
+
+        const previousUsVisit =
+            getRadioValue("previousUsVisit");
+
+        const previousUsWhen =
+            getValue("previousUsWhen");
+
+        const previousUsDuration =
+            getValue("previousUsDuration");
+
+        // =================================================
+        // CHECK REQUIRED FIELDS
+        // EXACTLY MATCHING BACKEND
+        // =================================================
+
+        const requiredFields = {
+
+            passportNumber,
+            passportIssuingCountry,
+            passportIssueDate,
+            passportExpiryDate,
+
+            surname,
+            firstMiddleName,
+
+            dateOfBirth,
+            birthCity,
+            birthCountry,
+            nationality,
+            sex,
+
+            homeAddress,
+            homeCity,
+            homeCountry,
+            mobilePhone,
+
+            maritalStatus,
+
+            employerSchool,
+            presentOccupation,
+
+            usArrivalDate,
+            visaEmail,
+            usStayAddress,
+            usContactName,
+            stayDuration,
+            tripPurpose,
+
+            tripPaidBy,
+
+            previousUsVisit
+
+        };
+
+        const missingFields = Object.keys(
+            requiredFields
+        ).filter(function (field) {
+
+            return !requiredFields[field];
+
+        });
+
+        if (missingFields.length > 0) {
+
+            showMessage(
+                "Please complete all required application fields."
+            );
+
+            return;
+
+        }
+
+        // =================================================
+        // APPLICANT PHOTO
+        // =================================================
+
+        const applicantPhoto =
+            await getApplicantPhoto();
+
+        // =================================================
+        // IMPORTANT:
+        // SEND FLAT DATA
+        // BACKEND EXPECTS THESE FIELD NAMES DIRECTLY
+        // =================================================
+
+        const applicationData = {
+
+            applicationType:
+                "U.S. Travel & Tours Application",
+
+            submittedAt:
+                new Date().toISOString(),
+
+            applicantPhoto,
+
+            passportNumber,
+            passportIssuingCountry,
+            passportIssueDate,
+            passportExpiryDate,
+
+            surname,
+            firstMiddleName,
+            otherSurnames,
+            otherFirstMiddleNames,
+
+            dateOfBirth,
+            birthCity,
+            birthCountry,
+            birthState,
+            nationality,
+            sex,
+            nationalId,
+
+            homeAddress,
+            homeCity,
+            homeState,
+            postalCode,
+            homeCountry,
+            homePhone,
+            businessPhone,
+            mobilePhone,
+            faxNumber,
+
+            maritalStatus,
+            spouseName,
+            spouseDob,
+
+            employerSchool,
+            presentOccupation,
+            employerAddress,
+
+            usArrivalDate,
+            visaEmail,
+            usStayAddress,
+            usContactName,
+            usContactPhone,
+            stayDuration,
+            tripPurpose,
+            usContactBusinessPhone,
+            usContactCellPhone,
+
+            tripPaidBy,
+
+            previousUsVisit,
+            previousUsWhen,
+            previousUsDuration,
+
+            consent: true
+
+        };
+
+        // =================================================
+        // CHECK PAYLOAD SIZE
+        // BACKEND LIMIT = 1 MB
+        // =================================================
+
+        const payloadSize =
+            new Blob([
+                JSON.stringify(applicationData)
+            ]).size;
+
+        if (payloadSize > 900000) {
+
+            showMessage(
+                "Application photo is too large. Please select a smaller image."
+            );
+
+            return;
+
+        }
+
+        // =================================================
+        // BUTTON LOADING
+        // =================================================
+
+        const originalButtonHTML =
+            submitBtn
+                ? submitBtn.innerHTML
+                : "";
+
+        if (submitBtn) {
+
+            submitBtn.disabled = true;
+
+            submitBtn.innerHTML =
+                '<span>Submitting...</span>';
+
+        }
 
         try {
 
-            /* -------------------------------------------------
-               CUSTOMER ONLY
-            ------------------------------------------------- */
+            // =================================================
+            // SEND APPLICATION TO BACKEND
+            // =================================================
 
-            if (
-                !req.user ||
-                req.user.role !== "customer"
-            ) {
+            const response = await fetch(
+                APPLICATION_ENDPOINT,
+                {
+                    method: "POST",
 
-                return res.status(403).json({
-                    success: false,
-                    message:
-                        "Only customer accounts can submit applications."
-                });
-            }
+                    headers: {
+                        "Content-Type":
+                            "application/json",
 
+                        "Authorization":
+                            `Bearer ${token}`
+                    },
 
-            /* -------------------------------------------------
-               ACCEPT MULTIPLE FRONTEND DATA FORMATS
-               
-               Supported:
-               1. req.body
-               2. req.body.application
-               3. req.body.applicationData
-            ------------------------------------------------- */
-
-            let body = req.body || {};
-
-
-            if (
-                body.application &&
-                typeof body.application === "object" &&
-                !Array.isArray(body.application)
-            ) {
-
-                body = body.application;
-
-            } else if (
-                body.applicationData &&
-                typeof body.applicationData === "object" &&
-                !Array.isArray(body.applicationData)
-            ) {
-
-                body = body.applicationData;
-            }
-
-
-            /* -------------------------------------------------
-               REQUIRED FIELDS
-            ------------------------------------------------- */
-
-            const passportNumber = cleanString(
-                getValue(
-                    body,
-
-                    "passportNumber",
-                    "passport_number",
-
-                    "passport.number"
-                )
+                    body:
+                        JSON.stringify(
+                            applicationData
+                        )
+                }
             );
 
-
-            const passportIssuingCountry = cleanString(
-                getValue(
-                    body,
-
-                    "passportIssuingCountry",
-                    "passport_issuing_country",
-
-                    "passport.issuingCountry",
-                    "passport.issuing_country"
-                )
-            );
-
-
-            const passportIssueDate = cleanString(
-                getValue(
-                    body,
-
-                    "passportIssueDate",
-                    "passport_issue_date",
-
-                    "passport.issueDate",
-                    "passport.issue_date"
-                )
-            );
-
-
-            const passportExpiryDate = cleanString(
-                getValue(
-                    body,
-
-                    "passportExpiryDate",
-                    "passport_expiry_date",
-
-                    "passport.expiryDate",
-                    "passport.expiry_date"
-                )
-            );
-
-
-            const surname = cleanString(
-                getValue(
-                    body,
-
-                    "surname",
-                    "lastName",
-                    "last_name"
-                )
-            );
-
-
-            const firstMiddleName = cleanString(
-                getValue(
-                    body,
-
-                    "firstMiddleName",
-                    "first_middle_name",
-
-                    "firstName",
-                    "first_name"
-                )
-            );
-
-
-            const dateOfBirth = cleanString(
-                getValue(
-                    body,
-
-                    "dateOfBirth",
-                    "date_of_birth",
-
-                    "dob"
-                )
-            );
-
-
-            const birthCity = cleanString(
-                getValue(
-                    body,
-
-                    "birthCity",
-                    "birth_city"
-                )
-            );
-
-
-            const birthCountry = cleanString(
-                getValue(
-                    body,
-
-                    "birthCountry",
-                    "birth_country"
-                )
-            );
-
-
-            const nationality = cleanString(
-                getValue(
-                    body,
-
-                    "nationality"
-                )
-            );
-
-
-            const homeAddress = cleanString(
-                getValue(
-                    body,
-
-                    "homeAddress",
-                    "home_address"
-                )
-            );
-
-
-            const homeCity = cleanString(
-                getValue(
-                    body,
-
-                    "homeCity",
-                    "home_city"
-                )
-            );
-
-
-            const homeCountry = cleanString(
-                getValue(
-                    body,
-
-                    "homeCountry",
-                    "home_country"
-                )
-            );
-
-
-            const mobilePhone = cleanString(
-                getValue(
-                    body,
-
-                    "mobilePhone",
-                    "mobile_phone",
-                    "phone"
-                )
-            );
-
-
-            const employerSchool = cleanString(
-                getValue(
-                    body,
-
-                    "employerSchool",
-                    "employer_school"
-                )
-            );
-
-
-            const presentOccupation = cleanString(
-                getValue(
-                    body,
-
-                    "presentOccupation",
-                    "present_occupation",
-                    "occupation"
-                )
-            );
-
-
-            const usArrivalDate = cleanString(
-                getValue(
-                    body,
-
-                    "usArrivalDate",
-                    "us_arrival_date"
-                )
-            );
-
-
-            const visaEmail = cleanString(
-                getValue(
-                    body,
-
-                    "visaEmail",
-                    "visa_email",
-                    "email"
-                )
-            );
-
-
-            const usStayAddress = cleanString(
-                getValue(
-                    body,
-
-                    "usStayAddress",
-                    "us_stay_address"
-                )
-            );
-
-
-            const usContactName = cleanString(
-                getValue(
-                    body,
-
-                    "usContactName",
-                    "us_contact_name"
-                )
-            );
-
-
-            const stayDuration = cleanString(
-                getValue(
-                    body,
-
-                    "stayDuration",
-                    "stay_duration"
-                )
-            );
-
-
-            const tripPurpose = cleanString(
-                getValue(
-                    body,
-
-                    "tripPurpose",
-                    "trip_purpose"
-                )
-            );
-
-
-            const tripPaidBy = cleanString(
-                getValue(
-                    body,
-
-                    "tripPaidBy",
-                    "trip_paid_by"
-                )
-            );
-
-
-            const previousUsVisit = cleanString(
-                getValue(
-                    body,
-
-                    "previousUsVisit",
-                    "previous_us_visit"
-                )
-            );
-
-
-            /* =================================================
-               REQUIRED FIELD VALIDATION
-            ================================================= */
-
-            const missingFields = [];
-
-
-            if (!passportNumber) {
-                missingFields.push("passportNumber");
-            }
-
-
-            if (!passportIssuingCountry) {
-                missingFields.push(
-                    "passportIssuingCountry"
-                );
-            }
-
-
-            if (!passportIssueDate) {
-                missingFields.push(
-                    "passportIssueDate"
-                );
-            }
-
-
-            if (!passportExpiryDate) {
-                missingFields.push(
-                    "passportExpiryDate"
-                );
-            }
-
-
-            if (!surname) {
-                missingFields.push("surname");
-            }
-
-
-            if (!firstMiddleName) {
-                missingFields.push(
-                    "firstMiddleName"
-                );
-            }
-
-
-            if (!dateOfBirth) {
-                missingFields.push(
-                    "dateOfBirth"
-                );
-            }
-
-
-            if (!birthCity) {
-                missingFields.push(
-                    "birthCity"
-                );
-            }
-
-
-            if (!birthCountry) {
-                missingFields.push(
-                    "birthCountry"
-                );
-            }
-
-
-            if (!nationality) {
-                missingFields.push(
-                    "nationality"
-                );
-            }
-
-
-            if (!homeAddress) {
-                missingFields.push(
-                    "homeAddress"
-                );
-            }
-
-
-            if (!homeCity) {
-                missingFields.push(
-                    "homeCity"
-                );
-            }
-
-
-            if (!homeCountry) {
-                missingFields.push(
-                    "homeCountry"
-                );
-            }
-
-
-            if (!mobilePhone) {
-                missingFields.push(
-                    "mobilePhone"
-                );
-            }
-
-
-            if (!employerSchool) {
-                missingFields.push(
-                    "employerSchool"
-                );
-            }
-
-
-            if (!presentOccupation) {
-                missingFields.push(
-                    "presentOccupation"
-                );
-            }
-
-
-            if (!usArrivalDate) {
-                missingFields.push(
-                    "usArrivalDate"
-                );
-            }
-
-
-            if (!visaEmail) {
-                missingFields.push(
-                    "visaEmail"
-                );
-            }
-
-
-            if (!usStayAddress) {
-                missingFields.push(
-                    "usStayAddress"
-                );
-            }
-
-
-            if (!usContactName) {
-                missingFields.push(
-                    "usContactName"
-                );
-            }
-
-
-            if (!stayDuration) {
-                missingFields.push(
-                    "stayDuration"
-                );
-            }
-
-
-            if (!tripPurpose) {
-                missingFields.push(
-                    "tripPurpose"
-                );
-            }
-
-
-            if (!tripPaidBy) {
-                missingFields.push(
-                    "tripPaidBy"
-                );
-            }
-
-
-            if (!previousUsVisit) {
-                missingFields.push(
-                    "previousUsVisit"
-                );
-            }
-
-
-            /* -------------------------------------------------
-               VALIDATION RESPONSE
-            ------------------------------------------------- */
-
-            if (missingFields.length > 0) {
-
-                console.log(
-                    "APPLICATION MISSING FIELDS:",
-                    missingFields
-                );
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Please complete all required application fields.",
-
-                    missingFields
-                });
-            }
-
-
-            /* =================================================
-               PAYLOAD SIZE PROTECTION
-            ================================================= */
-
-            let applicationData;
+            let result = {};
 
             try {
 
-                const serialized =
-                    JSON.stringify(body);
-
-
-                if (
-                    Buffer.byteLength(
-                        serialized,
-                        "utf8"
-                    ) >
-                    1024 * 1024
-                ) {
-
-                    return res.status(413).json({
-
-                        success: false,
-
-                        message:
-                            "Application data is too large."
-                    });
-                }
-
-
-                applicationData =
-                    serialized;
+                result =
+                    await response.json();
 
             } catch (error) {
 
-                console.error(
-                    "APPLICATION JSON ERROR:",
-                    error
-                );
+                result = {};
 
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Invalid application data."
-                });
             }
 
-
-            /* =================================================
-               SAVE APPLICATION
-            ================================================= */
-
-            const userId =
-                normalizeId(req.user.id);
-
-
-            if (!userId) {
-
-                return res.status(401).json({
-
-                    success: false,
-
-                    message:
-                        "Invalid customer account."
-                });
-            }
-
-
-            const result =
-                await pool.query(
-                    `
-                    INSERT INTO applications
-                    (
-                        user_id,
-                        application_data,
-                        status,
-                        created_at,
-                        updated_at
-                    )
-                    VALUES
-                    (
-                        $1,
-                        $2,
-                        'payment_pending',
-                        CURRENT_TIMESTAMP,
-                        CURRENT_TIMESTAMP
-                    )
-                    RETURNING
-                        id,
-                        status,
-                        created_at,
-                        updated_at
-                    `,
-                    [
-                        userId,
-                        applicationData
-                    ]
-                );
-
+            // =================================================
+            // BACKEND ERROR
+            // =================================================
 
             if (
-                !result.rows ||
-                result.rows.length === 0
+                !response.ok ||
+                !result.success
             ) {
 
-                return res.status(500).json({
+                showMessage(
+                    result.message ||
+                    "Unable to submit application. Please try again."
+                );
 
-                    success: false,
+                return;
 
-                    message:
-                        "Unable to create application."
-                });
             }
 
+            // =================================================
+            // SAVE APPLICATION FOR PAYMENT PAGE
+            // =================================================
 
-            const application =
-                result.rows[0];
-
-
-            /* =================================================
-               SUCCESS
-            ================================================= */
-
-            console.log(
-                "APPLICATION CREATED:",
-                Number(application.id)
-            );
-
-
-            return res.status(201).json({
-
-                success: true,
-
-                message:
-                    "Application submitted successfully.",
+            const pendingApplication = {
 
                 applicationId:
-                    Number(application.id),
+                    result.applicationId,
 
                 status:
-                    application.status,
+                    result.status,
 
-                createdAt:
-                    application.created_at,
+                applicationData
 
-                updatedAt:
-                    application.updated_at
-            });
+            };
 
-        } catch (error) {
-
-            console.error(
-                "APPLICATION SUBMISSION ERROR:",
-                error
-            );
-
-
-            return res.status(500).json({
-
-                success: false,
-
-                message:
-                    "Unable to submit application at this time."
-            });
-        }
-    }
-);
-
-
-/* =========================================================
-   GET /api/applications/:id
-   CUSTOMER / ADMIN - VIEW SINGLE APPLICATION
-========================================================= */
-
-router.get(
-    "/:id",
-    requireAuth,
-    async (req, res) => {
-
-        try {
-
-            const applicationId =
-                normalizeId(req.params.id);
-
-
-            if (!applicationId) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Invalid Application ID."
-                });
-            }
-
-
-            const result =
-                await pool.query(
-                    `
-                    SELECT
-                        id,
-                        user_id,
-                        application_data,
-                        status,
-                        created_at,
-                        updated_at
-                    FROM applications
-                    WHERE id = $1
-                    LIMIT 1
-                    `,
-                    [applicationId]
-                );
-
-
-            if (
-                result.rows.length === 0
-            ) {
-
-                return res.status(404).json({
-
-                    success: false,
-
-                    message:
-                        "Application not found."
-                });
-            }
-
-
-            const row =
-                result.rows[0];
-
-
-            /* -------------------------------------------------
-               CUSTOMER OWNERSHIP
-            ------------------------------------------------- */
-
-            if (
-                req.user.role !== "admin" &&
-                Number(row.user_id) !==
-                    Number(req.user.id)
-            ) {
-
-                return res.status(403).json({
-
-                    success: false,
-
-                    message:
-                        "You are not authorized to view this application."
-                });
-            }
-
-
-            const data =
-                parseApplicationData(
-                    row.application_data
-                );
-
-
-            return res.json({
-
-                success: true,
-
-                application: {
-
-                    id:
-                        Number(row.id),
-
-                    userId:
-                        row.user_id !== null
-                            ? Number(row.user_id)
-                            : null,
-
-                    data,
-
-                    status:
-                        row.status,
-
-                    createdAt:
-                        row.created_at,
-
-                    updatedAt:
-                        row.updated_at
-                }
-            });
-
-        } catch (error) {
-
-            console.error(
-                "GET APPLICATION ERROR:",
-                error
-            );
-
-
-            return res.status(500).json({
-
-                success: false,
-
-                message:
-                    "Unable to load application."
-            });
-        }
-    }
-);
-
-
-/* =========================================================
-   GET /api/applications
-   ADMIN - VIEW ALL APPLICATIONS
-========================================================= */
-
-router.get(
-    "/",
-    requireAdmin,
-    async (req, res) => {
-
-        try {
-
-            const result =
-                await pool.query(
-                    `
-                    SELECT
-                        id,
-                        user_id,
-                        application_data,
-                        status,
-                        created_at,
-                        updated_at
-                    FROM applications
-                    ORDER BY created_at DESC
-                    `
-                );
-
-
-            const applications =
-                result.rows.map(row => ({
-
-                    id:
-                        Number(row.id),
-
-                    userId:
-                        row.user_id !== null
-                            ? Number(row.user_id)
-                            : null,
-
-                    data:
-                        parseApplicationData(
-                            row.application_data
-                        ),
-
-                    status:
-                        row.status,
-
-                    createdAt:
-                        row.created_at,
-
-                    updatedAt:
-                        row.updated_at
-                }));
-
-
-            return res.json({
-
-                success: true,
-
-                applications
-            });
-
-        } catch (error) {
-
-            console.error(
-                "GET ALL APPLICATIONS ERROR:",
-                error
-            );
-
-
-            return res.status(500).json({
-
-                success: false,
-
-                message:
-                    "Unable to load applications."
-            });
-        }
-    }
-);
-
-
-/* =========================================================
-   PATCH /api/applications/:id/status
-   ADMIN - UPDATE APPLICATION STATUS
-========================================================= */
-
-router.patch(
-    "/:id/status",
-    requireAdmin,
-    async (req, res) => {
-
-        try {
-
-            const applicationId =
-                normalizeId(req.params.id);
-
-
-            if (!applicationId) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Invalid Application ID."
-                });
-            }
-
-
-            const status =
-                cleanString(
-                    req.body?.status
-                ).toLowerCase();
-
-
-            const allowedStatuses = [
-
-                "pending",
-
-                "payment_pending",
-
-                "payment_submitted",
-
-                "under_review",
-
-                "approved",
-
-                "rejected",
-
-                "completed"
-            ];
-
-
-            if (
-                !allowedStatuses.includes(
-                    status
+            sessionStorage.setItem(
+                "pendingApplication",
+                JSON.stringify(
+                    pendingApplication
                 )
-            ) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Invalid application status.",
-
-                    allowedStatuses
-                });
-            }
-
-
-            const existing =
-                await pool.query(
-                    `
-                    SELECT id
-                    FROM applications
-                    WHERE id = $1
-                    LIMIT 1
-                    `,
-                    [applicationId]
-                );
-
-
-            if (
-                existing.rows.length === 0
-            ) {
-
-                return res.status(404).json({
-
-                    success: false,
-
-                    message:
-                        "Application not found."
-                });
-            }
-
-
-            const result =
-                await pool.query(
-                    `
-                    UPDATE applications
-                    SET
-                        status = $1,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE id = $2
-                    RETURNING
-                        id,
-                        status,
-                        updated_at
-                    `,
-                    [
-                        status,
-                        applicationId
-                    ]
-                );
-
-
-            const updated =
-                result.rows[0];
-
-
-            return res.json({
-
-                success: true,
-
-                message:
-                    "Application status updated successfully.",
-
-                applicationId:
-                    Number(updated.id),
-
-                status:
-                    updated.status,
-
-                updatedAt:
-                    updated.updated_at
-            });
-
-        } catch (error) {
-
-            console.error(
-                "UPDATE APPLICATION STATUS ERROR:",
-                error
             );
 
+            // =================================================
+            // SAVE APPLICATION ID
+            // =================================================
 
-            return res.status(500).json({
+            if (result.applicationId) {
 
-                success: false,
-
-                message:
-                    "Unable to update application status."
-            });
-        }
-    }
-);
-
-
-/* =========================================================
-   DELETE /api/applications/:id
-   ADMIN - DELETE APPLICATION
-========================================================= */
-
-router.delete(
-    "/:id",
-    requireAdmin,
-    async (req, res) => {
-
-        let client = null;
-
-        try {
-
-            const applicationId =
-                normalizeId(req.params.id);
-
-
-            if (!applicationId) {
-
-                return res.status(400).json({
-
-                    success: false,
-
-                    message:
-                        "Invalid Application ID."
-                });
-            }
-
-
-            client =
-                await pool.connect();
-
-
-            await client.query(
-                "BEGIN"
-            );
-
-
-            /* -------------------------------------------------
-               DELETE PAYMENTS
-            ------------------------------------------------- */
-
-            await client.query(
-                `
-                DELETE FROM payments
-                WHERE application_id = $1
-                `,
-                [applicationId]
-            );
-
-
-            /* -------------------------------------------------
-               DELETE APPLICATION
-            ------------------------------------------------- */
-
-            const result =
-                await client.query(
-                    `
-                    DELETE FROM applications
-                    WHERE id = $1
-                    RETURNING id
-                    `,
-                    [applicationId]
-                );
-
-
-            if (
-                result.rows.length === 0
-            ) {
-
-                await client.query(
-                    "ROLLBACK"
-                );
-
-
-                return res.status(404).json({
-
-                    success: false,
-
-                    message:
-                        "Application not found."
-                });
-            }
-
-
-            await client.query(
-                "COMMIT"
-            );
-
-
-            return res.json({
-
-                success: true,
-
-                message:
-                    "Application deleted successfully.",
-
-                applicationId:
-                    Number(
-                        result.rows[0].id
+                sessionStorage.setItem(
+                    "applicationId",
+                    String(
+                        result.applicationId
                     )
-            });
+                );
+
+            }
+
+            // =================================================
+            // GO TO PAYMENT PAGE
+            // =================================================
+
+            window.location.href =
+                "payments.html";
 
         } catch (error) {
 
-            if (client) {
-
-                try {
-
-                    await client.query(
-                        "ROLLBACK"
-                    );
-
-                } catch (rollbackError) {
-
-                    console.error(
-                        "APPLICATION ROLLBACK ERROR:",
-                        rollbackError
-                    );
-                }
-            }
-
-
             console.error(
-                "DELETE APPLICATION ERROR:",
+                "Application submission error:",
                 error
             );
 
-
-            return res.status(500).json({
-
-                success: false,
-
-                message:
-                    "Unable to delete application."
-            });
+            showMessage(
+                "Unable to submit application. Please check your internet connection and try again."
+            );
 
         } finally {
 
-            if (client) {
-                client.release();
+            if (submitBtn) {
+
+                submitBtn.disabled = false;
+
+                submitBtn.innerHTML =
+                    originalButtonHTML;
+
             }
+
         }
-    }
-);
 
+    });
 
-/* =========================================================
-   EXPORT
-========================================================= */
-
-module.exports = router;
+});
