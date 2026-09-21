@@ -661,7 +661,10 @@ async function createResumeSignedUrl(
 ========================================================= */
 
 router.post(
-    "/applications",
+    [
+        "/applications",
+        "/"
+    ],
     requireAuth,
     uploadResume.single("resume"),
     async (
@@ -1281,7 +1284,10 @@ router.post(
 ========================================================= */
 
 router.get(
-    "/applications/my",
+    [
+        "/applications/my",
+        "/my"
+    ],
     requireAuth,
     async (
         req,
@@ -1546,7 +1552,10 @@ router.get(
 ========================================================= */
 
 router.get(
-    "/applications/:id",
+    [
+        "/applications/:id",
+        "/:id"
+    ],
     requireAuth,
     async (
         req,
@@ -1675,9 +1684,11 @@ router.get(
    PATCH /api/jobs/applications/:id/status
    ADMIN - UPDATE STATUS
 ========================================================= */
-
 router.patch(
-    "/applications/:id/status",
+    [
+        "/applications/:id/status",
+        "/:id/status"
+    ],
     requireAdmin,
     async (
         req,
@@ -1824,7 +1835,10 @@ router.patch(
 ========================================================= */
 
 router.get(
-    "/applications/:id/resume",
+    [
+        "/applications/:id/resume",
+        "/:id/resume"
+    ],
     requireAdmin,
     async (
         req,
@@ -1938,7 +1952,10 @@ router.get(
 ========================================================= */
 
 router.delete(
-    "/applications/:id",
+    [
+        "/applications/:id",
+        "/:id"
+    ],
     requireAdmin,
     async (
         req,
