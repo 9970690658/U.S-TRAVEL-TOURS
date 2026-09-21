@@ -586,94 +586,32 @@ console.log(
     "Application routes loaded."
 );
 
+
 // =========================================================
 // PAYMENT ROUTES
 // =========================================================
 
-// IMPORTANT:
-// The root ./payments.js file is the FRONTEND payment
-// JavaScript file and must NOT be loaded by Node.js.
-//
-// The backend payment router must be loaded from the
-// server-side payment route file.
+const paymentsRoutes =
+    require("./payments");
 
-const paymentRoutesCandidates = [
-    path.join(__dirname, "server", "payments.js"),
-    path.join(__dirname, "payment-routes.js"),
-    path.join(__dirname, "server", "payment-routes.js")
-];
 
-let paymentsRoutes = null;
-let paymentRouteFile = null;
+app.use(
+    "/api/payments",
+    paymentsRoutes
+);
 
-for (const candidate of paymentRoutesCandidates) {
 
-    if (fs.existsSync(candidate)) {
+app.use(
+    "/api/application-payment",
+    paymentsRoutes
+);
 
-        try {
 
-            const loadedRoutes =
-                require(candidate);
+console.log(
+    "Payment routes loaded."
+);
 
-            if (
-                typeof loadedRoutes === "function" ||
-                (
-                    loadedRoutes &&
-                    typeof loadedRoutes === "object"
-                )
-            ) {
 
-                paymentsRoutes =
-                    loadedRoutes;
-
-                paymentRouteFile =
-                    candidate;
-
-                break;
-
-            }
-
-        } catch (error) {
-
-            console.error(
-                "Payment route load failed:",
-                candidate
-            );
-
-        }
-
-    }
-
-}
-
-if (paymentsRoutes) {
-
-    app.use(
-        "/api/payments",
-        paymentsRoutes
-    );
-
-    app.use(
-        "/api/application-payment",
-        paymentsRoutes
-    );
-
-    console.log(
-        "Payment routes loaded from:",
-        paymentRouteFile
-    );
-
-} else {
-
-    console.error(
-        "PAYMENT ERROR: Backend payment router not found."
-    );
-
-    console.error(
-        "IMPORTANT: ./payments.js was NOT loaded because it is a frontend browser file."
-    );
-
-}
 // =========================================================
 // CHAT ROUTES
 // =========================================================
