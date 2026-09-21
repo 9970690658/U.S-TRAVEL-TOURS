@@ -1041,7 +1041,7 @@ router.post(
             await transporter.sendMail({
 
     from:
-        `"U.S TRAVEL & TOURS" <${FROM_EMAIL}>`,
+    `"U.S TRAVEL & TOURS" <${OWNER_EMAIL}>`,
 
     to:
         contact.email,
