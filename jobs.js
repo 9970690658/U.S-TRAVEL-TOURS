@@ -737,9 +737,10 @@ router.post(
                 );
 
             const name =
-                cleanString(
-                    req.body?.name
-                );
+    cleanString(
+        req.body?.name ||
+        req.body?.fullName
+    );
 
             const email =
                 cleanString(
@@ -778,10 +779,11 @@ router.post(
                 );
 
             const coverLetter =
-                cleanString(
-                    req.body?.coverLetter ||
-                    req.body?.cover_letter
-                );
+    cleanString(
+        req.body?.coverLetter ||
+        req.body?.cover_letter ||
+        req.body?.message
+    );
 
 
             /* -------------------------------------------------
